@@ -1,0 +1,122 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="420" viewBox="0 0 1200 420" fill="none">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1200" y2="420" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#f8fafc" />
+      <stop offset="1" stop-color="#eef2ff" />
+    </linearGradient>
+
+    <radialGradient id="glowBlue" cx="0" cy="0" r="1" gradientUnits="userSpaceOnUse" gradientTransform="translate(240 110) rotate(22) scale(520 360)">
+      <stop offset="0" stop-color="#3b82f6" stop-opacity="0.18" />
+      <stop offset="1" stop-color="#3b82f6" stop-opacity="0" />
+    </radialGradient>
+    <radialGradient id="glowGreen" cx="0" cy="0" r="1" gradientUnits="userSpaceOnUse" gradientTransform="translate(960 140) rotate(-18) scale(520 360)">
+      <stop offset="0" stop-color="#10b981" stop-opacity="0.15" />
+      <stop offset="1" stop-color="#10b981" stop-opacity="0" />
+    </radialGradient>
+    <radialGradient id="glowAmber" cx="0" cy="0" r="1" gradientUnits="userSpaceOnUse" gradientTransform="translate(720 360) rotate(0) scale(620 420)">
+      <stop offset="0" stop-color="#f59e0b" stop-opacity="0.14" />
+      <stop offset="1" stop-color="#f59e0b" stop-opacity="0" />
+    </radialGradient>
+
+    <pattern id="grid" width="60" height="60" patternUnits="userSpaceOnUse">
+      <path d="M60 0H0V60" stroke="#0f172a" stroke-opacity="0.06" stroke-width="1" />
+      <path d="M0 30H60" stroke="#0f172a" stroke-opacity="0.035" stroke-width="1" />
+      <path d="M30 0V60" stroke="#0f172a" stroke-opacity="0.035" stroke-width="1" />
+    </pattern>
+
+    <filter id="soft" x="-40" y="-40" width="1280" height="500" filterUnits="userSpaceOnUse" color-interpolation-filters="sRGB">
+      <feDropShadow dx="0" dy="14" stdDeviation="18" flood-color="#020617" flood-opacity="0.12" />
+    </filter>
+
+    <marker id="arrowBlue" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto" markerUnits="strokeWidth">
+      <path d="M0 0 L10 4 L0 8 Z" fill="#2563eb" fill-opacity="0.9" />
+    </marker>
+    <marker id="arrowGreen" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto" markerUnits="strokeWidth">
+      <path d="M0 0 L10 4 L0 8 Z" fill="#10b981" fill-opacity="0.9" />
+    </marker>
+    <marker id="arrowAmber" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto" markerUnits="strokeWidth">
+      <path d="M0 0 L10 4 L0 8 Z" fill="#f59e0b" fill-opacity="0.9" />
+    </marker>
+    <marker id="arrowRed" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto" markerUnits="strokeWidth">
+      <path d="M0 0 L10 4 L0 8 Z" fill="#ef4444" fill-opacity="0.9" />
+    </marker>
+  </defs>
+
+  <rect width="1200" height="420" fill="url(#bg)" />
+  <rect width="1200" height="420" fill="url(#glowBlue)" />
+  <rect width="1200" height="420" fill="url(#glowGreen)" />
+  <rect width="1200" height="420" fill="url(#glowAmber)" />
+  <rect width="1200" height="420" fill="url(#grid)" />
+
+  <g filter="url(#soft)">
+    <!-- Roads (outline then fill) -->
+    <g stroke-linecap="round" stroke-linejoin="round">
+      <!-- Main diagonal -->
+      <path d="M-80 360 C180 250, 360 220, 620 180 S980 90, 1280 60" stroke="#0f172a" stroke-opacity="0.10" stroke-width="66" />
+      <path d="M-80 360 C180 250, 360 220, 620 180 S980 90, 1280 60" stroke="#ffffff" stroke-opacity="0.80" stroke-width="60" />
+      <path d="M-80 360 C180 250, 360 220, 620 180 S980 90, 1280 60" stroke="#94a3b8" stroke-opacity="0.55" stroke-width="2.2" stroke-dasharray="12 14" />
+
+      <!-- Vertical arterial -->
+      <path d="M620 -90 C600 60, 592 120, 610 220 S650 390, 640 520" stroke="#0f172a" stroke-opacity="0.10" stroke-width="66" />
+      <path d="M620 -90 C600 60, 592 120, 610 220 S650 390, 640 520" stroke="#ffffff" stroke-opacity="0.78" stroke-width="60" />
+      <path d="M620 -90 C600 60, 592 120, 610 220 S650 390, 640 520" stroke="#94a3b8" stroke-opacity="0.42" stroke-width="2.0" stroke-dasharray="10 14" />
+
+      <!-- Upper-left to lower-right -->
+      <path d="M-70 90 C260 40, 430 70, 600 140 S980 300, 1280 260" stroke="#0f172a" stroke-opacity="0.08" stroke-width="54" />
+      <path d="M-70 90 C260 40, 430 70, 600 140 S980 300, 1280 260" stroke="#ffffff" stroke-opacity="0.74" stroke-width="48" />
+      <path d="M-70 90 C260 40, 430 70, 600 140 S980 300, 1280 260" stroke="#94a3b8" stroke-opacity="0.35" stroke-width="1.8" stroke-dasharray="10 16" />
+
+      <!-- Small connector -->
+      <path d="M980 -40 C910 120, 900 200, 980 280" stroke="#0f172a" stroke-opacity="0.08" stroke-width="44" />
+      <path d="M980 -40 C910 120, 900 200, 980 280" stroke="#ffffff" stroke-opacity="0.72" stroke-width="38" />
+      <path d="M980 -40 C910 120, 900 200, 980 280" stroke="#94a3b8" stroke-opacity="0.30" stroke-width="1.8" stroke-dasharray="10 16" />
+    </g>
+
+    <!-- Crosswalk hint -->
+    <g opacity="0.6">
+      <rect x="568" y="182" width="104" height="28" rx="10" fill="#ffffff" />
+      <rect x="574" y="187" width="20" height="18" rx="6" fill="#cbd5e1" />
+      <rect x="602" y="187" width="20" height="18" rx="6" fill="#cbd5e1" />
+      <rect x="630" y="187" width="20" height="18" rx="6" fill="#cbd5e1" />
+      <rect x="658" y="187" width="8" height="18" rx="4" fill="#cbd5e1" />
+    </g>
+
+    <!-- Trajectories -->
+    <g stroke-linecap="round" stroke-linejoin="round">
+      <!-- Blue -->
+      <path d="M170 342 C295 270, 410 242, 540 222 S735 170, 828 122" stroke="#2563eb" stroke-opacity="0.22" stroke-width="14" />
+      <path d="M170 342 C295 270, 410 242, 540 222 S735 170, 828 122" stroke="#2563eb" stroke-opacity="0.92" stroke-width="5.6" marker-end="url(#arrowBlue)" />
+      <circle cx="170" cy="342" r="6" fill="#2563eb" fill-opacity="0.92" stroke="#ffffff" stroke-opacity="0.9" stroke-width="2" />
+      <circle cx="540" cy="222" r="5" fill="#2563eb" fill-opacity="0.55" />
+      <circle cx="828" cy="122" r="6" fill="#2563eb" fill-opacity="0.92" stroke="#ffffff" stroke-opacity="0.9" stroke-width="2" />
+
+      <!-- Green -->
+      <path d="M635 382 C620 330, 610 286, 612 238 S626 120, 620 48" stroke="#10b981" stroke-opacity="0.20" stroke-width="14" />
+      <path d="M635 382 C620 330, 610 286, 612 238 S626 120, 620 48" stroke="#10b981" stroke-opacity="0.92" stroke-width="5.6" marker-end="url(#arrowGreen)" />
+      <circle cx="635" cy="382" r="6" fill="#10b981" fill-opacity="0.92" stroke="#ffffff" stroke-opacity="0.9" stroke-width="2" />
+      <circle cx="612" cy="238" r="5" fill="#10b981" fill-opacity="0.55" />
+      <circle cx="620" cy="48" r="6" fill="#10b981" fill-opacity="0.92" stroke="#ffffff" stroke-opacity="0.9" stroke-width="2" />
+
+      <!-- Amber -->
+      <path d="M1036 300 C930 270, 792 226, 660 172 S330 72, 92 102" stroke="#f59e0b" stroke-opacity="0.18" stroke-width="14" />
+      <path d="M1036 300 C930 270, 792 226, 660 172 S330 72, 92 102" stroke="#f59e0b" stroke-opacity="0.90" stroke-width="5.6" marker-end="url(#arrowAmber)" />
+      <circle cx="1036" cy="300" r="6" fill="#f59e0b" fill-opacity="0.92" stroke="#ffffff" stroke-opacity="0.9" stroke-width="2" />
+      <circle cx="660" cy="172" r="5" fill="#f59e0b" fill-opacity="0.55" />
+      <circle cx="92" cy="102" r="6" fill="#f59e0b" fill-opacity="0.92" stroke="#ffffff" stroke-opacity="0.9" stroke-width="2" />
+
+      <!-- Red -->
+      <path d="M960 66 C900 150, 892 220, 948 286" stroke="#ef4444" stroke-opacity="0.16" stroke-width="12" />
+      <path d="M960 66 C900 150, 892 220, 948 286" stroke="#ef4444" stroke-opacity="0.90" stroke-width="4.8" marker-end="url(#arrowRed)" />
+      <circle cx="960" cy="66" r="5" fill="#ef4444" fill-opacity="0.85" stroke="#ffffff" stroke-opacity="0.9" stroke-width="2" />
+      <circle cx="948" cy="286" r="5" fill="#ef4444" fill-opacity="0.85" stroke="#ffffff" stroke-opacity="0.9" stroke-width="2" />
+    </g>
+
+    <!-- Intersection emphasis -->
+    <g>
+      <circle cx="620" cy="190" r="44" fill="#0f172a" fill-opacity="0.05" />
+      <circle cx="620" cy="190" r="20" fill="#ffffff" fill-opacity="0.65" stroke="#0f172a" stroke-opacity="0.12" stroke-width="2" />
+    </g>
+  </g>
+</svg>
+

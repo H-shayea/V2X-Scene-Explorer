@@ -1,0 +1,18 @@
+{
+  "datasets": [
+    {
+      "id": "v2x-traj",
+      "title": "V2X-Traj",
+      "family": "v2x-traj",
+      "root": "dataset/v2x-traj",
+      "profile": "dataset/profiles/v2x-traj/profile.json",
+      "scenes": "dataset/profiles/v2x-traj/scenes.csv"
+    },
+    {
+      "id": "consider-it-cpm",
+      "title": "Consider.it (CPM Objects)",
+      "family": "cpm-objects",
+      "root": "/Users/shayea/Documents/Projects/Consider_it/dataset"
+    }
+  ]
+}

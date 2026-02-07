@@ -1,0 +1,21 @@
+.DS_Store
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+
+# Local outputs
+tmp/
+output/
+dataset/profiles/
+dataset/PROFILE_REPORT.md
+scripts/dataset/PROFILE_REPORT.md
+
+# Datasets (large, local-only)
+dataset/v2x-traj/
+dataset/full-dataset/
+dataset/V2X-Seq-TFD-Example/
+dataset/ConsiderIt/
+
+# Large local assets
+Map1.png
+Cooperative Trajectory.pdf

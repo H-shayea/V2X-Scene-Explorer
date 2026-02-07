@@ -1,0 +1,259 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>V2X Scene Explorer</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <section id="homeView" class="home">
+      <div class="homeCard">
+        <div class="homeHero">
+          <img class="homeHero__img" src="/hero.svg" alt="" />
+        </div>
+        <div class="homeGrid">
+          <div class="homeMain">
+            <div class="homeBrand">
+              <div class="homeTitle">V2X Scene Explorer</div>
+              <div class="homeSubtitle">
+                An interactive viewer for multi-agent trajectory datasets: scenes, playback, trajectories, per-class filters, and maps when available.
+              </div>
+            </div>
+
+            <div class="homeControls">
+              <label class="field homeField">
+                <span>Choose a dataset</span>
+                <select id="homeDatasetSelect"></select>
+              </label>
+              <button id="homeStartBtn" class="btn" type="button">Open Explorer</button>
+            </div>
+
+            <div id="homeError" class="homeError" hidden></div>
+
+            <div id="homeDatasetMeta" class="homeMeta"></div>
+
+              <div class="homeFoot">
+              Tip: you can switch datasets later; each dataset keeps its own settings. <span class="homeOwner">Owner: Hassan</span>
+            </div>
+          </div>
+
+          <aside class="homeAside" aria-label="App overview">
+            <div class="homeAside__title">What You Can Do</div>
+            <div class="homeBullets">
+              <div class="homeBullet"><b>Browse scenes:</b> fast next/prev, list paging, and jump to a scene ID.</div>
+              <div class="homeBullet"><b>Play trajectories:</b> scrub time, click an object, and show its full path.</div>
+              <div class="homeBullet"><b>See motion:</b> velocity arrows (movement) and heading arrows (orientation).</div>
+              <div class="homeBullet"><b>Filter intelligently:</b> by modality, type, and fine-grained class (subtype).</div>
+              <div class="homeBullet"><b>Understand context:</b> HD map rendering when the dataset provides it.</div>
+            </div>
+
+            <div class="homeAside__title">Keyboard Shortcuts</div>
+            <div class="homeKbd">
+              <div><kbd>Space</kbd> Play/Pause</div>
+              <div><kbd>←</kbd>/<kbd>→</kbd> Prev/Next frame</div>
+              <div><kbd>N</kbd>/<kbd>P</kbd> Next/Prev scene</div>
+              <div><kbd>F</kbd> Fit view</div>
+            </div>
+          </aside>
+        </div>
+      </div>
+    </section>
+
+    <div id="explorerView" hidden>
+      <header class="topbar">
+        <div class="topbar__row">
+          <div class="brand">
+            <div class="brand__title">V2X Scene Explorer</div>
+            <div class="brand__subtitle">Trajectory dataset explorer <span class="ownerTag">Owner: Hassan</span></div>
+          </div>
+
+          <div class="controls controls--primary">
+            <button id="backHomeBtn" class="btn btn--ghost btn--sm" type="button" title="Return to the start screen">Home</button>
+            <label class="field">
+              <span>Dataset</span>
+              <select id="datasetSelect"></select>
+            </label>
+
+            <label class="field">
+              <span>Split</span>
+              <select id="splitSelect">
+                <option value="train">Train</option>
+                <option value="val">Validation</option>
+              </select>
+            </label>
+
+            <label class="field">
+              <span id="groupLabel">Intersection</span>
+              <select id="intersectSelect"></select>
+            </label>
+
+            <label class="field field--scene">
+              <span>Scene</span>
+              <div class="sceneRow">
+                <select id="sceneSelect"></select>
+                <button id="prevSceneBtn" class="btn btn--ghost btn--sm btn--icon" type="button" title="Previous scene" aria-label="Previous scene">&lt;</button>
+                <button id="nextSceneBtn" class="btn btn--ghost btn--sm btn--icon" type="button" title="Next scene" aria-label="Next scene">&gt;</button>
+              </div>
+            </label>
+          </div>
+        </div>
+
+        <div class="topbar__row topbar__row--secondary">
+          <div id="sceneHint" class="hint"></div>
+          <div class="sceneTools sceneTools--bar">
+            <div class="barLabel">Scene list</div>
+            <button id="prevPageBtn" class="btn btn--ghost btn--sm btn--icon" type="button" title="Show earlier scenes in the scene list" aria-label="Previous scene list">&laquo;</button>
+            <div id="pageLabel" class="pageLabel">Scenes 0-0 of 0</div>
+            <button id="nextPageBtn" class="btn btn--ghost btn--sm btn--icon" type="button" title="Show later scenes in the scene list" aria-label="Next scene list">&raquo;</button>
+            <select id="sceneLimitSelect" title="Scenes shown in the list">
+              <option value="100">100</option>
+              <option value="200">200</option>
+              <option value="400" selected>400</option>
+              <option value="800">800</option>
+              <option value="2000">2000</option>
+            </select>
+            <div class="sceneJumpWrap">
+              <input id="sceneJumpInput" class="sceneJump" inputmode="numeric" placeholder="Scene ID…" />
+              <button id="sceneGoBtn" class="btn btn--ghost btn--sm" type="button" title="Jump to a scene ID">Jump</button>
+            </div>
+          </div>
+        </div>
+      </header>
+
+      <main class="layout">
+      <aside class="panel">
+        <div class="panel__section">
+          <div class="panel__title" id="modalitiesTitle">Modalities</div>
+          <label class="check" id="layerEgoWrap"><input type="checkbox" id="layerEgo" checked /> <span id="layerEgoText">Ego vehicle</span></label>
+          <label class="check" id="layerInfraWrap"><input type="checkbox" id="layerInfra" checked /> <span id="layerInfraText">Infrastructure</span></label>
+          <label class="check" id="layerVehicleWrap"><input type="checkbox" id="layerVehicle" checked /> <span id="layerVehicleText">Other vehicles</span></label>
+          <label class="check" id="layerTLWrap"><input type="checkbox" id="layerTL" checked /> <span id="layerTLText">Traffic lights</span></label>
+        </div>
+
+	        <div class="panel__section">
+	          <div class="panel__title">Object Types</div>
+	          <label class="check"><input type="checkbox" id="typeVehicle" checked /> Vehicle</label>
+	          <label class="check"><input type="checkbox" id="typePed" checked /> Pedestrian</label>
+	          <label class="check"><input type="checkbox" id="typeBike" checked /> Bicycle</label>
+	          <label class="check"><input type="checkbox" id="typeOther" checked /> Other</label>
+	          <label class="check"><input type="checkbox" id="typeAnimal" checked /> Animal</label>
+	          <label class="check"><input type="checkbox" id="typeRsu" checked /> Roadside unit</label>
+	          <label class="check"><input type="checkbox" id="typeUnknown" checked /> Unknown</label>
+	        </div>
+
+	        <div class="panel__section" id="subTypeSection">
+	          <div class="panel__title">Subtypes</div>
+	          <div class="row">
+	            <button id="subTypeAllBtn" class="btn btn--ghost btn--sm" type="button">All</button>
+	            <button id="subTypeNoneBtn" class="btn btn--ghost btn--sm" type="button">None</button>
+	          </div>
+	          <div id="subTypeFilters" class="filtersGrid"></div>
+	        </div>
+
+	        <div class="panel__section">
+	          <div class="panel__title">Playback</div>
+	          <div class="row">
+	            <button id="playBtn" class="btn">Play</button>
+            <button id="stepBtn" class="btn btn--ghost">Next frame</button>
+          </div>
+	          <label class="field">
+	            <span>Speed</span>
+	            <select id="speedSelect">
+	              <option value="0.25">0.25x</option>
+	              <option value="0.5">0.5x</option>
+	              <option value="1" selected>1x</option>
+	              <option value="2">2x</option>
+	              <option value="4">4x</option>
+	            </select>
+	          </label>
+	          <label class="check small"><input type="checkbox" id="showVelocity" /> Show velocity arrows</label>
+	          <label class="check small"><input type="checkbox" id="showHeading" /> Show heading arrows</label>
+	          <label class="check small"><input type="checkbox" id="showTrail" checked /> Show trajectories</label>
+	          <label class="check small"><input type="checkbox" id="trailAll" /> Apply to all objects (current frame)</label>
+	          <label class="check small"><input type="checkbox" id="trailFull" checked /> Full trajectory (past + future)</label>
+	          <label class="check small" id="holdTLWrap"><input type="checkbox" id="holdTL" checked /> Hold traffic lights between updates</label>
+	        </div>
+
+        <div class="panel__section" id="mapSection">
+          <div class="panel__title" id="mapTitle">Map</div>
+	          <div class="row">
+	            <button id="fitSceneBtn" class="btn btn--ghost">Fit trajectories</button>
+	            <button id="fitMapBtn" class="btn btn--ghost">Fit Map</button>
+	          </div>
+	          <div id="mapOnlyControls">
+	            <label class="field">
+	              <span>Scope</span>
+	              <select id="mapClipSelect">
+	                <option value="scene" selected>Focused (scene)</option>
+	                <option value="intersection">Full (intersection map)</option>
+	              </select>
+	            </label>
+	            <label class="field">
+	              <span>Detail</span>
+	              <select id="mapStepSelect">
+	                <option value="1">Step 1 (max)</option>
+	                <option value="2">Step 2 (high)</option>
+	                <option value="3" selected>Step 3 (medium)</option>
+	                <option value="5">Step 5 (low)</option>
+	                <option value="8">Step 8 (very low)</option>
+	              </select>
+	            </label>
+	            <label class="field">
+	              <span>Padding (m)</span>
+	              <select id="mapPadSelect">
+	                <option value="60">60</option>
+	                <option value="120" selected>120</option>
+	                <option value="250">250</option>
+	                <option value="500">500</option>
+	                <option value="1000">1000</option>
+	              </select>
+	            </label>
+	            <label class="field">
+	              <span>Lane limit</span>
+	              <select id="mapMaxLanesSelect">
+	                <option value="2000">2000</option>
+	                <option value="4000">4000</option>
+	                <option value="5000" selected>5000</option>
+	                <option value="8000">8000</option>
+	                <option value="12000">12000</option>
+	              </select>
+	            </label>
+	            <div class="panel__subhead">Map Layers</div>
+	            <label class="check small"><input type="checkbox" id="mapLanes" checked /> Lanes</label>
+	            <label class="check small"><input type="checkbox" id="mapStoplines" checked /> Stoplines</label>
+	            <label class="check small"><input type="checkbox" id="mapCrosswalks" checked /> Crosswalks</label>
+	            <label class="check small"><input type="checkbox" id="mapJunctions" checked /> Junction areas</label>
+	            <label class="check small"><input type="checkbox" id="focusMask" checked /> Dim outside trajectories (intersection view)</label>
+	          </div>
+	          <label class="check small"><input type="checkbox" id="sceneBox" checked /> Show trajectory extent</label>
+	          <label class="check small"><input type="checkbox" id="debugOverlay" /> Debug overlay (extents)</label>
+	        </div>
+
+        <div class="panel__section">
+          <div class="panel__title">Scene Details</div>
+          <div id="statusBox" class="statusBox">Select a scene…</div>
+          <pre id="sceneInfo" class="codebox">Select a scene…</pre>
+        </div>
+      </aside>
+
+      <section class="stage">
+        <div class="canvasWrap">
+          <canvas id="mapCanvas"></canvas>
+        </div>
+
+        <div class="timeline">
+          <input id="frameSlider" type="range" min="0" max="0" value="0" step="1" />
+          <div class="timeline__meta">
+            <div id="frameLabel">Frame 0</div>
+            <div id="timeLabel">Time +0.0s</div>
+            <div id="countsLabel">Ego 0 · Infra 0 · Vehicles 0 · Lights 0</div>
+          </div>
+        </div>
+      </section>
+      </main>
+    </div>
+
+    <script src="/app.js"></script>
+  </body>
+</html>
