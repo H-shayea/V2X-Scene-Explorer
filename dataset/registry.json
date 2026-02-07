@@ -12,7 +12,7 @@
       "id": "consider-it-cpm",
       "title": "Consider.it (CPM Objects)",
       "family": "cpm-objects",
-      "root": "/Users/shayea/Documents/Projects/Consider_it/dataset"
+      "root": "dataset/ConsiderIt"
     }
   ]
 }

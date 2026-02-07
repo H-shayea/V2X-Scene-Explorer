@@ -1,14 +1,19 @@
 .DS_Store
+
+# Python
 __pycache__/
-*.pyc
+*.py[cod]
+.venv/
+venv/
+.env
+.env.*
+
+# Jupyter
 .ipynb_checkpoints/
 
 # Local outputs
 tmp/
 output/
-dataset/profiles/
-dataset/PROFILE_REPORT.md
-scripts/dataset/PROFILE_REPORT.md
 
 # Datasets (large, local-only)
 dataset/v2x-traj/
@@ -16,6 +21,20 @@ dataset/full-dataset/
 dataset/V2X-Seq-TFD-Example/
 dataset/ConsiderIt/
 
+# Generated profiling outputs
+dataset/PROFILE_REPORT.md
+scripts/dataset/
+dataset/profiles/**
+!dataset/profiles/
+!dataset/profiles/v2x-traj/
+!dataset/profiles/v2x-traj/PROFILE_REPORT.md
+!dataset/profiles/v2x-traj/profile.json
+!dataset/profiles/v2x-traj/scenes.csv
+
 # Large local assets
 Map1.png
 Cooperative Trajectory.pdf
+
+# Folder for local-only scripts and notebooks
+jupyter-notebooks/
+scripts/
