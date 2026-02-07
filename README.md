@@ -60,11 +60,6 @@ Then open:
 
 Note: this repo includes a small, precomputed scene index in `dataset/profiles/v2x-traj/` (not the dataset itself).
 
-### Consider.it CPM Objects (`family: cpm-objects`)
-
-- Split: treated as a single continuous log (`all`)
-- Grouping: sensor log (CSV file) -> "scenes" as time windows (gap-aware, capped duration)
-- Map: not available (local sensor coordinates)
 
 ## Keyboard shortcuts
 
