@@ -11,6 +11,10 @@ venv/
 # Jupyter
 .ipynb_checkpoints/
 
+# Local notebooks and scripts (not tracked)
+jupyter-notebooks/
+scripts/
+
 # Local outputs
 tmp/
 output/
