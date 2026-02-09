@@ -1,0 +1,210 @@
+{
+  "schema_version": 1,
+  "datasets": [
+    {
+      "id": "v2x-traj",
+      "title": "V2X-Traj",
+      "year": 2024,
+      "venue": "NeurIPS (paper ecosystem)",
+      "category": "intersection-centric",
+      "visibility": "public",
+      "summary": "Real-world cooperative motion forecasting dataset with multiple autonomous vehicles and infrastructure present in each scenario (vehicle-to-everything / V2X). Designed to evaluate cooperative forecasting beyond pure vehicle-to-infrastructure settings.",
+      "highlights": [
+        "Cooperative forecasting focus (multi-agent, multi-device)",
+        "Multiple cooperation settings (e.g., V2I / V2V / V2X) depending on the benchmark",
+        "Works with HD maps and traffic signals when provided by the dataset release"
+      ],
+      "capabilities": {
+        "has_map": true,
+        "has_traffic_lights": true,
+        "coordinate_frame": "global (map)",
+        "scene_unit": "intersection -> scene"
+      },
+      "links": [
+        {
+          "label": "Paper (arXiv:2311.00371)",
+          "url": "https://arxiv.org/abs/2311.00371"
+        },
+        {
+          "label": "Project code (V2X-Graph)",
+          "url": "https://github.com/AIR-THU/V2X-Graph"
+        }
+      ],
+      "app": { "supported": true, "family": "v2x-traj" }
+    },
+    {
+      "id": "consider-it-cpm",
+      "title": "Consider.it (CPM Objects)",
+      "year": 2025,
+      "venue": "Internal / private",
+      "category": "intersection-centric",
+      "visibility": "private",
+      "summary": "Private cooperative perception dataset of CPM object logs. Logs contain timestamped object detections from roadside units (RSUs) and thermal camera recordings. The viewer segments continuous logs into longer, gap-aware time windows for interactive playback.",
+      "highlights": [
+        "Private dataset (not distributed via this repository)",
+        "Object detections with fine-grained class ids (decoded from sensor_interface-v1.2.1.proto)",
+        "Local sensor coordinate frame (no HD map)"
+      ],
+      "capabilities": {
+        "has_map": false,
+        "has_traffic_lights": false,
+        "coordinate_frame": "local (sensor)",
+        "scene_unit": "sensor log -> time window scene"
+      },
+      "links": [],
+      "app": { "supported": true, "family": "cpm-objects" }
+    },
+    {
+      "id": "ind",
+      "title": "inD: Drone trajectories at German intersections",
+      "year": 2019,
+      "venue": "arXiv:1911.07602",
+      "category": "intersection-centric",
+      "visibility": "public",
+      "summary": "Naturalistic road user trajectories recorded by drones at multiple German intersections. Provides extracted trajectories per road user with high positional accuracy and supports research on motion prediction, behavior modeling, and safety validation at intersections.",
+      "highlights": ["Top-down drone viewpoint", "Multiple intersection locations", "Trajectory extraction for road users (typed)"],
+      "capabilities": {
+        "has_map": false,
+        "has_traffic_lights": false,
+        "coordinate_frame": "global (geo-referenced)",
+        "scene_unit": "recording / location"
+      },
+      "links": [
+        { "label": "Paper (arXiv:1911.07602)", "url": "https://arxiv.org/abs/1911.07602" },
+        { "label": "Dataset website", "url": "https://www.ind-dataset.com/" }
+      ],
+      "app": { "supported": false, "family": null }
+    },
+    {
+      "id": "sind",
+      "title": "SinD: Drone dataset at signalized intersections",
+      "year": 2022,
+      "venue": "ITSC 2022 (paper); arXiv:2209.02297",
+      "category": "intersection-centric",
+      "visibility": "public",
+      "summary": "Drone-recorded trajectory dataset focused on signalized intersections. Includes traffic participant trajectories plus synchronized traffic light states and high-definition maps. The project also provides tools and documentation for data format and visualization.",
+      "highlights": ["Signalized intersection focus", "Traffic light states", "HD map support (Lanelet2)"],
+      "capabilities": {
+        "has_map": true,
+        "has_traffic_lights": true,
+        "coordinate_frame": "global (map)",
+        "scene_unit": "recording"
+      },
+      "links": [
+        { "label": "Paper (arXiv:2209.02297)", "url": "https://arxiv.org/abs/2209.02297" },
+        { "label": "Project code / sample data", "url": "https://github.com/SOTIF-AVLab/SinD" }
+      ],
+      "app": { "supported": false, "family": null }
+    },
+    {
+      "id": "int2",
+      "title": "INT2: Interactive Trajectory Prediction at Intersections",
+      "year": 2023,
+      "venue": "ICCV 2023",
+      "category": "intersection-centric",
+      "visibility": "public",
+      "summary": "Large-scale interactive trajectory prediction dataset for intersections. Includes vectorized semantic maps and traffic light information, and benchmarks interactive forecasting under in-domain and cross-domain settings.",
+      "highlights": ["Interactive prediction focus", "Vector maps + traffic lights", "Large-scale dataset release + benchmark"],
+      "capabilities": {
+        "has_map": true,
+        "has_traffic_lights": true,
+        "coordinate_frame": "global (map)",
+        "scene_unit": "fixed-length scene (1 minute)"
+      },
+      "links": [
+        {
+          "label": "Paper (CVF Open Access)",
+          "url": "https://openaccess.thecvf.com/content/ICCV2023/html/Yan_INT2_Interactive_Trajectory_Prediction_at_Intersections_ICCV_2023_paper.html"
+        },
+        { "label": "Project code / dataset", "url": "https://github.com/AIR-DISCOVER/INT2" }
+      ],
+      "app": { "supported": false, "family": null }
+    },
+    {
+      "id": "vtp-tl",
+      "title": "VTP-TL: Vehicle trajectory prediction under traffic lights",
+      "year": 2022,
+      "venue": "ECCV 2022 (paper); arXiv:2207.10398",
+      "category": "intersection-centric",
+      "visibility": "public",
+      "summary": "Dataset introduced alongside D2-TPred for vehicle trajectory prediction conditioned on traffic lights at urban intersections. Distributed with the D2-TPred project code.",
+      "highlights": ["Traffic-light-aware forecasting", "Released with D2-TPred"],
+      "capabilities": {
+        "has_map": null,
+        "has_traffic_lights": true,
+        "coordinate_frame": null,
+        "scene_unit": null
+      },
+      "links": [
+        { "label": "Paper (arXiv:2207.10398)", "url": "https://arxiv.org/abs/2207.10398" },
+        { "label": "Project code / dataset", "url": "https://github.com/VTP-TL/D2-TPred" }
+      ],
+      "app": { "supported": false, "family": null }
+    },
+    {
+      "id": "v2x-seq",
+      "title": "V2X-Seq: Sequential V2X dataset for cooperative perception and forecasting",
+      "year": 2023,
+      "venue": "CVPR 2023",
+      "category": "intersection-centric",
+      "visibility": "public",
+      "summary": "Large-scale, real-world sequential vehicle-to-infrastructure (V2X) dataset including trajectories, vector maps, and traffic lights. Contains both sequential perception data and a trajectory forecasting dataset mined from many hours of recordings across multiple intersection areas.",
+      "highlights": ["Sequential V2X data", "Vector maps + traffic lights", "Perception + forecasting subsets"],
+      "capabilities": {
+        "has_map": true,
+        "has_traffic_lights": true,
+        "coordinate_frame": "global (map)",
+        "scene_unit": "scenario"
+      },
+      "links": [
+        {
+          "label": "Paper (CVF Open Access)",
+          "url": "https://openaccess.thecvf.com/content/CVPR2023/html/Yu_V2X-Seq_A_Large-Scale_Sequential_Dataset_for_Vehicle-Infrastructure_Cooperative_Perception_and_CVPR_2023_paper.html"
+        },
+        { "label": "Project code / download", "url": "https://github.com/AIR-THU/DAIR-V2X-Seq" }
+      ],
+      "app": { "supported": false, "family": null }
+    },
+    {
+      "id": "interaction",
+      "title": "INTERACTION Dataset: Interactive driving scenarios with semantic maps",
+      "year": 2019,
+      "venue": "arXiv:1910.03088",
+      "category": "multi-scenario (includes intersections)",
+      "visibility": "public",
+      "summary": "International dataset of highly interactive driving scenarios (including intersections, roundabouts, merging, lane changes) paired with semantic maps and traffic rules. Recorded from drones and traffic cameras and designed for motion prediction, planning, and behavior research.",
+      "highlights": ["Multiple scenario types + countries", "Semantic maps with traffic rules", "Interactive behaviors"],
+      "capabilities": {
+        "has_map": true,
+        "has_traffic_lights": true,
+        "coordinate_frame": "global (map)",
+        "scene_unit": "scenario / track file"
+      },
+      "links": [
+        { "label": "Paper (arXiv:1910.03088)", "url": "https://arxiv.org/abs/1910.03088" },
+        { "label": "Dataset website", "url": "https://interaction-dataset.com/" },
+        { "label": "Processing scripts (GitHub)", "url": "https://github.com/interaction-dataset/interaction-dataset" }
+      ],
+      "app": { "supported": false, "family": null }
+    },
+    {
+      "id": "round",
+      "title": "rounD: Drone trajectories at German roundabouts",
+      "year": 2020,
+      "venue": "ITSC 2020",
+      "category": "intersection-adjacent (roundabouts)",
+      "visibility": "public",
+      "summary": "Naturalistic road user trajectories recorded by drones at multiple German roundabouts. Provides georeferenced trajectories, metadata, and digital map representations (e.g., Lanelet2 and OpenDRIVE) to support behavior modeling and safety validation around roundabouts.",
+      "highlights": ["Top-down drone viewpoint", "Roundabout scenarios", "Digital maps (Lanelet2 + OpenDRIVE)"],
+      "capabilities": {
+        "has_map": true,
+        "has_traffic_lights": false,
+        "coordinate_frame": "global (geo-referenced)",
+        "scene_unit": "recording / location"
+      },
+      "links": [{ "label": "Dataset website", "url": "https://levelxdata.com/round-dataset/" }],
+      "app": { "supported": false, "family": null }
+    }
+  ]
+}
+

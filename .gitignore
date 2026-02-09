@@ -20,11 +20,17 @@ scripts/
 tmp/
 output/
 
+# Offline preprocessing / experiments (keep local; not part of the app)
+tools/considerit/
+
 # Datasets (large, local-only)
 dataset/v2x-traj/
 dataset/full-dataset/
 dataset/V2X-Seq-TFD-Example/
 dataset/ConsiderIt/
+
+# Local dataset overrides (private paths / basemap origins)
+dataset/registry.local.json
 
 # Generated profiling outputs
 dataset/PROFILE_REPORT.md

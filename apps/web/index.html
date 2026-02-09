@@ -19,29 +19,64 @@
               <div class="homeSubtitle">
                 An interactive viewer for multi-agent trajectory datasets: scenes, playback, trajectories, per-class filters, and maps when available.
               </div>
+              <div id="homeStats" class="homeStats"></div>
             </div>
 
-            <div class="homeControls">
+            <div class="homeControls homeControls--hub">
               <label class="field homeField">
-                <span>Choose a dataset</span>
-                <select id="homeDatasetSelect"></select>
+                <span>Find a dataset</span>
+                <input id="homeSearch" class="textInput" placeholder="Search by name, scenario, or keyword..." />
               </label>
-              <button id="homeStartBtn" class="btn" type="button">Open Explorer</button>
+
+              <div class="homeFilters" aria-label="Dataset filters">
+                <label class="field field--compact">
+                  <span>Category</span>
+                  <select id="homeCategory">
+                    <option value="" selected>All</option>
+                  </select>
+                </label>
+                <label class="field field--compact">
+                  <span>HD map</span>
+                  <select id="homeHasMap">
+                    <option value="" selected>All</option>
+                    <option value="yes">Yes</option>
+                    <option value="no">No</option>
+                    <option value="unknown">Unknown</option>
+                  </select>
+                </label>
+                <label class="field field--compact">
+                  <span>Traffic lights</span>
+                  <select id="homeHasTL">
+                    <option value="" selected>All</option>
+                    <option value="yes">Yes</option>
+                    <option value="no">No</option>
+                    <option value="unknown">Unknown</option>
+                  </select>
+                </label>
+                <label class="field field--compact">
+                  <span>Sort</span>
+                  <select id="homeSort">
+                    <option value="available" selected>Available first</option>
+                    <option value="year_desc">Year (new → old)</option>
+                    <option value="title_asc">Title (A → Z)</option>
+                  </select>
+                </label>
+              </div>
             </div>
 
             <div id="homeError" class="homeError" hidden></div>
 
-            <div id="homeDatasetMeta" class="homeMeta"></div>
+            <div id="homeDatasetCards" class="dsList" aria-label="Dataset catalog"></div>
 
             <div class="homeFoot">
-              Tip: you can switch datasets later; each dataset keeps its own settings.
+              Tip: open a supported dataset to explore it. More datasets can be added later without changing the explorer UI.
             </div>
           </div>
 
           <aside class="homeAside" aria-label="App overview">
             <div class="homeAside__title">What You Can Do</div>
             <div class="homeBullets">
-              <div class="homeBullet"><b>Browse scenes:</b> fast next/prev, list paging, and jump to a scene ID.</div>
+              <div class="homeBullet"><b>Browse scenes:</b> fast next/prev and jump to a scene ID.</div>
               <div class="homeBullet"><b>Play trajectories:</b> scrub time, click an object, and show its full path.</div>
               <div class="homeBullet"><b>See motion:</b> velocity arrows (movement) and heading arrows (orientation).</div>
               <div class="homeBullet"><b>Filter intelligently:</b> by modality, type, and fine-grained class (subtype).</div>
@@ -87,42 +122,35 @@
               <span id="groupLabel">Intersection</span>
               <select id="intersectSelect"></select>
             </label>
-
-            <label class="field field--scene">
-              <span>Scene</span>
-              <div class="sceneRow">
-                <select id="sceneSelect"></select>
-                <button id="prevSceneBtn" class="btn btn--ghost btn--sm btn--icon" type="button" title="Previous scene" aria-label="Previous scene">&lt;</button>
-                <button id="nextSceneBtn" class="btn btn--ghost btn--sm btn--icon" type="button" title="Next scene" aria-label="Next scene">&gt;</button>
-              </div>
-            </label>
           </div>
         </div>
 
-        <div class="topbar__row topbar__row--secondary">
-          <div id="sceneHint" class="hint"></div>
-          <div class="sceneTools sceneTools--bar">
-            <div class="barLabel">Scene list</div>
-            <button id="prevPageBtn" class="btn btn--ghost btn--sm btn--icon" type="button" title="Show earlier scenes in the scene list" aria-label="Previous scene list">&laquo;</button>
-            <div id="pageLabel" class="pageLabel">Scenes 0-0 of 0</div>
-            <button id="nextPageBtn" class="btn btn--ghost btn--sm btn--icon" type="button" title="Show later scenes in the scene list" aria-label="Next scene list">&raquo;</button>
-            <select id="sceneLimitSelect" title="Scenes shown in the list">
-              <option value="100">100</option>
-              <option value="200">200</option>
-              <option value="400" selected>400</option>
-              <option value="800">800</option>
-              <option value="2000">2000</option>
-            </select>
-            <div class="sceneJumpWrap">
-              <input id="sceneJumpInput" class="sceneJump" inputmode="numeric" placeholder="Scene ID…" />
-              <button id="sceneGoBtn" class="btn btn--ghost btn--sm" type="button" title="Jump to a scene ID">Jump</button>
-            </div>
-          </div>
-        </div>
       </header>
 
       <main class="layout">
       <aside class="panel">
+        <div class="panel__section" id="sceneNavSection">
+          <div class="panel__title">Scene</div>
+          <div id="sceneHint" class="hint hint--block"></div>
+
+          <label class="field field--panelScene">
+            <span>Current scene</span>
+            <div class="sceneRow sceneRow--panel">
+              <select id="sceneSelect"></select>
+              <button id="prevSceneBtn" class="btn btn--ghost btn--sm btn--icon" type="button" title="Previous scene" aria-label="Previous scene">&lt;</button>
+              <button id="nextSceneBtn" class="btn btn--ghost btn--sm btn--icon" type="button" title="Next scene" aria-label="Next scene">&gt;</button>
+            </div>
+          </label>
+
+          <label class="field field--panelScene">
+            <span>Go to scene ID</span>
+            <div class="sceneJumpRow">
+              <input id="sceneJumpInput" class="sceneJump" inputmode="numeric" placeholder="e.g., 123" />
+              <button id="sceneGoBtn" class="btn btn--ghost btn--sm" type="button" title="Jump to a scene ID">Jump</button>
+            </div>
+          </label>
+        </div>
+
         <div class="panel__section">
           <div class="panel__title" id="modalitiesTitle">Modalities</div>
           <label class="check" id="layerEgoWrap"><input type="checkbox" id="layerEgo" checked /> <span id="layerEgoText">Ego vehicle</span></label>
@@ -181,6 +209,11 @@
 	            <button id="fitSceneBtn" class="btn btn--ghost">Fit trajectories</button>
 	            <button id="fitMapBtn" class="btn btn--ghost">Fit Map</button>
 	          </div>
+            <div id="basemapControls" hidden>
+              <div class="panel__subhead">Basemap</div>
+              <label class="check small"><input type="checkbox" id="showBasemap" /> Show basemap (OpenStreetMap)</label>
+              <div id="basemapStatus" class="hint" hidden></div>
+            </div>
 	          <div id="mapOnlyControls">
 	            <label class="field">
 	              <span>Scope</span>

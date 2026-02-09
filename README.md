@@ -10,7 +10,7 @@ scene browsing, playback, full trajectories, per-class filters, and HD map rende
 ## Features
 
 - Dataset picker with per-dataset settings (saved locally in your browser)
-- Scene navigation (next/prev, list paging, jump to scene ID)
+- Scene navigation (next/prev, jump to scene ID)
 - Playback (play/pause, next frame, speed control)
 - Visual layers: trajectories, velocity arrows, heading arrows
 - Filters: modality/stream, object type, and fine-grained classes (subtypes)
@@ -59,6 +59,17 @@ Then open:
 - Map: supported (HD map rendering)
 
 Note: this repo includes a small, precomputed scene index in `dataset/profiles/v2x-traj/` (not the dataset itself).
+
+### Consider.it CPM Objects (private) (`family: cpm-objects`)
+
+- Splits: treated as a single continuous log (`all`)
+- Grouping: sensor log (CSV file) -> scenes as gap-aware time windows (capped duration)
+- Map: not available (local sensor coordinates)
+- Optional basemap (OpenStreetMap): supported if you provide a geo origin (lat/lon) in `dataset/registry.local.json`
+- Sensors observed in the dataset folder: roadside LiDAR (RSUs) and thermal camera logs
+- Annotations: object detections with a fine-grained class id (decoded from `sensor_interface-v1.2.1.proto`)
+
+Note: this dataset is private and is not distributed with this repository.
 
 
 ## Keyboard shortcuts

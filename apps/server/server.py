@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+from collections import OrderedDict
 import json
 import mimetypes
 import os
@@ -10,12 +11,15 @@ import posixpath
 import signal
 import subprocess
 import sys
+import threading
 import time
 import traceback
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qs, urlparse
+from urllib.request import Request, urlopen
 
 try:
     # Preferred when running as a module: `python -m apps.server.server`
@@ -23,6 +27,11 @@ try:
 except ModuleNotFoundError:
     # Fallback when running as a script: `python apps/server/server.py`
     from datasets import DatasetStore  # type: ignore
+
+
+_TILE_CACHE_MAX = 512
+_tile_cache: "OrderedDict[str, tuple[bytes, str]]" = OrderedDict()
+_tile_cache_lock = threading.Lock()
 
 
 def json_bytes(obj: object) -> bytes:
@@ -42,6 +51,9 @@ def _reload_watch_files(repo_root: Path) -> list[Path]:
     out.extend(sorted((repo_root / "apps" / "server").rglob("*.py")))
     # Registry changes affect dataset discovery.
     out.append(repo_root / "dataset" / "registry.json")
+    out.append(repo_root / "dataset" / "registry.local.json")
+    # Catalog changes affect landing-page metadata.
+    out.append(repo_root / "dataset" / "catalog.json")
     return [p for p in out if p.exists()]
 
 
@@ -136,15 +148,22 @@ class AppHandler(BaseHTTPRequestHandler):
         return self.server.store  # type: ignore[attr-defined]
 
     @property
+    def repo_root(self) -> Path:
+        return self.server.repo_root  # type: ignore[attr-defined]
+
+    @property
     def web_root(self) -> Path:
         return self.server.web_root  # type: ignore[attr-defined]
 
-    def _send(self, status: int, body: bytes, content_type: str) -> None:
+    def _send(self, status: int, body: bytes, content_type: str, extra_headers: dict[str, str] | None = None) -> None:
         self.send_response(status)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
         # Same-origin by default, but allowing CORS helps local dev.
         self.send_header("Access-Control-Allow-Origin", "*")
+        if extra_headers:
+            for k, v in extra_headers.items():
+                self.send_header(str(k), str(v))
         self.end_headers()
         self.wfile.write(body)
 
@@ -161,6 +180,20 @@ class AppHandler(BaseHTTPRequestHandler):
         try:
             if path == "/api/health":
                 self._send_json(200, {"ok": True})
+                return
+
+            # Small same-origin tile proxy (helps when adblock/CORS blocks public tile servers).
+            if path.startswith("/api/tiles/"):
+                self._handle_tiles(path)
+                return
+
+            if path == "/api/catalog":
+                catalog_path = (self.repo_root / "dataset" / "catalog.json").resolve()
+                if not catalog_path.exists():
+                    self._send_error_json(404, "not_found", "catalog.json not found")
+                    return
+                raw = json.loads(catalog_path.read_text(encoding="utf-8"))
+                self._send_json(200, raw)
                 return
 
             if path == "/api/datasets":
@@ -233,6 +266,83 @@ class AppHandler(BaseHTTPRequestHandler):
             tb = traceback.format_exc(limit=5)
             self._send_error_json(500, "internal_error", f"{e}\n{tb}")
 
+    def _handle_tiles(self, path: str) -> None:
+        """
+        Same-origin OSM tile proxy.
+
+        Route:
+          /api/tiles/osm/{z}/{x}/{y}.png
+        """
+        parts = path.strip("/").split("/")
+        if len(parts) != 6 or parts[0] != "api" or parts[1] != "tiles":
+            self._send_error_json(404, "not_found")
+            return
+
+        provider = parts[2]
+        if provider != "osm":
+            self._send_error_json(404, "not_found", f"unknown tile provider: {provider}")
+            return
+
+        try:
+            z = int(parts[3])
+            x = int(parts[4])
+            y_part = parts[5]
+            if not y_part.endswith(".png"):
+                raise ValueError("expected .png")
+            y = int(y_part[:-4])
+        except Exception:
+            self._send_error_json(400, "bad_request", "invalid tile coordinates")
+            return
+
+        if z < 0 or z > 22:
+            self._send_error_json(400, "bad_request", "z out of range")
+            return
+        n = 2 ** z
+        if x < 0 or x >= n or y < 0 or y >= n:
+            self._send_error_json(400, "bad_request", "x/y out of range")
+            return
+
+        key = f"osm:{z}/{x}/{y}"
+        with _tile_cache_lock:
+            cached = _tile_cache.get(key)
+            if cached is not None:
+                _tile_cache.move_to_end(key)
+                body, ctype = cached
+                self._send(200, body, ctype, extra_headers={"Cache-Control": "public, max-age=86400"})
+                return
+
+        remote = f"https://tile.openstreetmap.org/{z}/{x}/{y}.png"
+        try:
+            req = Request(
+                remote,
+                headers={
+                    # A descriptive UA helps tile providers; keep it short (local dev tool).
+                    "User-Agent": f"{self.server_version} (+local dev)",
+                    "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
+                },
+            )
+            with urlopen(req, timeout=10) as resp:
+                body = resp.read()
+                ctype = resp.headers.get("Content-Type") or "image/png"
+        except (HTTPError, URLError) as e:
+            self._send_error_json(502, "tile_fetch_failed", f"{e}")
+            return
+        except Exception as e:
+            self._send_error_json(502, "tile_fetch_failed", f"{e}")
+            return
+
+        if not body:
+            self._send_error_json(502, "tile_fetch_failed", "empty tile response")
+            return
+
+        with _tile_cache_lock:
+            _tile_cache[key] = (body, ctype)
+            _tile_cache.move_to_end(key)
+            while len(_tile_cache) > _TILE_CACHE_MAX:
+                _tile_cache.popitem(last=False)
+
+        self._send(200, body, ctype, extra_headers={"Cache-Control": "public, max-age=86400"})
+
     def _handle_static(self, path: str) -> None:
         # Default doc
         if path == "/":
@@ -284,6 +394,7 @@ def main() -> int:
     server = ThreadingHTTPServer((args.host, args.port), AppHandler)
     server.store = store  # type: ignore[attr-defined]
     server.web_root = web_root  # type: ignore[attr-defined]
+    server.repo_root = repo_root  # type: ignore[attr-defined]
 
     print(f"Serving on http://{args.host}:{args.port}")
     print(f"Web root: {web_root}")

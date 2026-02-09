@@ -153,6 +153,13 @@ class DatasetSpec:
     root: Path
     profile: Optional[Path] = None
     scenes: Optional[Path] = None
+    # Optional basemap config for datasets that are in a local sensor frame but have a known geo origin.
+    # Origin is (lat, lon) in degrees and corresponds to world (x=0, y=0) for that dataset.
+    geo_origin: Optional[Tuple[float, float]] = None
+    # Optional per-group origin overrides (group == intersect_id in the API; for CPM Objects this is the sensor_id).
+    geo_origin_by_intersect: Optional[Dict[str, Tuple[float, float]]] = None
+    basemap_tile_url: Optional[str] = None
+    basemap_attribution: Optional[str] = None
 
 
 @dataclass
@@ -1357,20 +1364,112 @@ class _LRUCache:
 
 
 def load_registry(repo_root: Path) -> List[DatasetSpec]:
+    def _resolve_path(p: Optional[str]) -> Optional[Path]:
+        if not p:
+            return None
+        s = str(p)
+        try:
+            pp = Path(s).expanduser()
+        except Exception:
+            return None
+        if pp.is_absolute():
+            return pp.resolve()
+        return (repo_root / s).resolve()
+
+    def _parse_lat_lon(obj: Any) -> Optional[Tuple[float, float]]:
+        if obj is None:
+            return None
+        lat: Any = None
+        lon: Any = None
+        if isinstance(obj, dict):
+            lat = obj.get("lat", obj.get("latitude"))
+            lon = obj.get("lon", obj.get("lng", obj.get("longitude")))
+        elif isinstance(obj, (list, tuple)) and len(obj) >= 2:
+            lat = obj[0]
+            lon = obj[1]
+        else:
+            return None
+        try:
+            lat_f = float(lat)
+            lon_f = float(lon)
+        except Exception:
+            return None
+        if not (-90.0 <= lat_f <= 90.0 and -180.0 <= lon_f <= 180.0):
+            return None
+        return (lat_f, lon_f)
+
+    def _merge_registry(base: Dict[str, Any], local: Dict[str, Any]) -> Dict[str, Any]:
+        merged = {"datasets": []}
+        base_items = list(base.get("datasets", []) or [])
+        local_items = list(local.get("datasets", []) or [])
+        by_id: Dict[str, Dict[str, Any]] = {}
+        ordered: List[str] = []
+        for it in base_items:
+            if not isinstance(it, dict) or "id" not in it:
+                continue
+            iid = str(it["id"])
+            by_id[iid] = dict(it)
+            ordered.append(iid)
+        for it in local_items:
+            if not isinstance(it, dict) or "id" not in it:
+                continue
+            iid = str(it["id"])
+            if iid in by_id:
+                # Local overrides base keys.
+                by_id[iid].update(it)
+            else:
+                by_id[iid] = dict(it)
+                ordered.append(iid)
+        merged["datasets"] = [by_id[i] for i in ordered if i in by_id]
+        return merged
+
     registry_path = repo_root / "dataset" / "registry.json"
     if not registry_path.exists():
         return []
-    raw = json.loads(registry_path.read_text())
+    raw_base = json.loads(registry_path.read_text())
+
+    # Optional local overrides (private paths / basemap origins, etc).
+    raw_local: Dict[str, Any] = {}
+    local_path = repo_root / "dataset" / "registry.local.json"
+    if local_path.exists():
+        try:
+            raw_local = json.loads(local_path.read_text())
+        except Exception:
+            raw_local = {}
+
+    raw = _merge_registry(raw_base, raw_local) if raw_local else raw_base
+
     out: List[DatasetSpec] = []
     for d in raw.get("datasets", []):
+        if not isinstance(d, dict):
+            continue
         try:
+            root = _resolve_path(d.get("root"))
+            if root is None:
+                raise ValueError("missing root")
+            basemap = d.get("basemap") if isinstance(d.get("basemap"), dict) else {}
+            geo_origin = _parse_lat_lon(basemap.get("origin")) if basemap else None
+            geo_by: Optional[Dict[str, Tuple[float, float]]] = None
+            if basemap and isinstance(basemap.get("origin_by_intersect"), dict):
+                geo_by = {}
+                for k, v in basemap["origin_by_intersect"].items():
+                    ll = _parse_lat_lon(v)
+                    if ll is not None:
+                        geo_by[str(k)] = ll
+                if not geo_by:
+                    geo_by = None
+
             ds = DatasetSpec(
                 id=str(d["id"]),
                 title=str(d.get("title") or d["id"]),
                 family=str(d.get("family") or "generic"),
-                root=(repo_root / str(d["root"])).resolve(),
-                profile=(repo_root / str(d["profile"])).resolve() if d.get("profile") else None,
-                scenes=(repo_root / str(d["scenes"])).resolve() if d.get("scenes") else None,
+                root=root,
+                profile=_resolve_path(d.get("profile")) if d.get("profile") else None,
+                scenes=_resolve_path(d.get("scenes")) if d.get("scenes") else None,
+                geo_origin=geo_origin,
+                geo_origin_by_intersect=geo_by,
+                basemap_tile_url=str(basemap.get("tile_url")) if basemap and basemap.get("tile_url") else None,
+                basemap_attribution=str(basemap.get("attribution")) if basemap and basemap.get("attribution") else None,
             )
         except Exception:
             continue
@@ -1405,7 +1504,7 @@ class DatasetStore:
                 "modality_short_labels": {"ego": "Ego", "infra": "Infra", "vehicle": "Vehicles", "traffic_light": "Lights"},
             }
         if spec.family == "cpm-objects":
-            return {
+            meta: Dict[str, Any] = {
                 "splits": ["all"],
                 "default_split": "all",
                 "group_label": "Sensor",
@@ -1415,6 +1514,19 @@ class DatasetStore:
                 "modality_labels": {"infra": "Objects"},
                 "modality_short_labels": {"infra": "Objects"},
             }
+            if spec.geo_origin or spec.geo_origin_by_intersect:
+                bm: Dict[str, Any] = {
+                    "provider": "osm",
+                    # Prefer same-origin tile proxy to avoid client-side adblock/CORS issues.
+                    "tile_url": spec.basemap_tile_url or "/api/tiles/osm/{z}/{x}/{y}.png",
+                    "attribution": spec.basemap_attribution or "© OpenStreetMap contributors",
+                }
+                if spec.geo_origin:
+                    bm["origin"] = {"lat": spec.geo_origin[0], "lon": spec.geo_origin[1]}
+                if spec.geo_origin_by_intersect:
+                    bm["origin_by_intersect"] = {k: {"lat": v[0], "lon": v[1]} for k, v in spec.geo_origin_by_intersect.items()}
+                meta["basemap"] = bm
+            return meta
         return {
             "splits": ["all"],
             "default_split": "all",
@@ -1429,14 +1541,17 @@ class DatasetStore:
         out = []
         for spec in self.specs.values():
             meta = self._dataset_meta(spec)
-            out.append(
-                {
-                    "id": spec.id,
-                    "title": spec.title,
-                    "family": spec.family,
-                    **meta,
-                }
-            )
+            supported = spec.id in self.adapters
+            item: Dict[str, Any] = {
+                "id": spec.id,
+                "title": spec.title,
+                "family": spec.family,
+                "supported": supported,
+                **meta,
+            }
+            if not supported:
+                item["unsupported_reason"] = f"Unsupported dataset family: {spec.family}"
+            out.append(item)
         return out
 
     def get_adapter(self, dataset_id: str) -> Any:
