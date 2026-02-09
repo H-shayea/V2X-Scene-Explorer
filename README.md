@@ -1,6 +1,6 @@
 # V2X Scene Explorer
 
-Owner: Hassan
+Maintainer: Hassan
 
 V2X Scene Explorer is a lightweight, dependency-free web app for exploring multi-agent trajectory datasets:
 scene browsing, playback, full trajectories, per-class filters, and HD map rendering when available.
@@ -83,3 +83,7 @@ Note: this repo includes a small, precomputed scene index in `dataset/profiles/v
 - Empty dataset list / startup issue: verify `dataset/registry.json` exists and points to valid paths.
 - Scene list loads but scene rendering fails: confirm the dataset folder exists and contains the expected files.
 - Port already in use: run with a different `--port`.
+
+## License
+
+MIT (see `LICENSE`).

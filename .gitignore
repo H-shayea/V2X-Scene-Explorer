@@ -39,8 +39,3 @@ dataset/profiles/**
 # Large local assets
 Map1.png
 Cooperative Trajectory.pdf
-
-# Folder for local-only scripts and notebooks
-jupyter-notebooks/
-scripts/
-tutorials/
