@@ -74,9 +74,12 @@ Note: this repo includes a small, precomputed scene index in `dataset/profiles/v
 - Frontend: `apps/web/` (vanilla HTML/CSS/JS; no build tools)
 - Dataset config: `dataset/registry.json`
 
+## Tutorials
+
+- `tutorials/01_scenes.md` - how this project defines "scenes" for each dataset family.
+
 ## Troubleshooting
 
 - Empty dataset list / startup issue: verify `dataset/registry.json` exists and points to valid paths.
 - Scene list loads but scene rendering fails: confirm the dataset folder exists and contains the expected files.
 - Port already in use: run with a different `--port`.
-
