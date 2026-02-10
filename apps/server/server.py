@@ -8,6 +8,7 @@ import json
 import mimetypes
 import os
 import posixpath
+import re
 import signal
 import subprocess
 import sys
@@ -23,15 +24,26 @@ from urllib.request import Request, urlopen
 
 try:
     # Preferred when running as a module: `python -m apps.server.server`
+    from apps.app_meta import APP_NAME, APP_VERSION, DEFAULT_UPDATE_REPO
     from apps.server.datasets import DatasetStore
 except ModuleNotFoundError:
     # Fallback when running as a script: `python apps/server/server.py`
+    APP_NAME = "V2X Scene Explorer"
+    APP_VERSION = str(os.environ.get("TRAJ_APP_VERSION") or "0.2.0").strip() or "0.2.0"
+    DEFAULT_UPDATE_REPO = str(os.environ.get("TRAJ_UPDATE_REPO") or "H-shayea/V2X-Scene-Explorer").strip()
     from datasets import DatasetStore  # type: ignore
 
 
 _TILE_CACHE_MAX = 512
 _tile_cache: "OrderedDict[str, tuple[bytes, str]]" = OrderedDict()
 _tile_cache_lock = threading.Lock()
+
+_UPDATE_CACHE_TTL_S = 5 * 60
+_update_cache_lock = threading.Lock()
+_update_cache_key = ""
+_update_cache_ts = 0.0
+_update_cache_payload: dict[str, object] | None = None
+_SEMVER_RE = re.compile(r"^v?(\d+)\.(\d+)\.(\d+)(?:[-+].*)?$")
 
 
 def json_bytes(obj: object) -> bytes:
@@ -44,6 +56,157 @@ def clamp_int(s: str, default: int, min_v: int, max_v: int) -> int:
     except Exception:
         return default
     return max(min_v, min(max_v, v))
+
+
+def _now_utc_iso() -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def _update_repo() -> str:
+    return str(os.environ.get("TRAJ_UPDATE_REPO") or DEFAULT_UPDATE_REPO or "").strip()
+
+
+def _normalize_ver(s: str) -> str:
+    return str(s or "").strip().lstrip("vV")
+
+
+def _parse_semver(s: str) -> tuple[int, int, int] | None:
+    m = _SEMVER_RE.match(str(s or "").strip())
+    if not m:
+        return None
+    try:
+        return int(m.group(1)), int(m.group(2)), int(m.group(3))
+    except Exception:
+        return None
+
+
+def _is_update_available(current_version: str, latest_tag: str) -> tuple[bool, bool, str]:
+    """
+    Returns:
+      (update_available, comparison_confident, comparison_mode)
+    """
+    cur = _normalize_ver(current_version)
+    latest = _normalize_ver(latest_tag)
+    if not latest:
+        return False, False, "missing_latest"
+    if latest == cur:
+        return False, True, "equal"
+
+    cur_sv = _parse_semver(cur)
+    latest_sv = _parse_semver(latest)
+    if cur_sv is None or latest_sv is None:
+        # If we can't compare semver safely, do not auto-claim an update.
+        return False, False, "unknown"
+    return latest_sv > cur_sv, True, "semver"
+
+
+def _pick_release_download_url(release: dict) -> str | None:
+    assets = release.get("assets")
+    if isinstance(assets, list):
+        for a in assets:
+            if not isinstance(a, dict):
+                continue
+            name = str(a.get("name") or "")
+            url = str(a.get("browser_download_url") or "")
+            if url and name.lower().endswith(".dmg"):
+                return url
+    rel = str(release.get("html_url") or "").strip()
+    return rel or None
+
+
+def _fetch_update_payload_uncached() -> dict[str, object]:
+    repo = _update_repo()
+    base: dict[str, object] = {
+        "ok": True,
+        "checked_at": _now_utc_iso(),
+        "app_name": APP_NAME,
+        "app_version": APP_VERSION,
+        "update_repo": repo or None,
+        "releases_url": f"https://github.com/{repo}/releases" if repo else None,
+        "desktop": str(os.environ.get("TRAJ_DESKTOP_APP") or "0") == "1",
+        "latest_tag": None,
+        "latest_version": None,
+        "update_available": False,
+        "comparison_confident": False,
+        "comparison_mode": "not_configured",
+        "release_name": None,
+        "release_url": None,
+        "download_url": None,
+        "published_at": None,
+        "error": None,
+    }
+    if not repo:
+        return base
+
+    url = f"https://api.github.com/repos/{repo}/releases/latest"
+    try:
+        req = Request(
+            url,
+            headers={
+                "Accept": "application/vnd.github+json",
+                "User-Agent": f"TrajExplorer/{APP_VERSION}",
+            },
+        )
+        with urlopen(req, timeout=8) as resp:
+            raw = json.loads(resp.read().decode("utf-8", errors="replace"))
+    except Exception as e:
+        base["ok"] = False
+        base["error"] = str(e)
+        base["comparison_mode"] = "error"
+        return base
+
+    if not isinstance(raw, dict):
+        base["ok"] = False
+        base["error"] = "invalid response from release API"
+        base["comparison_mode"] = "error"
+        return base
+
+    latest_tag = str(raw.get("tag_name") or "").strip()
+    latest_version = _normalize_ver(latest_tag)
+    update_available, confident, mode = _is_update_available(APP_VERSION, latest_tag)
+
+    base["latest_tag"] = latest_tag or None
+    base["latest_version"] = latest_version or None
+    base["update_available"] = bool(update_available)
+    base["comparison_confident"] = bool(confident)
+    base["comparison_mode"] = mode
+    base["release_name"] = str(raw.get("name") or "").strip() or None
+    base["release_url"] = str(raw.get("html_url") or "").strip() or None
+    base["download_url"] = _pick_release_download_url(raw)
+    base["published_at"] = str(raw.get("published_at") or "").strip() or None
+    return base
+
+
+def get_update_payload(force: bool = False) -> dict[str, object]:
+    global _update_cache_key, _update_cache_ts, _update_cache_payload
+    key = f"{_update_repo()}|{APP_VERSION}"
+    now = time.time()
+    with _update_cache_lock:
+        if (
+            not force
+            and _update_cache_payload is not None
+            and _update_cache_key == key
+            and (now - _update_cache_ts) < _UPDATE_CACHE_TTL_S
+        ):
+            return dict(_update_cache_payload)
+
+    payload = _fetch_update_payload_uncached()
+    with _update_cache_lock:
+        _update_cache_key = key
+        _update_cache_ts = now
+        _update_cache_payload = dict(payload)
+    return payload
+
+
+def get_app_meta() -> dict[str, object]:
+    repo = _update_repo()
+    return {
+        "app_name": APP_NAME,
+        "app_version": APP_VERSION,
+        "desktop": str(os.environ.get("TRAJ_DESKTOP_APP") or "0") == "1",
+        "update_repo": repo or None,
+        "releases_url": f"https://github.com/{repo}/releases" if repo else None,
+    }
 
 
 def _reload_watch_files(repo_root: Path) -> list[Path]:
@@ -126,7 +289,7 @@ def run_with_reload(repo_root: Path, host: str, port: int) -> int:
 
 
 class AppHandler(BaseHTTPRequestHandler):
-    server_version = "TrajExplorer/0.1"
+    server_version = f"TrajExplorer/{APP_VERSION}"
 
     def do_GET(self) -> None:  # noqa: N802
         parsed = urlparse(self.path)
@@ -180,6 +343,15 @@ class AppHandler(BaseHTTPRequestHandler):
         try:
             if path == "/api/health":
                 self._send_json(200, {"ok": True})
+                return
+
+            if path == "/api/app_meta":
+                self._send_json(200, get_app_meta())
+                return
+
+            if path == "/api/update/check":
+                force = (qs.get("force", ["0"])[0] or "0") == "1"
+                self._send_json(200, get_update_payload(force=force))
                 return
 
             # Small same-origin tile proxy (helps when adblock/CORS blocks public tile servers).

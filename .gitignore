@@ -19,6 +19,9 @@ scripts/
 # Local outputs
 tmp/
 output/
+build/
+dist/
+*.spec
 
 # Offline preprocessing / experiments (keep local; not part of the app)
 tools/considerit/

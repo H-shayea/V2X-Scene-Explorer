@@ -1423,14 +1423,26 @@ def load_registry(repo_root: Path) -> List[DatasetSpec]:
         merged["datasets"] = [by_id[i] for i in ordered if i in by_id]
         return merged
 
-    registry_path = repo_root / "dataset" / "registry.json"
+    registry_path_env = str(os.environ.get("TRAJ_REGISTRY_PATH") or "").strip()
+    if registry_path_env:
+        registry_path = _resolve_path(registry_path_env)
+        if registry_path is None:
+            return []
+    else:
+        registry_path = repo_root / "dataset" / "registry.json"
     if not registry_path.exists():
         return []
     raw_base = json.loads(registry_path.read_text())
 
     # Optional local overrides (private paths / basemap origins, etc).
     raw_local: Dict[str, Any] = {}
-    local_path = repo_root / "dataset" / "registry.local.json"
+    local_path_env = str(os.environ.get("TRAJ_REGISTRY_LOCAL") or "").strip()
+    if local_path_env:
+        local_path = _resolve_path(local_path_env)
+    else:
+        local_path = repo_root / "dataset" / "registry.local.json"
+    if local_path is None:
+        local_path = repo_root / "dataset" / "registry.local.json"
     if local_path.exists():
         try:
             raw_local = json.loads(local_path.read_text())

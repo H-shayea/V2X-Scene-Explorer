@@ -459,6 +459,10 @@ const state = {
   homeHasMap: "",
   homeHasTL: "",
   homeSort: "available",
+  appMeta: null,
+  updateInfo: null,
+  updateDownloadUrl: "",
+  updateBusy: false,
 };
 
 const req = { intersections: 0, scenes: 0, bundle: 0 };
@@ -2316,6 +2320,99 @@ function setHomeError(msg) {
   el.textContent = m;
 }
 
+function setUpdateHint(msg, tone = "") {
+  const el = $("updateHint");
+  if (!el) return;
+  const m = String(msg || "").trim();
+  if (!m) {
+    el.hidden = true;
+    el.textContent = "";
+    el.classList.remove("hint--ok", "hint--warn", "hint--bad");
+    return;
+  }
+  el.hidden = false;
+  el.textContent = m;
+  el.classList.remove("hint--ok", "hint--warn", "hint--bad");
+  if (tone === "ok") el.classList.add("hint--ok");
+  else if (tone === "warn") el.classList.add("hint--warn");
+  else if (tone === "bad") el.classList.add("hint--bad");
+}
+
+function syncUpdateUi() {
+  const badge = $("appVersionBadge");
+  const checkBtn = $("checkUpdateBtn");
+  const dlBtn = $("downloadUpdateBtn");
+  const meta = state.appMeta || null;
+  const upd = state.updateInfo || null;
+
+  const ver = meta && meta.app_version ? String(meta.app_version) : null;
+  if (badge) badge.textContent = ver ? `v${ver}` : "v?";
+  if (checkBtn) {
+    checkBtn.disabled = !!state.updateBusy;
+    checkBtn.textContent = state.updateBusy ? "Checking..." : "Check updates";
+  }
+  if (dlBtn) {
+    const canDownload = !!(upd && upd.update_available && state.updateDownloadUrl);
+    dlBtn.hidden = !canDownload;
+    dlBtn.disabled = !canDownload;
+  }
+}
+
+async function loadAppMeta() {
+  try {
+    const data = await fetchJson("/api/app_meta");
+    state.appMeta = data || null;
+  } catch (_) {
+    state.appMeta = null;
+  }
+  syncUpdateUi();
+}
+
+async function checkForUpdates({ force = false, userInitiated = false } = {}) {
+  if (state.updateBusy) return;
+  state.updateBusy = true;
+  syncUpdateUi();
+
+  try {
+    const qs = new URLSearchParams({ force: force ? "1" : "0" });
+    const data = await fetchJson(`/api/update/check?${qs.toString()}`);
+    state.updateInfo = data || null;
+
+    const latest = data && data.latest_version ? `v${data.latest_version}` : null;
+    const current = data && data.app_version ? `v${data.app_version}` : null;
+    state.updateDownloadUrl = String((data && (data.download_url || data.release_url || "")) || "").trim();
+
+    if (!data || data.ok === false) {
+      const err = data && data.error ? String(data.error) : "Update check failed.";
+      setUpdateHint(err, userInitiated ? "bad" : "");
+      syncUpdateUi();
+      return;
+    }
+
+    if (data.update_available) {
+      setUpdateHint(`Update available: ${latest || "new release"} (current ${current || "unknown"}).`, "warn");
+      syncUpdateUi();
+      return;
+    }
+
+    if (latest && data.comparison_confident === false) {
+      setUpdateHint(`Latest release found (${latest}). Version format differs from current app version.`, "warn");
+      syncUpdateUi();
+      return;
+    }
+
+    if (userInitiated) {
+      setUpdateHint(`You are up to date (${current || "current version"}).`, "ok");
+    }
+  } catch (e) {
+    const msg = `Update check failed: ${e && e.message ? e.message : String(e)}`;
+    setUpdateHint(msg, userInitiated ? "bad" : "");
+  } finally {
+    state.updateBusy = false;
+    syncUpdateUi();
+  }
+}
+
 async function openExplorerForDataset(datasetId, { savePrev = true } = {}) {
   const next = String(datasetId || "").trim();
   if (!next) return;
@@ -2484,6 +2581,24 @@ function wireUi() {
       syncControlsFromState();
       renderHomeDatasetCards();
       setHomeError("");
+    });
+  }
+
+  const checkUpdateBtn = $("checkUpdateBtn");
+  if (checkUpdateBtn) {
+    checkUpdateBtn.addEventListener("click", () => {
+      checkForUpdates({ force: true, userInitiated: true }).catch(() => {});
+    });
+  }
+
+  const dlBtn = $("downloadUpdateBtn");
+  if (dlBtn) {
+    dlBtn.addEventListener("click", () => {
+      const url = String(state.updateDownloadUrl || "").trim();
+      if (!url) return;
+      try {
+        window.open(url, "_blank", "noopener");
+      } catch (_) {}
     });
   }
 
@@ -2982,6 +3097,7 @@ async function main() {
   wireUi();
   wireHomeUi();
   setView("home");
+  syncUpdateUi();
 
   await loadDatasets();
   await loadCatalog();
@@ -2993,6 +3109,11 @@ async function main() {
   const sortSel = $("homeSort");
   if (sortSel) sortSel.value = String(state.homeSort || "available");
   renderHomeDatasetCards();
+
+  // Update checks run in the background and should not block loading datasets.
+  loadAppMeta()
+    .then(() => checkForUpdates({ force: false, userInitiated: false }))
+    .catch(() => {});
 
   window.addEventListener("beforeunload", () => {
     if (state.started) saveCurrentDatasetSettings();

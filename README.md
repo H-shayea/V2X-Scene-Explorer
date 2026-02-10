@@ -50,6 +50,118 @@ Then open:
 
 - http://127.0.0.1:8000
 
+### 3) Run as a native macOS desktop app (local dev)
+
+From the repo root:
+
+```bash
+python3 -m pip install -r desktop/requirements-macos.txt
+python3 -m apps.desktop.main
+```
+
+The desktop launcher starts the same backend and opens a native macOS window.
+It auto-creates a user-local dataset override file at:
+
+- `~/Library/Application Support/V2X Scene Explorer/registry.local.json`
+
+Use that file to set your local dataset paths without editing files inside the app bundle.
+
+### 4) Build a distributable `.app` bundle (macOS)
+
+```bash
+./desktop/build_macos_app.sh
+```
+
+Output:
+
+- `dist/V2X Scene Explorer.app`
+
+For public distribution, sign + notarize the app with your Apple Developer ID.
+
+App icon notes:
+
+- The build auto-generates `desktop/assets/app-icon-source.png` if it does not exist.
+- You can override icon source per build:
+
+```bash
+ICON_SRC="/absolute/path/to/your-icon.png" ./desktop/build_macos_app.sh
+```
+
+### 5) Package a `.dmg` installer (macOS)
+
+```bash
+./desktop/build_macos_dmg.sh
+```
+
+Output:
+
+- `dist/V2X Scene Explorer.dmg`
+
+### 6) Sign + notarize for public distribution (macOS)
+
+Prerequisite: Apple Developer account with a `Developer ID Application` certificate installed.
+
+List available signing identities:
+
+```bash
+security find-identity -v -p codesigning
+```
+
+Set your signing identity:
+
+```bash
+export DEV_ID_APP="Developer ID Application: YOUR NAME (TEAMID)"
+```
+
+Sign the app:
+
+```bash
+./desktop/sign_macos_app.sh
+```
+
+Create a notarytool keychain profile (recommended, one-time setup):
+
+```bash
+xcrun notarytool store-credentials "V2X_NOTARY" \
+  --apple-id "your-apple-id@example.com" \
+  --team-id "TEAMID" \
+  --password "app-specific-password"
+```
+
+Notarize and staple the DMG:
+
+```bash
+export NOTARY_PROFILE="V2X_NOTARY"
+./desktop/notarize_macos_dmg.sh
+```
+
+One-command release pipeline (build -> sign -> dmg -> notarize):
+
+```bash
+export DEV_ID_APP="Developer ID Application: YOUR NAME (TEAMID)"
+export NOTARY_PROFILE="V2X_NOTARY"
+./desktop/release_macos.sh
+```
+
+### 7) In-app update checks (desktop)
+
+The desktop app can check GitHub Releases and show a download button for newer versions.
+
+- Default release repo: `H-shayea/V2X-Scene-Explorer`
+- Override repo:
+
+```bash
+export TRAJ_UPDATE_REPO="owner/repo"
+```
+
+- Set app version (used for comparison):
+
+```bash
+export TRAJ_APP_VERSION="0.2.0"
+```
+
+Note: current updater flow is "check + download latest DMG". It does not install updates silently in place.
+
 ## Supported datasets
 
 ### V2X-Traj (`family: v2x-traj`)
@@ -92,6 +204,7 @@ Note: this dataset is private and is not distributed with this repository.
 ## Troubleshooting
 
 - Empty dataset list / startup issue: verify `dataset/registry.json` exists and points to valid paths.
+- Desktop app startup issue: verify `~/Library/Application Support/V2X Scene Explorer/registry.local.json` contains valid dataset roots.
 - Scene list loads but scene rendering fails: confirm the dataset folder exists and contains the expected files.
 - Port already in use: run with a different `--port`.
 
