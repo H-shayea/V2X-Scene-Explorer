@@ -65,6 +65,7 @@
             </div>
 
             <div id="homeError" class="homeError" hidden></div>
+            <div id="homeConnectResult" class="hint hint--block" hidden></div>
 
             <div id="homeDatasetCards" class="dsList" aria-label="Dataset catalog"></div>
 
@@ -111,12 +112,12 @@
 
           <div class="controls controls--primary">
             <button id="backHomeBtn" class="btn btn--ghost btn--sm" type="button" title="Return to the start screen">Home</button>
-            <label class="field">
+            <label id="datasetField" class="field">
               <span>Dataset</span>
               <select id="datasetSelect"></select>
             </label>
 
-            <label class="field">
+            <label id="splitField" class="field">
               <span>Split</span>
               <select id="splitSelect">
                 <option value="train">Train</option>
@@ -135,6 +136,21 @@
 
       <main class="layout">
       <aside class="panel">
+        <div class="panel__section">
+          <div class="panel__title">Data Source</div>
+          <div id="sourceHint" class="hint hint--block">Pick a dataset directory to load this dataset.</div>
+          <div class="row sourceRow">
+            <button id="sourceFolderBtn" class="btn btn--ghost btn--sm" type="button">Load dataset directory...</button>
+          </div>
+          <div id="sourceCard" class="sourceCard" hidden>
+            <div class="sourceCard__icon" aria-hidden="true"></div>
+            <div class="sourceCard__body">
+              <div id="sourceCardTitle" class="sourceCard__title">Dataset folder</div>
+              <div id="sourceCardPath" class="sourceCard__path"></div>
+            </div>
+          </div>
+        </div>
+
         <div class="panel__section" id="sceneNavSection">
           <div class="panel__title">Scene</div>
           <div id="sceneHint" class="hint hint--block"></div>
@@ -167,13 +183,14 @@
 
 	        <div class="panel__section">
 	          <div class="panel__title">Object Types</div>
-	          <label class="check"><input type="checkbox" id="typeVehicle" checked /> Vehicle</label>
-	          <label class="check"><input type="checkbox" id="typePed" checked /> Pedestrian</label>
-	          <label class="check"><input type="checkbox" id="typeBike" checked /> Bicycle</label>
-	          <label class="check"><input type="checkbox" id="typeOther" checked /> Other</label>
-	          <label class="check"><input type="checkbox" id="typeAnimal" checked /> Animal</label>
-	          <label class="check"><input type="checkbox" id="typeRsu" checked /> Roadside unit</label>
-	          <label class="check"><input type="checkbox" id="typeUnknown" checked /> Unknown</label>
+	          <label class="check" id="typeVehicleWrap"><input type="checkbox" id="typeVehicle" checked /> <span id="typeVehicleText">Vehicle</span></label>
+	          <label class="check" id="typeVruWrap"><input type="checkbox" id="typeVru" checked /> <span id="typeVruText">VRU</span></label>
+	          <label class="check" id="typePedWrap"><input type="checkbox" id="typePed" checked /> <span id="typePedText">Pedestrian</span></label>
+	          <label class="check" id="typeBikeWrap"><input type="checkbox" id="typeBike" checked /> <span id="typeBikeText">Bicycle</span></label>
+	          <label class="check" id="typeOtherWrap"><input type="checkbox" id="typeOther" checked /> <span id="typeOtherText">Other</span></label>
+	          <label class="check" id="typeAnimalWrap"><input type="checkbox" id="typeAnimal" checked /> <span id="typeAnimalText">Animal</span></label>
+	          <label class="check" id="typeRsuWrap"><input type="checkbox" id="typeRsu" checked /> <span id="typeRsuText">Roadside unit</span></label>
+	          <label class="check" id="typeUnknownWrap"><input type="checkbox" id="typeUnknown" checked /> <span id="typeUnknownText">Unknown</span></label>
 	        </div>
 
 	        <div class="panel__section" id="subTypeSection">
@@ -277,8 +294,12 @@
       </aside>
 
       <section class="stage">
-        <div class="canvasWrap">
+        <div id="canvasWrap" class="canvasWrap">
           <canvas id="mapCanvas"></canvas>
+          <div id="canvasOverlay" class="canvasOverlay" hidden>
+            <div class="canvasOverlay__spinner" aria-hidden="true"></div>
+            <div id="canvasOverlayText" class="canvasOverlay__text">Loading scene...</div>
+          </div>
         </div>
 
         <div class="timeline">
@@ -287,10 +308,112 @@
             <div id="frameLabel">Frame 0</div>
             <div id="timeLabel">Time +0.0s</div>
             <div id="countsLabel">Ego 0 · Infra 0 · Vehicles 0 · Lights 0</div>
+            <div id="sceneTransitionLabel" class="sceneTransitionLabel" aria-live="polite"></div>
           </div>
         </div>
       </section>
       </main>
+    </div>
+
+    <div id="profileWizardModal" class="modal" hidden aria-hidden="true">
+      <div class="modal__backdrop" data-close-profile-wizard></div>
+      <section class="modal__card" role="dialog" aria-modal="true" aria-labelledby="profileWizardTitle">
+        <div class="modal__head">
+          <div>
+            <div id="profileWizardTitle" class="modal__title">New Connection</div>
+            <div id="profileWizardSub" class="modal__subtitle">Step 1 of 3</div>
+          </div>
+          <button id="profileWizardCloseBtn" class="btn btn--ghost btn--sm btn--icon" type="button" title="Close" aria-label="Close">&times;</button>
+        </div>
+
+        <div class="wizardSteps" aria-hidden="true">
+          <span id="wizStepChip1" class="wizardStep">1 · Basics</span>
+          <span id="wizStepChip2" class="wizardStep">2 · Mapping</span>
+          <span id="wizStepChip3" class="wizardStep">3 · Review</span>
+        </div>
+
+        <div class="wizardBody">
+          <section id="wizStep1" class="wizardPane">
+            <div class="connectGrid">
+              <label class="field field--compact">
+                <span>Dataset type</span>
+                <select id="wizType">
+                  <option value="auto" selected>Auto detect</option>
+                  <option value="v2x_traj">V2X-Traj style</option>
+                  <option value="v2x_seq">V2X-Seq style</option>
+                  <option value="consider_it_cpm">Consider.it CPM style</option>
+                </select>
+              </label>
+
+              <label class="field field--compact">
+                <span>Connection name</span>
+                <input id="wizName" class="textInput" placeholder="e.g., RSU logs and map" />
+              </label>
+            </div>
+
+            <label class="field">
+              <span>Paths (one per line: folder or file)</span>
+              <textarea id="wizPaths" class="textInput textArea" placeholder="/Users/you/data/dataset-root&#10;/Users/you/data/file.csv"></textarea>
+            </label>
+
+            <div class="row">
+              <button id="wizDetectBtn" class="btn btn--ghost" type="button">Detect + Validate</button>
+            </div>
+            <div id="wizDetectResult" class="hint hint--block" hidden></div>
+          </section>
+
+          <section id="wizStep2" class="wizardPane" hidden>
+            <div id="wizMapV2x" class="wizardMapBlock" hidden>
+              <div class="panel__subhead">V2X-Traj mapping</div>
+              <div class="connectGrid">
+                <label class="field field--compact"><span>Scenes index CSV *</span><input id="wizV2xScenes" class="textInput" placeholder="/path/scenes.csv" /></label>
+                <label class="field field--compact"><span>Ego trajectories dir *</span><input id="wizV2xEgo" class="textInput" placeholder="/path/ego-trajectories" /></label>
+                <label class="field field--compact"><span>Infrastructure trajectories dir *</span><input id="wizV2xInfra" class="textInput" placeholder="/path/infrastructure-trajectories" /></label>
+                <label class="field field--compact"><span>Vehicle trajectories dir *</span><input id="wizV2xVehicle" class="textInput" placeholder="/path/vehicle-trajectories" /></label>
+                <label class="field field--compact"><span>Traffic-light dir (optional)</span><input id="wizV2xTl" class="textInput" placeholder="/path/traffic-light" /></label>
+                <label class="field field--compact"><span>Maps dir (optional)</span><input id="wizV2xMaps" class="textInput" placeholder="/path/maps" /></label>
+              </div>
+            </div>
+
+            <div id="wizMapCpm" class="wizardMapBlock" hidden>
+              <div class="panel__subhead">Consider.it CPM mapping</div>
+              <label class="field"><span>CPM log CSV files (one per line) *</span><textarea id="wizCpmLogs" class="textInput textArea" placeholder="/path/cpm_a.csv&#10;/path/cpm_b.csv"></textarea></label>
+              <div class="connectGrid">
+                <label class="field field--compact"><span>Proto schema (optional)</span><input id="wizCpmProto" class="textInput" placeholder="/path/sensor_interface-v1.2.1.proto" /></label>
+                <label class="field field--compact"><span>Scene window (seconds)</span><input id="wizCpmWindow" class="textInput" inputmode="numeric" placeholder="300" /></label>
+                <label class="field field--compact"><span>Scene gap (seconds)</span><input id="wizCpmGap" class="textInput" inputmode="numeric" placeholder="120" /></label>
+              </div>
+              <div class="panel__subhead">Column mapping (optional overrides)</div>
+              <div class="connectGrid">
+                <label class="field field--compact"><span>Timestamp column</span><input id="wizCpmColTs" class="textInput" placeholder="generationTime_ms" /></label>
+                <label class="field field--compact"><span>Object ID column</span><input id="wizCpmColId" class="textInput" placeholder="objectID" /></label>
+                <label class="field field--compact"><span>X column</span><input id="wizCpmColX" class="textInput" placeholder="xDistance_m" /></label>
+                <label class="field field--compact"><span>Y column</span><input id="wizCpmColY" class="textInput" placeholder="yDistance_m" /></label>
+                <label class="field field--compact"><span>VX column</span><input id="wizCpmColVx" class="textInput" placeholder="xSpeed_mps" /></label>
+                <label class="field field--compact"><span>VY column</span><input id="wizCpmColVy" class="textInput" placeholder="ySpeed_mps" /></label>
+                <label class="field field--compact"><span>Heading column</span><input id="wizCpmColYaw" class="textInput" placeholder="yawAngle_deg" /></label>
+                <label class="field field--compact"><span>Class column</span><input id="wizCpmColClass" class="textInput" placeholder="classificationType" /></label>
+              </div>
+            </div>
+
+            <div class="row">
+              <button id="wizValidateBtn" class="btn btn--ghost" type="button">Validate Mapping</button>
+            </div>
+            <div id="wizValidateResult" class="hint hint--block" hidden></div>
+          </section>
+
+          <section id="wizStep3" class="wizardPane" hidden>
+            <div id="wizReviewSummary" class="statusBox">Run validation first.</div>
+            <div id="wizReviewIssues" class="wizardIssues"></div>
+          </section>
+        </div>
+
+        <div class="wizardFoot">
+          <button id="wizPrevBtn" class="btn btn--ghost" type="button">Back</button>
+          <button id="wizNextBtn" class="btn" type="button">Next</button>
+          <button id="wizSaveBtn" class="btn" type="button" hidden>Save Connection</button>
+        </div>
+      </section>
     </div>
 
     <script src="/app.js"></script>

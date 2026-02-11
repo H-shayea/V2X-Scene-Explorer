@@ -11,6 +11,19 @@ async function fetchJson(url) {
   return res.json();
 }
 
+async function postJson(url, payload) {
+  const res = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload || {}),
+  });
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(`${res.status} ${res.statusText}: ${text}`);
+  }
+  return res.json();
+}
+
 function clamp(n, lo, hi) {
   return Math.max(lo, Math.min(hi, n));
 }
@@ -353,6 +366,7 @@ const COLORS = {
   },
   type: {
     VEHICLE: "#0b1220",
+    VRU: "#ef4444",
     PEDESTRIAN: "#ef4444",
     BICYCLE: "#06b6d4",
     OTHER: "#a1a1aa",
@@ -362,6 +376,10 @@ const COLORS = {
   },
   // Fine-grained class colors. Unknown labels fall back to a stable hash-based color.
   subType: {
+    // Consider.it two-class palette (explicit to avoid hash-color collisions).
+    VEHICLE: "#1d4ed8",
+    VRU: "#dc2626",
+
     CAR: "#2563eb",
     BUS: "#a855f7",
     VAN: "#14b8a6",
@@ -405,6 +423,7 @@ const state = {
   catalogDatasets: [],
   datasetSettingsById: {},
   datasetId: null,
+  datasetLocked: false,
   split: "train",
   splits: ["train", "val"],
   defaultSplit: "train",
@@ -415,6 +434,7 @@ const state = {
   basemapZoom: null,
   basemapFrameStats: null,
   modalities: ["ego", "infra", "vehicle", "traffic_light"],
+  sceneModalities: null,
   modalityLabels: {},
   modalityShortLabels: {},
   subTypesByDataset: {},
@@ -446,7 +466,7 @@ const state = {
   mapMaxLanes: 5000,
   layers: { ego: true, infra: true, vehicle: true, traffic_light: true },
   mapLayers: { lanes: true, stoplines: true, crosswalks: true, junctions: true },
-  types: { VEHICLE: true, PEDESTRIAN: true, BICYCLE: true, OTHER: true, ANIMAL: true, RSU: true, UNKNOWN: true },
+  types: { VEHICLE: true, VRU: true, PEDESTRIAN: true, BICYCLE: true, OTHER: true, ANIMAL: true, RSU: true, UNKNOWN: true },
   debugOverlay: false,
   sceneBox: true,
   focusMask: true,
@@ -459,10 +479,25 @@ const state = {
   homeHasMap: "",
   homeHasTL: "",
   homeSort: "available",
+  profiles: [],
+  connectDraft: null,
+  connectBusy: false,
+  sourceBusy: false,
+  sourceByType: {},
+  profileWizard: {
+    open: false,
+    mode: "create",
+    step: 1,
+    busy: false,
+    action: "",
+    draft: null,
+    profileId: "",
+  },
   appMeta: null,
   updateInfo: null,
   updateDownloadUrl: "",
   updateBusy: false,
+  sceneTransitionTimer: null,
 };
 
 const req = { intersections: 0, scenes: 0, bundle: 0 };
@@ -496,7 +531,7 @@ function defaultDatasetSettings() {
     basemapEnabled: false,
     basemapZoom: null,
     layers: { ego: true, infra: true, vehicle: true, traffic_light: true },
-    types: { VEHICLE: true, PEDESTRIAN: true, BICYCLE: true, OTHER: true, ANIMAL: true, RSU: true, UNKNOWN: true },
+    types: { VEHICLE: true, VRU: true, PEDESTRIAN: true, BICYCLE: true, OTHER: true, ANIMAL: true, RSU: true, UNKNOWN: true },
     mapClip: "scene",
     mapPointsStep: 3,
     mapPadding: 120,
@@ -620,10 +655,61 @@ function setCheck(id, v) {
   el.checked = !!v;
 }
 
+function setCheckDisabled(id, disabled) {
+  const el = $(id);
+  if (!el) return;
+  el.disabled = !!disabled;
+}
+
 function setSelectValue(id, v) {
   const el = $(id);
   if (!el) return;
   el.value = String(v);
+}
+
+function shortSceneLabel(raw, fallback = "") {
+  const s = String(raw || "").trim();
+  if (!s) return String(fallback || "").trim();
+  const compact = s.replace(/\s+/g, " ").trim();
+  return compact.length > 96 ? `${compact.slice(0, 93)}...` : compact;
+}
+
+function currentSceneLabel(sceneId) {
+  const sel = $("sceneSelect");
+  const sid = String(sceneId || "").trim();
+  if (sel && sid) {
+    const opt = Array.from(sel.options || []).find((o) => String(o.value) === sid);
+    if (opt && opt.textContent) return shortSceneLabel(opt.textContent, `Scene ${sid}`);
+  }
+  return sid ? `Scene ${sid}` : "Scene";
+}
+
+function setCanvasLoading(on, message = "Loading scene...") {
+  const wrap = $("canvasWrap");
+  const overlay = $("canvasOverlay");
+  const text = $("canvasOverlayText");
+  if (wrap) wrap.classList.toggle("is-loading", !!on);
+  if (text) text.textContent = String(message || "Loading scene...");
+  if (overlay) overlay.hidden = !on;
+}
+
+function markSceneTransition(label) {
+  const wrap = $("canvasWrap");
+  const out = $("sceneTransitionLabel");
+  const time = new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+  if (out) out.textContent = `${shortSceneLabel(label, "Scene")} loaded at ${time}`;
+  if (!wrap) return;
+  if (state.sceneTransitionTimer) {
+    clearTimeout(state.sceneTransitionTimer);
+    state.sceneTransitionTimer = null;
+  }
+  wrap.classList.remove("is-switched");
+  void wrap.offsetWidth;
+  wrap.classList.add("is-switched");
+  state.sceneTransitionTimer = setTimeout(() => {
+    wrap.classList.remove("is-switched");
+    state.sceneTransitionTimer = null;
+  }, 520);
 }
 
 function closestOptionValue(el, target) {
@@ -670,6 +756,7 @@ function syncControlsFromState() {
   setCheck("layerTL", state.layers.traffic_light);
 
   setCheck("typeVehicle", state.types.VEHICLE);
+  setCheck("typeVru", state.types.VRU);
   setCheck("typePed", state.types.PEDESTRIAN);
   setCheck("typeBike", state.types.BICYCLE);
   setCheck("typeOther", state.types.OTHER);
@@ -872,6 +959,11 @@ function applyDatasetUi() {
   const groupEl = $("groupLabel");
   if (groupEl) groupEl.textContent = state.groupLabel;
 
+  const datasetField = $("datasetField");
+  if (datasetField) datasetField.hidden = !!state.datasetLocked;
+  const datasetSel = $("datasetSelect");
+  if (datasetSel) datasetSel.disabled = !!state.datasetLocked;
+
   const splitSel = $("splitSelect");
   if (splitSel) {
     splitSel.innerHTML = "";
@@ -890,6 +982,8 @@ function applyDatasetUi() {
     splitSel.value = state.split;
     splitSel.disabled = state.splits.length <= 1;
   }
+  const splitField = $("splitField");
+  if (splitField) splitField.hidden = state.splits.length <= 1;
 
   const mapTitle = $("mapTitle");
   const mapOnly = $("mapOnlyControls");
@@ -935,17 +1029,113 @@ function applyDatasetUi() {
   setMod("vehicle", "layerVehicleWrap", "layerVehicleText");
   setMod("traffic_light", "layerTLWrap", "layerTLText");
 
+  const isCpm = (datasetTypeFromMeta(meta) === "consider_it_cpm") || (meta.family === "cpm-objects");
+  const setType = (key, wrapId, textId, label, show) => {
+    const wrap = $(wrapId);
+    if (wrap) wrap.hidden = !show;
+    const txt = $(textId);
+    if (txt && label) txt.textContent = label;
+    if (!show && state.types && Object.prototype.hasOwnProperty.call(state.types, key)) {
+      state.types[key] = false;
+    }
+  };
+  if (isCpm) {
+    setType("VEHICLE", "typeVehicleWrap", "typeVehicleText", "Vehicles", true);
+    setType("VRU", "typeVruWrap", "typeVruText", "VRU", true);
+    setType("PEDESTRIAN", "typePedWrap", "typePedText", "Pedestrian", false);
+    setType("BICYCLE", "typeBikeWrap", "typeBikeText", "Bicycle", false);
+    setType("OTHER", "typeOtherWrap", "typeOtherText", "Other", false);
+    setType("ANIMAL", "typeAnimalWrap", "typeAnimalText", "Animal", false);
+    setType("RSU", "typeRsuWrap", "typeRsuText", "Roadside unit", false);
+    setType("UNKNOWN", "typeUnknownWrap", "typeUnknownText", "Unknown", false);
+  } else {
+    setType("VEHICLE", "typeVehicleWrap", "typeVehicleText", "Vehicle", true);
+    setType("VRU", "typeVruWrap", "typeVruText", "VRU", false);
+    setType("PEDESTRIAN", "typePedWrap", "typePedText", "Pedestrian", true);
+    setType("BICYCLE", "typeBikeWrap", "typeBikeText", "Bicycle", true);
+    setType("OTHER", "typeOtherWrap", "typeOtherText", "Other", true);
+    setType("ANIMAL", "typeAnimalWrap", "typeAnimalText", "Animal", true);
+    setType("RSU", "typeRsuWrap", "typeRsuText", "Roadside unit", true);
+    setType("UNKNOWN", "typeUnknownWrap", "typeUnknownText", "Unknown", true);
+  }
+
   const holdWrap = $("holdTLWrap");
   if (holdWrap) holdWrap.hidden = !available.has("traffic_light");
+  state.sceneModalities = null;
+  updateSceneModalityControls(null);
+  updateSourcePanel();
+}
+
+function detectSceneModalities(bundle) {
+  if (!bundle || typeof bundle !== "object") return null;
+  const datasetAvailable = new Set(Array.isArray(state.modalities) ? state.modalities.map(String) : []);
+  if (!datasetAvailable.size) return null;
+
+  let out = new Set();
+  const stats = bundle.modality_stats && typeof bundle.modality_stats === "object" ? bundle.modality_stats : null;
+  if (stats) {
+    for (const m of datasetAvailable) {
+      const rows = Number((((stats[m] || {}).rows) || 0));
+      if (rows > 0) out.add(m);
+    }
+  }
+
+  // Fallback when stats are missing: inspect a small frame sample.
+  if (!out.size && Array.isArray(bundle.frames) && bundle.frames.length) {
+    const frames = bundle.frames;
+    const step = Math.max(1, Math.floor(frames.length / 20));
+    for (let i = 0; i < frames.length; i += step) {
+      const fr = frames[i] || {};
+      for (const m of datasetAvailable) {
+        const arr = fr[m];
+        if (Array.isArray(arr) && arr.length > 0) out.add(m);
+      }
+      if (out.size === datasetAvailable.size) break;
+    }
+  }
+
+  if (!out.size) return null;
+  return out;
+}
+
+function updateSceneModalityControls(bundle) {
+  const datasetAvailable = new Set(Array.isArray(state.modalities) ? state.modalities.map(String) : []);
+  const sceneAvailable = detectSceneModalities(bundle);
+  state.sceneModalities = sceneAvailable ? Array.from(sceneAvailable) : null;
+
+  const cfg = [
+    { modality: "ego", wrapId: "layerEgoWrap", inputId: "layerEgo" },
+    { modality: "infra", wrapId: "layerInfraWrap", inputId: "layerInfra" },
+    { modality: "vehicle", wrapId: "layerVehicleWrap", inputId: "layerVehicle" },
+    { modality: "traffic_light", wrapId: "layerTLWrap", inputId: "layerTL" },
+  ];
+
+  for (const it of cfg) {
+    const datasetOn = datasetAvailable.has(it.modality);
+    const sceneOn = !sceneAvailable || sceneAvailable.has(it.modality);
+    const disable = datasetOn && !sceneOn;
+    const wrap = $(it.wrapId);
+    if (wrap) wrap.classList.toggle("is-disabled", disable);
+    setCheckDisabled(it.inputId, disable);
+  }
+
+  const hold = $("holdTL");
+  if (hold) {
+    const tlDataset = datasetAvailable.has("traffic_light");
+    const tlScene = !sceneAvailable || sceneAvailable.has("traffic_light");
+    hold.disabled = !(tlDataset && tlScene);
+  }
 }
 
 function hasModality(modality) {
-  return Array.isArray(state.modalities) && state.modalities.includes(modality);
+  if (!Array.isArray(state.modalities) || !state.modalities.includes(modality)) return false;
+  if (!Array.isArray(state.sceneModalities) || !state.sceneModalities.length) return true;
+  return state.sceneModalities.includes(modality);
 }
 
 function agentModalitiesOrdered() {
   const ms = Array.isArray(state.modalities) ? state.modalities.map(String) : ["ego", "infra", "vehicle"];
-  const agent = ms.filter((m) => m !== "traffic_light");
+  const agent = ms.filter((m) => m !== "traffic_light" && hasModality(m));
   const pref = ["infra", "vehicle", "ego"];
   const out = [];
   for (const p of pref) if (agent.includes(p)) out.push(p);
@@ -954,7 +1144,7 @@ function agentModalitiesOrdered() {
 }
 
 function countsModalitiesOrdered() {
-  const ms = Array.isArray(state.modalities) ? state.modalities.map(String) : ["ego", "infra", "vehicle", "traffic_light"];
+  const ms = (Array.isArray(state.modalities) ? state.modalities.map(String) : ["ego", "infra", "vehicle", "traffic_light"]).filter((m) => hasModality(m));
   const pref = ["ego", "infra", "vehicle", "traffic_light"];
   const out = [];
   for (const p of pref) if (ms.includes(p)) out.push(p);
@@ -998,7 +1188,7 @@ function buildMapPaths(map) {
 
 function recType(rec) {
   const t = rec && rec.type ? String(rec.type).toUpperCase() : "UNKNOWN";
-  if (t === "VEHICLE" || t === "PEDESTRIAN" || t === "BICYCLE" || t === "OTHER" || t === "ANIMAL" || t === "RSU") return t;
+  if (t === "VEHICLE" || t === "VRU" || t === "PEDESTRIAN" || t === "BICYCLE" || t === "OTHER" || t === "ANIMAL" || t === "RSU") return t;
   return "UNKNOWN";
 }
 
@@ -1264,6 +1454,7 @@ function shouldDrawRec(modality, rec) {
   if (modality === "traffic_light") return true;
   const t = recType(rec);
   if (t === "VEHICLE" && !state.types.VEHICLE) return false;
+  if (t === "VRU" && !state.types.VRU) return false;
   if (t === "PEDESTRIAN" && !state.types.PEDESTRIAN) return false;
   if (t === "BICYCLE" && !state.types.BICYCLE) return false;
   if (t === "OTHER" && !state.types.OTHER) return false;
@@ -1582,13 +1773,14 @@ function render() {
     }
   }
   let counts = parts.join(" · ");
+  const drawAllTrails = !!(state.trailAll || !state.selectedKey);
   if (state.showTrail) {
     if (state.trailAll) {
       counts += " · Trajectories: all objects in frame";
     } else if (state.selectedKey && state.selectedKey.id != null) {
       counts += ` · Selected ${state.selectedKey.modality}:${state.selectedKey.id}`;
     } else {
-      counts += " · Tip: click a dot to select + view its trajectory";
+      counts += " · Trajectories: all objects in frame (preview) · click a dot to lock selection";
     }
   }
   $("countsLabel").textContent = counts;
@@ -1721,7 +1913,7 @@ function render() {
 
   // Trajectories (selected or all objects in the current frame)
   if (state.showTrail) {
-    if (state.trailAll) {
+    if (drawAllTrails) {
       const seen = new Set();
       for (const modality of agentModalitiesOrdered()) {
         if (!state.layers[modality]) continue;
@@ -2070,6 +2262,1004 @@ async function loadCatalog() {
   }
 }
 
+async function loadProfiles() {
+  state.profiles = [];
+  try {
+    const data = await fetchJson("/api/profiles");
+    const items = Array.isArray(data.items) ? data.items : [];
+    state.profiles = items;
+  } catch (_) {
+    state.profiles = [];
+  }
+}
+
+function parseConnectPaths(raw) {
+  const out = [];
+  const seen = new Set();
+  const lines = String(raw || "").split(/\r?\n/);
+  for (const line of lines) {
+    const s = String(line || "").trim();
+    if (!s) continue;
+    if (seen.has(s)) continue;
+    seen.add(s);
+    out.push(s);
+  }
+  return out;
+}
+
+function cloneObj(obj) {
+  return JSON.parse(JSON.stringify(obj || {}));
+}
+
+function profileTypeLabel(datasetType) {
+  const t = String(datasetType || "").toLowerCase();
+  if (t === "v2x_traj") return "V2X-Traj";
+  if (t === "v2x_seq") return "V2X-Seq";
+  if (t === "consider_it_cpm") return "Consider.it CPM";
+  if (!t) return "Unknown";
+  return datasetType;
+}
+
+function profileStatusLabel(status) {
+  const s = String(status || "");
+  if (s === "ready") return "Ready";
+  if (s === "ready_with_warnings") return "Ready (warnings)";
+  if (s === "broken_path") return "Broken path";
+  if (s === "schema_mismatch") return "Schema mismatch";
+  return s || "Unknown";
+}
+
+function profileStatusTone(status) {
+  const s = String(status || "");
+  if (s === "ready") return "ok";
+  if (s === "ready_with_warnings") return "warn";
+  if (s === "broken_path" || s === "schema_mismatch") return "bad";
+  return "";
+}
+
+function setConnectResult(msg, tone = "") {
+  const el = $("homeConnectResult");
+  if (!el) return;
+  const m = String(msg || "").trim();
+  if (!m) {
+    el.hidden = true;
+    el.textContent = "";
+    el.classList.remove("hint--ok", "hint--warn", "hint--bad");
+    return;
+  }
+  el.hidden = false;
+  el.textContent = m;
+  el.classList.remove("hint--ok", "hint--warn", "hint--bad");
+  if (tone === "ok") el.classList.add("hint--ok");
+  else if (tone === "warn") el.classList.add("hint--warn");
+  else if (tone === "bad") el.classList.add("hint--bad");
+}
+
+function datasetTypeFromFamily(family) {
+  const fam = String(family || "").trim().toLowerCase();
+  if (fam === "v2x-traj") return "v2x_traj";
+  if (fam === "v2x-seq") return "v2x_seq";
+  if (fam === "cpm-objects") return "consider_it_cpm";
+  return "";
+}
+
+function datasetTypeFromMeta(meta) {
+  if (!meta || typeof meta !== "object") return "";
+  return datasetTypeFromFamily(meta.family);
+}
+
+function supportedLocalFamily(family) {
+  const fam = String(family || "").trim().toLowerCase();
+  return fam === "v2x-traj" || fam === "v2x-seq" || fam === "cpm-objects";
+}
+
+function virtualDatasetMeta(datasetId, title, family) {
+  const fam = String(family || "").trim().toLowerCase();
+  const base = {
+    id: String(datasetId || "").trim(),
+    title: String(title || datasetId || "").trim() || "Dataset",
+    family: fam,
+    supported: false,
+    virtual: true,
+  };
+  if (fam === "v2x-traj") {
+    return {
+      ...base,
+      splits: ["train", "val"],
+      default_split: "train",
+      group_label: "Intersection",
+      has_map: true,
+      has_traffic_lights: true,
+      modalities: ["ego", "infra", "vehicle", "traffic_light"],
+      modality_labels: { ego: "Ego vehicle", infra: "Infrastructure", vehicle: "Other vehicles", traffic_light: "Traffic lights" },
+      modality_short_labels: { ego: "Ego", infra: "Infra", vehicle: "Vehicles", traffic_light: "Lights" },
+    };
+  }
+  if (fam === "v2x-seq") {
+    return {
+      ...base,
+      splits: ["train", "val"],
+      default_split: "val",
+      group_label: "Intersection",
+      has_map: true,
+      has_traffic_lights: true,
+      modalities: ["ego", "infra", "vehicle", "traffic_light"],
+      modality_labels: {
+        ego: "Cooperative vehicle-infrastructure",
+        infra: "Single infrastructure",
+        vehicle: "Single vehicle",
+        traffic_light: "Traffic lights",
+      },
+      modality_short_labels: { ego: "Coop", infra: "Infra", vehicle: "Vehicle", traffic_light: "Lights" },
+    };
+  }
+  if (fam === "cpm-objects") {
+    return {
+      ...base,
+      splits: ["all"],
+      default_split: "all",
+      group_label: "Sensor",
+      has_map: false,
+      has_traffic_lights: false,
+      modalities: ["infra"],
+      modality_labels: { infra: "Objects" },
+      modality_short_labels: { infra: "Objects" },
+    };
+  }
+  return {
+    ...base,
+    splits: ["all"],
+    default_split: "all",
+    group_label: "Group",
+    has_map: false,
+    modalities: ["infra"],
+    modality_labels: { infra: "Objects" },
+    modality_short_labels: { infra: "Objects" },
+  };
+}
+
+function ensureDatasetMetaForCard(datasetId) {
+  const did = String(datasetId || "").trim();
+  if (!did) return null;
+  if (state.datasetsById && state.datasetsById[did]) return state.datasetsById[did];
+  const cat = (state.catalogById && state.catalogById[did]) ? state.catalogById[did] : null;
+  if (!cat || typeof cat !== "object") return null;
+  const app = (cat.app && typeof cat.app === "object") ? cat.app : {};
+  const family = String(app.family || "").trim().toLowerCase();
+  if (!supportedLocalFamily(family)) return null;
+  const meta = virtualDatasetMeta(did, cat.title || did, family);
+  state.datasetsById[did] = meta;
+  const sel = $("datasetSelect");
+  if (sel && !Array.from(sel.options || []).some((o) => String(o.value) === did)) {
+    const opt = document.createElement("option");
+    opt.value = did;
+    opt.textContent = meta.title || did;
+    sel.appendChild(opt);
+  }
+  return meta;
+}
+
+function runtimeProfilePreset(datasetType, meta) {
+  const t = String(datasetType || "").trim();
+  const m = (meta && typeof meta === "object") ? meta : {};
+  const selectedDatasetId = String(m.id || "").trim();
+  const selectedTitle = String(m.title || "").trim();
+  const safeFromId = selectedDatasetId ? selectedDatasetId.replace(/[^a-zA-Z0-9_-]+/g, "-") : "";
+  if (t === "v2x_traj") {
+    const datasetId = selectedDatasetId || "v2x-traj";
+    const safe = safeFromId || "v2x-traj";
+    return {
+      profile_id: `runtime-${safe}`,
+      dataset_id: datasetId,
+      name: selectedTitle || "V2X-Traj",
+    };
+  }
+  if (t === "v2x_seq") {
+    const datasetId = selectedDatasetId || "v2x-seq";
+    const safe = safeFromId || "v2x-seq";
+    return {
+      profile_id: `runtime-${safe}`,
+      dataset_id: datasetId,
+      name: selectedTitle || "V2X-Seq",
+    };
+  }
+  if (t === "consider_it_cpm") {
+    const datasetId = selectedDatasetId || "consider-it-cpm";
+    const safe = safeFromId || "consider-it-cpm";
+    return {
+      profile_id: `runtime-${safe}`,
+      dataset_id: datasetId,
+      name: selectedTitle || "Consider.it (CPM Objects)",
+    };
+  }
+  const safe = safeFromId || "dataset";
+  return {
+    profile_id: `runtime-${safe}`,
+    dataset_id: selectedDatasetId || "runtime-dataset",
+    name: selectedTitle || "Dataset",
+  };
+}
+
+function sourceState(datasetType) {
+  const key = String(datasetType || "");
+  if (!state.sourceByType[key]) {
+    state.sourceByType[key] = {
+      folderPath: "",
+      folderName: "",
+      protoPath: "",
+      hint: "",
+      tone: "",
+    };
+  }
+  return state.sourceByType[key];
+}
+
+function hasLoadedSourceForMeta(meta) {
+  const datasetType = datasetTypeFromMeta(meta || {});
+  if (!datasetType) return false;
+  const src = sourceState(datasetType);
+  return !!String(src.folderPath || "").trim();
+}
+
+function isDesktopPickerAvailable(methodName) {
+  const api = window.pywebview && window.pywebview.api ? window.pywebview.api : null;
+  return !!(api && typeof api[methodName] === "function");
+}
+
+async function pickPathsDesktop(methodName, fallbackPrompt) {
+  if (isDesktopPickerAvailable(methodName)) {
+    try {
+      const raw = await window.pywebview.api[methodName]();
+      const arr = Array.isArray(raw) ? raw : (raw ? [raw] : []);
+      return arr.map((x) => String(x || "").trim()).filter(Boolean);
+    } catch (_) {
+      // Fall through to manual fallback.
+    }
+  }
+
+  // Web mode: ask the local backend to open a native folder picker (macOS).
+  if (methodName === "pick_folder") {
+    try {
+      const payload = await postJson("/api/system/pick_folder", {
+        prompt: String(fallbackPrompt || "Select dataset directory"),
+      });
+      if (payload && Array.isArray(payload.paths)) {
+        return payload.paths.map((x) => String(x || "").trim()).filter(Boolean);
+      }
+    } catch (_) {
+      // Fall through to manual prompt only if server-side picker is unavailable.
+    }
+  }
+
+  const raw = window.prompt(fallbackPrompt, "");
+  if (raw == null) return [];
+  return parseConnectPaths(raw);
+}
+
+function folderNameFromPath(pathStr) {
+  const s = String(pathStr || "").trim().replace(/\\/g, "/").replace(/\/+$/, "");
+  if (!s) return "";
+  const parts = s.split("/");
+  return parts[parts.length - 1] || s;
+}
+
+function updateSourcePanel() {
+  const meta = currentDatasetMeta() || {};
+  const datasetType = datasetTypeFromMeta(meta);
+  const src = sourceState(datasetType);
+  const sourceHintEl = $("sourceHint");
+  const sourceCard = $("sourceCard");
+  const sourceCardTitle = $("sourceCardTitle");
+  const sourceCardPath = $("sourceCardPath");
+  const folderBtn = $("sourceFolderBtn");
+  if (!sourceHintEl) return;
+
+  const busy = !!state.sourceBusy;
+  if (folderBtn) {
+    folderBtn.disabled = busy || !datasetType;
+    folderBtn.textContent = busy ? "Loading..." : "Load dataset directory...";
+  }
+
+  let msg = String(src.hint || "").trim();
+  let tone = String(src.tone || "").trim();
+  if (!datasetType) {
+    msg = "This dataset is not yet supported for local loading.";
+    tone = "bad";
+  } else if (!msg && busy) {
+    msg = "Loading dataset directory...";
+  } else if (!msg && !src.folderPath) {
+    msg = "Select a dataset directory to load scenes.";
+    tone = "warn";
+  } else if (!msg && Number(state.sceneTotal || 0) <= 0) {
+    msg = "Directory loaded, but no scenes were found.";
+    tone = "warn";
+  } else if (!msg) {
+    msg = "Source loaded.";
+    tone = "ok";
+  }
+  sourceHintEl.textContent = msg;
+  sourceHintEl.classList.remove("hint--ok", "hint--warn", "hint--bad");
+  if (tone === "ok") sourceHintEl.classList.add("hint--ok");
+  else if (tone === "warn") sourceHintEl.classList.add("hint--warn");
+  else if (tone === "bad") sourceHintEl.classList.add("hint--bad");
+
+  if (sourceCard && sourceCardTitle && sourceCardPath) {
+    const hasFolder = !!String(src.folderPath || "").trim();
+    sourceCard.hidden = !hasFolder;
+    if (hasFolder) {
+      const dsName = String(meta.title || meta.id || "Dataset").trim();
+      const folderName = String(src.folderName || folderNameFromPath(src.folderPath) || "dataset").trim();
+      sourceCardTitle.textContent = `${dsName} · ${folderName}`;
+      sourceCardPath.textContent = String(src.folderPath || "").trim();
+    } else {
+      sourceCardTitle.textContent = "Dataset folder";
+      sourceCardPath.textContent = "";
+    }
+  }
+}
+
+function sourceIssueMessage(validation) {
+  const errors = Array.isArray(validation && validation.errors) ? validation.errors : [];
+  const warnings = Array.isArray(validation && validation.warnings) ? validation.warnings : [];
+  if (errors.length) return String(errors[0].message || "Validation failed.");
+  if (warnings.length) return String(warnings[0].message || "Validation warning.");
+  return "";
+}
+
+async function loadDatasetFromFolder(folderPathIn) {
+  const meta = currentDatasetMeta() || {};
+  const datasetType = datasetTypeFromMeta(meta);
+  if (!datasetType) {
+    setConnectResult("This dataset family does not support local loading yet.", "bad");
+    return;
+  }
+  const folderPath = String(folderPathIn || "").trim();
+  if (!folderPath) {
+    setConnectResult("No dataset directory selected.", "bad");
+    return;
+  }
+
+  const src = sourceState(datasetType);
+  const preset = runtimeProfilePreset(datasetType, meta);
+  state.sourceBusy = true;
+  src.hint = "Detecting dataset schema...";
+  src.tone = "";
+  updateSourcePanel();
+
+  try {
+    const detected = await postJson("/api/profiles/detect", {
+      dataset_type: datasetType,
+      name: preset.name,
+      paths: [folderPath],
+    });
+    if (!detected || !detected.profile) {
+      throw new Error("Could not detect dataset profile from selected paths.");
+    }
+    const profile = cloneObj(detected.profile);
+    profile.profile_id = preset.profile_id;
+    profile.dataset_id = preset.dataset_id;
+    profile.name = preset.name;
+
+    const validated = await postJson("/api/profiles/validate", { profile });
+    const status = String(((validated && validated.validation) ? validated.validation.status : "") || "");
+    if (status !== "ready" && status !== "ready_with_warnings") {
+      const detail = sourceIssueMessage(validated && validated.validation);
+      throw new Error(detail || "Validation failed for selected source paths.");
+    }
+
+    const saved = await postJson("/api/profiles/save", { profile: validated.profile });
+    await loadDatasets();
+    await loadProfiles();
+    renderHomeCategoryOptions();
+    renderHomeDatasetCards();
+
+    const runtimeDatasetId = String(((saved && saved.profile) ? saved.profile.dataset_id : "") || preset.dataset_id);
+    src.folderPath = folderPath;
+    src.folderName = folderNameFromPath(folderPath);
+    const savedProto = ((((saved || {}).profile || {}).bindings || {}).proto_schema || {}).path;
+    src.protoPath = savedProto ? String(savedProto || "").trim() : "";
+    src.hint = status === "ready_with_warnings"
+      ? `Loaded with warnings: ${sourceIssueMessage(validated.validation) || "check mapping."}`
+      : "Dataset source loaded.";
+    src.tone = status === "ready_with_warnings" ? "warn" : "ok";
+
+    await openExplorerForDataset(runtimeDatasetId, { savePrev: false });
+    setConnectResult(src.hint, src.tone);
+  } catch (e) {
+    const msg = `Load failed: ${e && e.message ? e.message : String(e)}`;
+    src.hint = msg;
+    src.tone = "bad";
+    setConnectResult(msg, "bad");
+  } finally {
+    state.sourceBusy = false;
+    updateSourcePanel();
+  }
+}
+
+function setHint(id, msg, tone = "") {
+  const el = $(id);
+  if (!el) return;
+  const m = String(msg || "").trim();
+  if (!m) {
+    el.hidden = true;
+    el.textContent = "";
+    el.classList.remove("hint--ok", "hint--warn", "hint--bad");
+    return;
+  }
+  el.hidden = false;
+  el.textContent = m;
+  el.classList.remove("hint--ok", "hint--warn", "hint--bad");
+  if (tone === "ok") el.classList.add("hint--ok");
+  else if (tone === "warn") el.classList.add("hint--warn");
+  else if (tone === "bad") el.classList.add("hint--bad");
+}
+
+function getElValue(id) {
+  const el = $(id);
+  if (!el) return "";
+  return String(el.value || "").trim();
+}
+
+function setElValue(id, value) {
+  const el = $(id);
+  if (!el) return;
+  el.value = String(value || "");
+}
+
+function parseIntClamp(raw, fallback, minV, maxV) {
+  const n = Number.parseInt(String(raw || "").trim(), 10);
+  if (!Number.isFinite(n)) return fallback;
+  return clamp(n, minV, maxV);
+}
+
+function wizardSelectedDatasetType() {
+  const selected = getElValue("wizType");
+  if (selected === "v2x_traj" || selected === "v2x_seq" || selected === "consider_it_cpm") return selected;
+  const draftType = String(((state.profileWizard.draft || {}).profile || {}).dataset_type || "").trim();
+  if (draftType === "v2x_traj" || draftType === "v2x_seq" || draftType === "consider_it_cpm") return draftType;
+  return "";
+}
+
+function getBindingPath(profile, role) {
+  if (!profile || typeof profile !== "object") return "";
+  const b = profile.bindings && typeof profile.bindings === "object" ? profile.bindings : {};
+  const obj = b[role];
+  if (!obj || typeof obj !== "object") return "";
+  return String(obj.path || "").trim();
+}
+
+function getBindingPaths(profile, role) {
+  if (!profile || typeof profile !== "object") return [];
+  const b = profile.bindings && typeof profile.bindings === "object" ? profile.bindings : {};
+  const obj = b[role];
+  if (!obj || typeof obj !== "object") return [];
+  const arr = Array.isArray(obj.paths) ? obj.paths : [];
+  return arr.map((x) => String(x || "").trim()).filter(Boolean);
+}
+
+function setBindingPath(bindings, role, path, required, kind) {
+  const prev = bindings[role] && typeof bindings[role] === "object" ? bindings[role] : {};
+  const p = String(path || "").trim();
+  if (!p && !required) {
+    delete bindings[role];
+    return;
+  }
+  bindings[role] = {
+    ...prev,
+    kind: kind,
+    required: !!required,
+    path: p,
+  };
+}
+
+function setWizardFromProfile(profile) {
+  if (!profile || typeof profile !== "object") return;
+  const datasetType = String(profile.dataset_type || "").trim();
+  setElValue("wizType", datasetType || "auto");
+  setElValue("wizName", String(profile.name || ""));
+  setElValue("wizPaths", Array.isArray(profile.roots) ? profile.roots.join("\n") : "");
+
+  setElValue("wizV2xScenes", getBindingPath(profile, "scenes_index"));
+  setElValue(
+    "wizV2xEgo",
+    datasetType === "v2x_seq" ? (getBindingPath(profile, "traj_cooperative") || getBindingPath(profile, "traj_ego")) : getBindingPath(profile, "traj_ego")
+  );
+  setElValue("wizV2xInfra", getBindingPath(profile, "traj_infra"));
+  setElValue("wizV2xVehicle", getBindingPath(profile, "traj_vehicle"));
+  setElValue("wizV2xTl", getBindingPath(profile, "traffic_light"));
+  setElValue("wizV2xMaps", getBindingPath(profile, "maps_dir"));
+
+  setElValue("wizCpmLogs", getBindingPaths(profile, "cpm_logs").join("\n"));
+  setElValue("wizCpmProto", getBindingPath(profile, "proto_schema"));
+  const sceneStrategy = profile.scene_strategy && typeof profile.scene_strategy === "object" ? profile.scene_strategy : {};
+  setElValue("wizCpmWindow", Number.isFinite(Number(sceneStrategy.window_s)) ? Number(sceneStrategy.window_s) : 300);
+  setElValue("wizCpmGap", Number.isFinite(Number(sceneStrategy.gap_s)) ? Number(sceneStrategy.gap_s) : 120);
+  const cpmLogs = profile.bindings && profile.bindings.cpm_logs && typeof profile.bindings.cpm_logs === "object"
+    ? profile.bindings.cpm_logs
+    : {};
+  const colMap = cpmLogs.column_map && typeof cpmLogs.column_map === "object" ? cpmLogs.column_map : {};
+  setElValue("wizCpmColTs", String(colMap.generationTime_ms || ""));
+  setElValue("wizCpmColId", String(colMap.objectID || ""));
+  setElValue("wizCpmColX", String(colMap.xDistance_m || ""));
+  setElValue("wizCpmColY", String(colMap.yDistance_m || ""));
+  setElValue("wizCpmColVx", String(colMap.xSpeed_mps || ""));
+  setElValue("wizCpmColVy", String(colMap.ySpeed_mps || ""));
+  setElValue("wizCpmColYaw", String(colMap.yawAngle_deg || ""));
+  setElValue("wizCpmColClass", String(colMap.classificationType || ""));
+}
+
+function applyWizardDatasetBlocks() {
+  const datasetType = wizardSelectedDatasetType();
+  const v2x = $("wizMapV2x");
+  const cpm = $("wizMapCpm");
+  if (v2x) v2x.hidden = !(datasetType === "v2x_traj" || datasetType === "v2x_seq");
+  if (cpm) cpm.hidden = datasetType !== "consider_it_cpm";
+}
+
+function buildProfileFromWizardInputs() {
+  const wiz = state.profileWizard;
+  const base = wiz.draft && wiz.draft.profile ? cloneObj(wiz.draft.profile) : {};
+  const selectedType = getElValue("wizType");
+  const datasetType = selectedType === "auto" ? String(base.dataset_type || "").trim() : selectedType;
+  const name = getElValue("wizName");
+  const roots = parseConnectPaths(getElValue("wizPaths"));
+  const profile = {
+    ...base,
+    name: name || String(base.name || "Dataset Profile"),
+    dataset_type: datasetType,
+    roots: roots,
+    bindings: base.bindings && typeof base.bindings === "object" ? { ...base.bindings } : {},
+  };
+  const bindings = profile.bindings;
+
+  if (datasetType === "v2x_traj") {
+    profile.scene_strategy = { mode: "intersection_scene" };
+    setBindingPath(bindings, "scenes_index", getElValue("wizV2xScenes"), true, "file");
+    setBindingPath(bindings, "traj_ego", getElValue("wizV2xEgo"), true, "dir");
+    setBindingPath(bindings, "traj_infra", getElValue("wizV2xInfra"), true, "dir");
+    setBindingPath(bindings, "traj_vehicle", getElValue("wizV2xVehicle"), true, "dir");
+    setBindingPath(bindings, "traffic_light", getElValue("wizV2xTl"), false, "dir");
+    setBindingPath(bindings, "maps_dir", getElValue("wizV2xMaps"), false, "dir");
+    delete bindings.traj_cooperative;
+    delete bindings.cpm_logs;
+    delete bindings.proto_schema;
+  }
+
+  if (datasetType === "v2x_seq") {
+    profile.scene_strategy = { mode: "sequence_scene" };
+    setBindingPath(bindings, "traj_cooperative", getElValue("wizV2xEgo"), false, "dir");
+    setBindingPath(bindings, "traj_infra", getElValue("wizV2xInfra"), false, "dir");
+    setBindingPath(bindings, "traj_vehicle", getElValue("wizV2xVehicle"), false, "dir");
+    setBindingPath(bindings, "traffic_light", getElValue("wizV2xTl"), false, "dir");
+    setBindingPath(bindings, "maps_dir", getElValue("wizV2xMaps"), false, "dir");
+    delete bindings.scenes_index;
+    delete bindings.traj_ego;
+    delete bindings.cpm_logs;
+    delete bindings.proto_schema;
+  }
+
+  if (datasetType === "consider_it_cpm") {
+    const prevLogs = bindings.cpm_logs && typeof bindings.cpm_logs === "object" ? bindings.cpm_logs : {};
+    const logPaths = parseConnectPaths(getElValue("wizCpmLogs"));
+    const columnMap = {};
+    const tsCol = getElValue("wizCpmColTs");
+    const idCol = getElValue("wizCpmColId");
+    const xCol = getElValue("wizCpmColX");
+    const yCol = getElValue("wizCpmColY");
+    const vxCol = getElValue("wizCpmColVx");
+    const vyCol = getElValue("wizCpmColVy");
+    const yawCol = getElValue("wizCpmColYaw");
+    const clsCol = getElValue("wizCpmColClass");
+    if (tsCol) columnMap.generationTime_ms = tsCol;
+    if (idCol) columnMap.objectID = idCol;
+    if (xCol) columnMap.xDistance_m = xCol;
+    if (yCol) columnMap.yDistance_m = yCol;
+    if (vxCol) columnMap.xSpeed_mps = vxCol;
+    if (vyCol) columnMap.ySpeed_mps = vyCol;
+    if (yawCol) columnMap.yawAngle_deg = yawCol;
+    if (clsCol) columnMap.classificationType = clsCol;
+    bindings.cpm_logs = {
+      ...prevLogs,
+      kind: "file_list",
+      required: true,
+      paths: logPaths,
+    };
+    if (Object.keys(columnMap).length) bindings.cpm_logs.column_map = columnMap;
+    else delete bindings.cpm_logs.column_map;
+
+    const protoPath = getElValue("wizCpmProto");
+    setBindingPath(bindings, "proto_schema", protoPath, false, "file");
+    const windowS = parseIntClamp(getElValue("wizCpmWindow"), 300, 1, 86400);
+    const gapS = parseIntClamp(getElValue("wizCpmGap"), 120, 0, 86400);
+    profile.scene_strategy = { mode: "time_window", window_s: windowS, gap_s: gapS };
+    delete bindings.scenes_index;
+    delete bindings.traj_ego;
+    delete bindings.traj_cooperative;
+    delete bindings.traj_infra;
+    delete bindings.traj_vehicle;
+    delete bindings.traffic_light;
+    delete bindings.maps_dir;
+  }
+
+  return profile;
+}
+
+function syncProfileWizardUi() {
+  const wiz = state.profileWizard;
+  const modal = $("profileWizardModal");
+  if (!modal) return;
+
+  modal.hidden = !wiz.open;
+  modal.setAttribute("aria-hidden", wiz.open ? "false" : "true");
+  if (!wiz.open) return;
+
+  const title = $("profileWizardTitle");
+  const sub = $("profileWizardSub");
+  if (title) title.textContent = wiz.mode === "edit" ? "Edit Connection" : "New Connection";
+  if (sub) sub.textContent = `Step ${wiz.step} of 3`;
+
+  const step1 = $("wizStep1");
+  const step2 = $("wizStep2");
+  const step3 = $("wizStep3");
+  if (step1) step1.hidden = wiz.step !== 1;
+  if (step2) step2.hidden = wiz.step !== 2;
+  if (step3) step3.hidden = wiz.step !== 3;
+
+  const chips = [["wizStepChip1", 1], ["wizStepChip2", 2], ["wizStepChip3", 3]];
+  for (const [id, stepNum] of chips) {
+    const chip = $(id);
+    if (!chip) continue;
+    chip.classList.remove("wizardStep--active", "wizardStep--done");
+    if (stepNum === wiz.step) chip.classList.add("wizardStep--active");
+    if (stepNum < wiz.step) chip.classList.add("wizardStep--done");
+  }
+
+  applyWizardDatasetBlocks();
+
+  const prevBtn = $("wizPrevBtn");
+  const nextBtn = $("wizNextBtn");
+  const saveBtn = $("wizSaveBtn");
+  const detectBtn = $("wizDetectBtn");
+  const validateBtn = $("wizValidateBtn");
+  if (prevBtn) prevBtn.disabled = wiz.busy || wiz.step <= 1;
+  if (nextBtn) {
+    nextBtn.hidden = wiz.step >= 3;
+    nextBtn.disabled = wiz.busy;
+    nextBtn.textContent = wiz.step === 2 ? "Validate + Continue" : "Next";
+  }
+  if (saveBtn) {
+    saveBtn.hidden = wiz.step !== 3;
+    const status = String(((wiz.draft || {}).validation || {}).status || "");
+    const canSave = !wiz.busy && (status === "ready" || status === "ready_with_warnings");
+    saveBtn.disabled = !canSave;
+    saveBtn.textContent = wiz.busy && wiz.action === "save" ? "Saving..." : "Save Connection";
+  }
+  if (detectBtn) {
+    detectBtn.disabled = wiz.busy;
+    detectBtn.textContent = wiz.busy && wiz.action === "detect" ? "Detecting..." : "Detect + Validate";
+  }
+  if (validateBtn) {
+    validateBtn.disabled = wiz.busy;
+    validateBtn.textContent = wiz.busy && wiz.action === "validate" ? "Validating..." : "Validate Mapping";
+  }
+  if (wiz.step === 3) renderWizardReview();
+}
+
+function openProfileWizard(mode = "create", payload = null) {
+  state.profileWizard = {
+    open: true,
+    mode: mode === "edit" ? "edit" : "create",
+    step: 1,
+    busy: false,
+    action: "",
+    draft: null,
+    profileId: "",
+  };
+  setHint("wizDetectResult", "");
+  setHint("wizValidateResult", "");
+  setConnectResult("");
+
+  if (payload && payload.profile && typeof payload.profile === "object") {
+    const draft = {
+      ok: true,
+      profile: cloneObj(payload.profile),
+      validation: payload.validation && typeof payload.validation === "object" ? cloneObj(payload.validation) : {},
+      capabilities: payload.capabilities && typeof payload.capabilities === "object" ? cloneObj(payload.capabilities) : {},
+    };
+    state.profileWizard.draft = draft;
+    state.profileWizard.profileId = String(payload.profile.profile_id || "");
+    setWizardFromProfile(draft.profile);
+    const validationStatus = String((draft.validation || {}).status || "");
+    if (validationStatus) {
+      setHint("wizDetectResult", `Current profile status: ${profileStatusLabel(validationStatus)}.`, profileStatusTone(validationStatus));
+    }
+  } else {
+    setElValue("wizType", "auto");
+    setElValue("wizName", "");
+    setElValue("wizPaths", "");
+    setElValue("wizV2xScenes", "");
+    setElValue("wizV2xEgo", "");
+    setElValue("wizV2xInfra", "");
+    setElValue("wizV2xVehicle", "");
+    setElValue("wizV2xTl", "");
+    setElValue("wizV2xMaps", "");
+    setElValue("wizCpmLogs", "");
+    setElValue("wizCpmProto", "");
+    setElValue("wizCpmWindow", "300");
+    setElValue("wizCpmGap", "120");
+    setElValue("wizCpmColTs", "");
+    setElValue("wizCpmColId", "");
+    setElValue("wizCpmColX", "");
+    setElValue("wizCpmColY", "");
+    setElValue("wizCpmColVx", "");
+    setElValue("wizCpmColVy", "");
+    setElValue("wizCpmColYaw", "");
+    setElValue("wizCpmColClass", "");
+  }
+  syncProfileWizardUi();
+}
+
+function closeProfileWizard() {
+  state.profileWizard.open = false;
+  state.profileWizard.busy = false;
+  state.profileWizard.action = "";
+  syncProfileWizardUi();
+}
+
+function renderWizardReview() {
+  const wiz = state.profileWizard;
+  const box = $("wizReviewSummary");
+  const issuesEl = $("wizReviewIssues");
+  if (!box || !issuesEl) return;
+  const draft = wiz.draft || {};
+  const profile = draft.profile && typeof draft.profile === "object" ? draft.profile : {};
+  const validation = draft.validation && typeof draft.validation === "object" ? draft.validation : {};
+  const status = String(validation.status || "");
+  const detectorScore = Number(((profile.detector || {}).score));
+  const scoreText = Number.isFinite(detectorScore) ? detectorScore.toFixed(1) : "?";
+
+  const summaryRows = [];
+  summaryRows.push(`<b>Name:</b> ${escapeHtml(String(profile.name || "?"))}`);
+  summaryRows.push(`<b>Type:</b> ${escapeHtml(profileTypeLabel(profile.dataset_type || ""))}`);
+  summaryRows.push(`<b>Status:</b> ${escapeHtml(profileStatusLabel(status))}`);
+  summaryRows.push(`<b>Detection score:</b> ${escapeHtml(scoreText)}`);
+  summaryRows.push(`<b>Dataset ID:</b> ${escapeHtml(String(profile.dataset_id || "(auto)"))}`);
+  box.innerHTML = summaryRows.map((x) => `<div>${x}</div>`).join("");
+
+  const errors = Array.isArray(validation.errors) ? validation.errors : [];
+  const warnings = Array.isArray(validation.warnings) ? validation.warnings : [];
+  const nodes = [];
+  for (const issue of errors) {
+    const msg = String(issue && issue.message ? issue.message : "Validation error.");
+    const role = issue && issue.role ? ` (${String(issue.role)})` : "";
+    nodes.push(`<div class="wizardIssue wizardIssue--bad"><b>Error${escapeHtml(role)}:</b> ${escapeHtml(msg)}</div>`);
+  }
+  for (const issue of warnings) {
+    const msg = String(issue && issue.message ? issue.message : "Validation warning.");
+    const role = issue && issue.role ? ` (${String(issue.role)})` : "";
+    nodes.push(`<div class="wizardIssue wizardIssue--warn"><b>Warning${escapeHtml(role)}:</b> ${escapeHtml(msg)}</div>`);
+  }
+  issuesEl.innerHTML = nodes.length ? nodes.join("") : `<div class="wizardIssue">No validation issues.</div>`;
+}
+
+async function wizardDetect() {
+  const wiz = state.profileWizard;
+  const selectedType = getElValue("wizType");
+  const datasetType = selectedType === "auto" ? null : selectedType;
+  const name = getElValue("wizName");
+  const paths = parseConnectPaths(getElValue("wizPaths"));
+  if (!paths.length) {
+    setHint("wizDetectResult", "Add at least one folder or file path.", "bad");
+    return false;
+  }
+
+  const prevProfile = wiz.draft && wiz.draft.profile ? wiz.draft.profile : {};
+  const keepProfileId = String(wiz.profileId || prevProfile.profile_id || "");
+  const keepDatasetId = String(prevProfile.dataset_id || "");
+
+  wiz.busy = true;
+  wiz.action = "detect";
+  syncProfileWizardUi();
+  try {
+    const payload = { dataset_type: datasetType, name, paths };
+    const data = await postJson("/api/profiles/detect", payload);
+    if (data && data.profile && typeof data.profile === "object") {
+      if (keepProfileId) data.profile.profile_id = keepProfileId;
+      if (keepDatasetId) data.profile.dataset_id = keepDatasetId;
+      wiz.profileId = String(data.profile.profile_id || keepProfileId || "");
+      setWizardFromProfile(data.profile);
+    }
+    wiz.draft = data || null;
+    state.connectDraft = wiz.draft;
+
+    const validation = data && data.validation ? data.validation : {};
+    const status = String(validation.status || "");
+    const tone = profileStatusTone(status);
+    const score = Number(((data && data.profile && data.profile.detector) ? data.profile.detector.score : NaN));
+    const scoreText = Number.isFinite(score) ? score.toFixed(1) : "?";
+    setHint("wizDetectResult", `Detected ${profileTypeLabel((data && data.profile && data.profile.dataset_type) || "")} (score ${scoreText}) · ${profileStatusLabel(status)}`, tone);
+    applyWizardDatasetBlocks();
+    return true;
+  } catch (e) {
+    wiz.draft = null;
+    setHint("wizDetectResult", `Detect failed: ${e && e.message ? e.message : String(e)}`, "bad");
+    return false;
+  } finally {
+    wiz.busy = false;
+    wiz.action = "";
+    syncProfileWizardUi();
+  }
+}
+
+async function wizardValidate() {
+  const wiz = state.profileWizard;
+  const profile = buildProfileFromWizardInputs();
+  if (wiz.profileId) profile.profile_id = wiz.profileId;
+  if (!profile.dataset_id && wiz.draft && wiz.draft.profile && wiz.draft.profile.dataset_id) {
+    profile.dataset_id = wiz.draft.profile.dataset_id;
+  }
+
+  wiz.busy = true;
+  wiz.action = "validate";
+  syncProfileWizardUi();
+  try {
+    const data = await postJson("/api/profiles/validate", { profile });
+    wiz.draft = data || null;
+    state.connectDraft = wiz.draft;
+    if (data && data.profile && typeof data.profile === "object") {
+      wiz.profileId = String(data.profile.profile_id || wiz.profileId || "");
+      setWizardFromProfile(data.profile);
+    }
+    const validation = data && data.validation ? data.validation : {};
+    const status = String(validation.status || "");
+    const tone = profileStatusTone(status);
+    const errors = Array.isArray(validation.errors) ? validation.errors : [];
+    const warnings = Array.isArray(validation.warnings) ? validation.warnings : [];
+    if (status === "ready") {
+      setHint("wizValidateResult", "Mapping is valid and ready to save.", "ok");
+    } else if (status === "ready_with_warnings") {
+      const msg = warnings.length ? String(warnings[0].message || "Validation has warnings.") : "Validation has warnings.";
+      setHint("wizValidateResult", msg, "warn");
+    } else {
+      const msg = errors.length ? String(errors[0].message || "Validation failed.") : "Validation failed.";
+      setHint("wizValidateResult", msg, "bad");
+    }
+    return tone === "ok" || status === "ready_with_warnings";
+  } catch (e) {
+    setHint("wizValidateResult", `Validate failed: ${e && e.message ? e.message : String(e)}`, "bad");
+    return false;
+  } finally {
+    wiz.busy = false;
+    wiz.action = "";
+    syncProfileWizardUi();
+  }
+}
+
+async function refreshHomeAfterProfileChange() {
+  await loadDatasets();
+  await loadProfiles();
+  renderHomeCategoryOptions();
+  renderHomeDatasetCards();
+  renderHomeProfilesList();
+}
+
+async function saveConnectionProfileFromWizard() {
+  const wiz = state.profileWizard;
+  const ready = await wizardValidate();
+  if (!ready) {
+    setConnectResult("Fix validation errors before saving.", "bad");
+    if (wiz.step !== 2) wiz.step = 2;
+    syncProfileWizardUi();
+    return;
+  }
+  if (!wiz.draft || !wiz.draft.profile) {
+    setConnectResult("No profile to save.", "bad");
+    return;
+  }
+
+  wiz.busy = true;
+  wiz.action = "save";
+  syncProfileWizardUi();
+  try {
+    const payload = await postJson("/api/profiles/save", { profile: wiz.draft.profile });
+    const saved = payload && payload.profile ? payload.profile : null;
+    await refreshHomeAfterProfileChange();
+    if (saved && saved.dataset_id) {
+      setConnectResult(`Saved profile: ${saved.name} (${saved.dataset_id}).`, "ok");
+    } else {
+      setConnectResult("Profile saved.", "ok");
+    }
+    closeProfileWizard();
+  } catch (e) {
+    setConnectResult(`Save failed: ${e && e.message ? e.message : String(e)}`, "bad");
+  } finally {
+    wiz.busy = false;
+    wiz.action = "";
+    syncProfileWizardUi();
+  }
+}
+
+async function openProfileWizardForEdit(profileId) {
+  const pid = String(profileId || "").trim();
+  if (!pid) return;
+  setConnectResult("");
+  try {
+    const payload = await fetchJson(`/api/profiles/${encodeURIComponent(pid)}`);
+    openProfileWizard("edit", payload);
+  } catch (e) {
+    setConnectResult(`Could not load profile: ${e && e.message ? e.message : String(e)}`, "bad");
+  }
+}
+
+async function deleteConnectionProfile(profileId) {
+  const pid = String(profileId || "").trim();
+  if (!pid) return;
+  if (!window.confirm("Delete this connection profile?")) return;
+  try {
+    await postJson("/api/profiles/delete", { profile_id: pid });
+    await refreshHomeAfterProfileChange();
+    setConnectResult("Profile deleted.", "ok");
+  } catch (e) {
+    setConnectResult(`Delete failed: ${e && e.message ? e.message : String(e)}`, "bad");
+  }
+}
+
+async function setDefaultConnectionProfile(profileId) {
+  const pid = String(profileId || "").trim();
+  if (!pid) return;
+  try {
+    await postJson("/api/profiles/default", { profile_id: pid });
+    await refreshHomeAfterProfileChange();
+    setConnectResult("Default profile updated.", "ok");
+  } catch (e) {
+    setConnectResult(`Set default failed: ${e && e.message ? e.message : String(e)}`, "bad");
+  }
+}
+
+function renderHomeProfilesList() {
+  const wrap = $("homeProfilesList");
+  if (!wrap) return;
+  const items = Array.isArray(state.profiles) ? state.profiles : [];
+  if (!items.length) {
+    wrap.innerHTML = `<div class="profileEmpty">No connection profiles yet. Add one to map local dataset files to app roles.</div>`;
+    return;
+  }
+
+  wrap.innerHTML = items
+    .map((p) => {
+      const profileId = String(p.profile_id || "");
+      const datasetId = String(p.dataset_id || "");
+      const isDefault = !!p.is_default;
+      const status = String(p.status || "");
+      const tone = profileStatusTone(status);
+      const statusClass = tone === "ok" ? "chip chip--yes" : tone === "bad" ? "chip chip--no" : "chip";
+      const openBtn = datasetId && state.datasetsById[datasetId]
+        ? `<button class="btn btn--ghost btn--sm" type="button" data-open-profile-dataset="${escapeHtml(datasetId)}">Open</button>`
+        : "";
+      const defaultChip = isDefault ? `<span class="chip chip--default">Default</span>` : "";
+      const defaultBtn = isDefault
+        ? ""
+        : `<button class="btn btn--ghost btn--sm" type="button" data-set-default-profile="${escapeHtml(profileId)}">Set default</button>`;
+      return `
+        <div class="profileRow">
+          <div class="profileRow__main">
+            <div class="profileRow__name">${escapeHtml(String(p.name || profileId || "Profile"))}</div>
+            <div class="profileRow__meta">${escapeHtml(profileTypeLabel(p.dataset_type))} · ${escapeHtml(datasetId || "no dataset id")}</div>
+          </div>
+          <div class="profileActions">
+            ${defaultChip}
+            <span class="${statusClass}">${escapeHtml(profileStatusLabel(status))}</span>
+            ${openBtn}
+            <button class="btn btn--ghost btn--sm" type="button" data-edit-profile="${escapeHtml(profileId)}">Edit</button>
+            ${defaultBtn}
+            <button class="btn btn--sm btn--danger" type="button" data-delete-profile="${escapeHtml(profileId)}">Delete</button>
+          </div>
+        </div>
+      `;
+    })
+    .join("");
+}
+
 function yesNoChip(label, v) {
   const vv = (v === true) ? "Yes" : (v === false) ? "No" : "?";
   const cls = (v === true) ? "chip chip--yes" : (v === false) ? "chip chip--no" : "chip";
@@ -2172,7 +3362,8 @@ function renderHomeDatasetCards() {
   const installed = [];
   const catalogOnly = [];
   for (const it of filtered) {
-    if (state.datasetsById && state.datasetsById[it.id]) installed.push(it);
+    const ds = state.datasetsById ? state.datasetsById[it.id] : null;
+    if (ds && !ds.virtual) installed.push(it);
     else catalogOnly.push(it);
   }
 
@@ -2207,9 +3398,11 @@ function renderHomeDatasetCards() {
   if (statsEl) {
     const totalCatalog = (state.catalogDatasets || []).length;
     const totalInstalled = Object.keys(state.datasetsById || {}).length;
+    const totalProfiles = Array.isArray(state.profiles) ? state.profiles.length : 0;
     const showing = filtered.length;
     const chips = [];
     chips.push(`<span class="chip chip--yes">Available: ${totalInstalled}</span>`);
+    chips.push(`<span class="chip">Connections: ${totalProfiles}</span>`);
     if (totalCatalog) chips.push(`<span class="chip">Catalog: ${totalCatalog}</span>`);
     if (q || catFilter || mapFilter || tlFilter) chips.push(`<span class="chip">Showing: ${showing}</span>`);
     statsEl.innerHTML = chips.join("");
@@ -2220,11 +3413,13 @@ function renderHomeDatasetCards() {
     const cards = arr
       .map((it) => {
         const ds = state.datasetsById[it.id] || null;
-        const isSupported = !!ds;
+        const appSpec = (it.app && typeof it.app === "object") ? it.app : {};
+        const family = String((ds && ds.family) || appSpec.family || "").trim().toLowerCase();
+        const isSupported = !!ds || (appSpec.supported === true && supportedLocalFamily(family));
         const isPrivate = String(it.visibility || "").toLowerCase() === "private";
-        const tagText = isPrivate ? "Private" : isSupported ? "Available" : "Catalog";
+        const tagText = isPrivate ? "Private" : (ds ? "Available" : (isSupported ? "Ready to load" : "Catalog"));
         const tagCls = isPrivate ? "dsTag dsTag--private" : isSupported ? "dsTag dsTag--on" : "dsTag";
-        const active = isSupported && state.datasetId && String(it.id) === String(state.datasetId);
+        const active = state.datasetId && String(it.id) === String(state.datasetId);
 
         const caps = it.capabilities || {};
         const chips = [];
@@ -2413,7 +3608,97 @@ async function checkForUpdates({ force = false, userInitiated = false } = {}) {
   }
 }
 
-async function openExplorerForDataset(datasetId, { savePrev = true } = {}) {
+function clearExplorerSceneState(message) {
+  const msg = String(message || "").trim() || "Load a dataset directory to start.";
+  setPlaying(false);
+  setCanvasLoading(false);
+  state.bundle = null;
+  state.sceneModalities = null;
+  state.frame = 0;
+  state.sceneIds = [];
+  state.sceneId = null;
+  state.sceneTotal = 0;
+  state.sceneOffset = 0;
+  state.intersectId = "";
+  state.selectedKey = null;
+  state.selected = null;
+  state.view = null;
+  state.mapPaths = null;
+  resetTrailCache();
+  updateSubTypeUi(null);
+
+  const interSel = $("intersectSelect");
+  if (interSel) {
+    interSel.innerHTML = "";
+    interSel.disabled = true;
+    const all = document.createElement("option");
+    all.value = "";
+    all.textContent = `All ${pluralizeLower(state.groupLabel) || "groups"}`;
+    interSel.appendChild(all);
+    interSel.value = "";
+  }
+  const sceneSel = $("sceneSelect");
+  if (sceneSel) {
+    sceneSel.innerHTML = "";
+    sceneSel.disabled = true;
+  }
+  const splitSel = $("splitSelect");
+  if (splitSel) splitSel.disabled = true;
+  const prevBtn = $("prevSceneBtn");
+  if (prevBtn) prevBtn.disabled = true;
+  const nextBtn = $("nextSceneBtn");
+  if (nextBtn) nextBtn.disabled = true;
+  const jumpInput = $("sceneJumpInput");
+  if (jumpInput) jumpInput.disabled = true;
+  const jumpBtn = $("sceneGoBtn");
+  if (jumpBtn) jumpBtn.disabled = true;
+
+  const slider = $("frameSlider");
+  if (slider) {
+    slider.min = "0";
+    slider.max = "0";
+    slider.value = "0";
+  }
+  const frameLabel = $("frameLabel");
+  if (frameLabel) frameLabel.textContent = "Frame 0";
+  const timeLabel = $("timeLabel");
+  if (timeLabel) timeLabel.textContent = "Time +0.0s";
+  const countsLabel = $("countsLabel");
+  if (countsLabel) countsLabel.textContent = "No data loaded";
+  const transLabel = $("sceneTransitionLabel");
+  if (transLabel) transLabel.textContent = "";
+
+  updateSceneHint(0, 0, 0);
+  setPlaybackEnabled(false);
+  updateSceneModalityControls(null);
+  updateStatusBox(msg);
+  const si = $("sceneInfo");
+  if (si) si.textContent = msg;
+
+  const canvas = $("mapCanvas");
+  if (canvas) {
+    const ctx = canvas.getContext("2d");
+    if (ctx) {
+      const { cssW, cssH, dpr } = getCanvasSize(canvas);
+      resizeCanvas(canvas, ctx, cssW, cssH, dpr);
+      ctx.setTransform(1, 0, 0, 1, 0, 0);
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+    }
+  }
+}
+
+function sourcePromptText(datasetType, title) {
+  const name = String(title || "dataset");
+  if (datasetType === "v2x_traj") {
+    return `Select the ${name} dataset directory to start scene loading.`;
+  }
+  if (datasetType === "consider_it_cpm") {
+    return `Select the ${name} dataset directory to start scene loading.`;
+  }
+  return `Select the ${name} dataset directory to start scene loading.`;
+}
+
+async function openExplorerForDataset(datasetId, { savePrev = true, loadData = true } = {}) {
   const next = String(datasetId || "").trim();
   if (!next) return;
 
@@ -2429,12 +3714,21 @@ async function openExplorerForDataset(datasetId, { savePrev = true } = {}) {
   applyDatasetUi();
   restoreDatasetSettings(next);
   syncControlsFromState();
+  updateSourcePanel();
+
+  if (!loadData) {
+    const meta = currentDatasetMeta() || {};
+    clearExplorerSceneState(sourcePromptText(datasetTypeFromMeta(meta), meta.title || meta.id || "dataset"));
+    updateSourcePanel();
+    return;
+  }
 
   // Now load data for this dataset.
   state.sceneOffset = Number(state.sceneOffset || 0);
   await loadIntersections();
   await loadScenes();
   await loadSceneBundle();
+  updateSourcePanel();
 }
 
 async function loadIntersections() {
@@ -2446,6 +3740,7 @@ async function loadIntersections() {
   if (reqId !== req.intersections) return;
   const sel = $("intersectSelect");
   sel.innerHTML = "";
+  sel.disabled = false;
 
   const all = document.createElement("option");
   all.value = "";
@@ -2461,7 +3756,18 @@ async function loadIntersections() {
   }
 
   const keep = prev && Array.from(sel.options).some((o) => String(o.value) === String(prev));
-  state.intersectId = keep ? prev : "";
+  if (keep) {
+    state.intersectId = prev;
+  } else {
+    const meta = currentDatasetMeta() || {};
+    const datasetType = datasetTypeFromMeta(meta);
+    if (datasetType === "consider_it_cpm") {
+      const lidar = Array.from(sel.options).find((o) => String(o.value || "").startsWith("lidar__"));
+      state.intersectId = lidar ? String(lidar.value) : "";
+    } else {
+      state.intersectId = "";
+    }
+  }
   sel.value = state.intersectId;
 }
 
@@ -2508,6 +3814,16 @@ async function loadScenes() {
   const next = keep ? existing : (data.items && data.items[0] ? data.items[0].scene_id : null);
   state.sceneId = next;
   if (next) sel.value = next;
+  const hasScenes = state.sceneIds.length > 0;
+  sel.disabled = !hasScenes;
+  const prevBtn = $("prevSceneBtn");
+  if (prevBtn) prevBtn.disabled = !hasScenes;
+  const nextBtn = $("nextSceneBtn");
+  if (nextBtn) nextBtn.disabled = !hasScenes;
+  const jumpInput = $("sceneJumpInput");
+  if (jumpInput) jumpInput.disabled = !hasScenes;
+  const jumpBtn = $("sceneGoBtn");
+  if (jumpBtn) jumpBtn.disabled = !hasScenes;
 }
 
 async function loadSceneBundle() {
@@ -2515,60 +3831,93 @@ async function loadSceneBundle() {
   const ds = state.datasetId;
   const split = state.split;
   const scene = state.sceneId;
-  if (!ds || !split || !scene) return;
+  if (!ds || !split || !scene) {
+    state.sceneModalities = null;
+    updateSceneModalityControls(null);
+    setCanvasLoading(false);
+    return;
+  }
 
   setPlaying(false);
   state.selected = null;
   $("sceneInfo").textContent = "Loading scene…";
   updateStatusBox("Loading scene…");
+  setCanvasLoading(true, `Loading ${currentSceneLabel(scene)}...`);
 
-  const qs = new URLSearchParams({
-    include_map: state.hasMap ? "1" : "0",
-    map_clip: state.mapClip || "intersection",
-    map_points_step: String(state.mapPointsStep || 3),
-    map_padding: String(state.mapPadding || 120),
-    max_lanes: String(state.mapMaxLanes || 5000),
-  });
+  try {
+    const qs = new URLSearchParams({
+      include_map: state.hasMap ? "1" : "0",
+      map_clip: state.mapClip || "intersection",
+      map_points_step: String(state.mapPointsStep || 3),
+      map_padding: String(state.mapPadding || 120),
+      max_lanes: String(state.mapMaxLanes || 5000),
+    });
 
-  const bundle = await fetchJson(`/api/datasets/${encodeURIComponent(ds)}/scene/${encodeURIComponent(split)}/${encodeURIComponent(scene)}/bundle?${qs.toString()}`);
-  if (reqId !== req.bundle) return;
-  if (state.datasetId !== ds || state.split !== split || String(state.sceneId) !== String(scene)) return;
+    const bundle = await fetchJson(`/api/datasets/${encodeURIComponent(ds)}/scene/${encodeURIComponent(split)}/${encodeURIComponent(scene)}/bundle?${qs.toString()}`);
+    if (reqId !== req.bundle) return;
+    if (state.datasetId !== ds || state.split !== split || String(state.sceneId) !== String(scene)) return;
 
-  state.bundle = bundle;
-  state.frame = 0;
-  state.selectedKey = null;
-  state.selected = null;
-  resetTrailCache();
-  updateSubTypeUi(bundle);
+    state.bundle = bundle;
+    state.frame = 0;
+    state.selectedKey = null;
+    state.selected = null;
+    updateSceneModalityControls(bundle);
+    resetTrailCache();
+    updateSubTypeUi(bundle);
 
-  // Reflect server-applied map settings (in case values were clamped/defaulted).
-  if (bundle.map) {
-    if (bundle.map.clip_mode) {
-      state.mapClip = bundle.map.clip_mode;
-      $("mapClipSelect").value = state.mapClip;
+    // Reflect server-applied map settings (in case values were clamped/defaulted).
+    if (bundle.map) {
+      if (bundle.map.clip_mode) {
+        state.mapClip = bundle.map.clip_mode;
+        $("mapClipSelect").value = state.mapClip;
+      }
+      if (bundle.map.points_step) {
+        state.mapPointsStep = Number(bundle.map.points_step) || state.mapPointsStep;
+        $("mapStepSelect").value = String(state.mapPointsStep);
+      }
     }
-    if (bundle.map.points_step) {
-      state.mapPointsStep = Number(bundle.map.points_step) || state.mapPointsStep;
-      $("mapStepSelect").value = String(state.mapPointsStep);
+
+    const slider = $("frameSlider");
+    slider.min = "0";
+    slider.max = String(Math.max(0, bundle.frames.length - 1));
+    slider.value = "0";
+
+    state.mapPaths = buildMapPaths(bundle.map);
+
+    // Fit view on load (default: trajectories; scope can be expanded via "Fit Map"/scope selector).
+    const canvas = $("mapCanvas");
+    const { cssW, cssH } = getCanvasSize(canvas);
+    state.view = fitViewToExtent(bundle.extent, cssW, cssH, 28);
+
+    setPlaybackEnabled(bundle.frames && bundle.frames.length > 0);
+    const splitSel = $("splitSelect");
+    if (splitSel) splitSel.disabled = state.splits.length <= 1;
+    const interSel = $("intersectSelect");
+    if (interSel) interSel.disabled = false;
+    const sceneSel = $("sceneSelect");
+    if (sceneSel) sceneSel.disabled = false;
+    const prevBtn = $("prevSceneBtn");
+    if (prevBtn) prevBtn.disabled = false;
+    const nextBtn = $("nextSceneBtn");
+    if (nextBtn) nextBtn.disabled = false;
+    const jumpInput = $("sceneJumpInput");
+    if (jumpInput) jumpInput.disabled = false;
+    const jumpBtn = $("sceneGoBtn");
+    if (jumpBtn) jumpBtn.disabled = false;
+    updateStatusBox();
+    updateSceneInfo();
+    render();
+    markSceneTransition(currentSceneLabel(scene));
+  } catch (e) {
+    if (reqId === req.bundle) {
+      const msg = `Failed to load scene: ${e && e.message ? e.message : String(e)}`;
+      updateStatusBox(msg);
+      $("sceneInfo").textContent = msg;
     }
+    throw e;
+  } finally {
+    if (reqId === req.bundle) setCanvasLoading(false);
   }
-
-  const slider = $("frameSlider");
-  slider.min = "0";
-  slider.max = String(Math.max(0, bundle.frames.length - 1));
-  slider.value = "0";
-
-  state.mapPaths = buildMapPaths(bundle.map);
-
-  // Fit view on load (default: trajectories; scope can be expanded via "Fit Map"/scope selector).
-  const canvas = $("mapCanvas");
-  const { cssW, cssH } = getCanvasSize(canvas);
-  state.view = fitViewToExtent(bundle.extent, cssW, cssH, 28);
-
-  setPlaybackEnabled(bundle.frames && bundle.frames.length > 0);
-  updateStatusBox();
-  updateSceneInfo();
-  render();
 }
 
 function wireUi() {
@@ -2577,10 +3926,13 @@ function wireUi() {
     backBtn.addEventListener("click", () => {
       setPlaying(false);
       saveCurrentDatasetSettings();
+      state.datasetLocked = false;
       setView("home");
       syncControlsFromState();
       renderHomeDatasetCards();
+      renderHomeProfilesList();
       setHomeError("");
+      updateSourcePanel();
     });
   }
 
@@ -2604,11 +3956,34 @@ function wireUi() {
 
   $("datasetSelect").addEventListener("change", async (e) => {
     try {
+      state.datasetLocked = false;
       await openExplorerForDataset(e.target.value, { savePrev: true });
     } catch (err) {
       updateStatusBox(`Failed to switch dataset: ${err && err.message ? err.message : String(err)}`);
     }
   });
+
+  const sourceFolderBtn = $("sourceFolderBtn");
+  if (sourceFolderBtn) {
+    sourceFolderBtn.addEventListener("click", async () => {
+      if (state.sourceBusy) return;
+      const meta = currentDatasetMeta() || {};
+      const datasetType = datasetTypeFromMeta(meta);
+      if (!datasetType) {
+        setConnectResult("This dataset is not supported for local loading.", "bad");
+        updateSourcePanel();
+        return;
+      }
+      const prompt = datasetType === "v2x_traj"
+        ? "Enter a V2X-Traj dataset directory path:"
+        : datasetType === "v2x_seq"
+          ? "Enter a V2X-Seq dataset directory path:"
+          : "Enter a Consider.it dataset directory path:";
+      const paths = await pickPathsDesktop("pick_folder", prompt);
+      if (!paths.length) return;
+      await loadDatasetFromFolder(paths[0]);
+    });
+  }
 
   $("splitSelect").addEventListener("change", async (e) => {
     state.split = e.target.value;
@@ -2814,6 +4189,7 @@ function wireUi() {
   bindCheck("mapJunctions", (v) => (state.mapLayers.junctions = v));
 
   bindCheck("typeVehicle", (v) => (state.types.VEHICLE = v));
+  bindCheck("typeVru", (v) => (state.types.VRU = v));
   bindCheck("typePed", (v) => (state.types.PEDESTRIAN = v));
   bindCheck("typeBike", (v) => (state.types.BICYCLE = v));
   bindCheck("typeOther", (v) => (state.types.OTHER = v));
@@ -3065,6 +4441,148 @@ function wireHomeUi() {
     });
   }
 
+  const newConnBtn = $("homeConnectNewBtn");
+  if (newConnBtn) {
+    newConnBtn.addEventListener("click", () => {
+      openProfileWizard("create");
+    });
+  }
+
+  const profileList = $("homeProfilesList");
+  if (profileList) {
+    profileList.addEventListener("click", async (ev) => {
+      const openBtn = ev.target && ev.target.closest ? ev.target.closest("[data-open-profile-dataset]") : null;
+      if (openBtn) {
+        const ds = String(openBtn.getAttribute("data-open-profile-dataset") || "").trim();
+        if (!ds) return;
+        setHomeError("");
+        openBtn.disabled = true;
+        const prevText = openBtn.textContent;
+        openBtn.textContent = "Opening...";
+        try {
+          const ensured = ensureDatasetMetaForCard(ds);
+          if (!ensured && !state.datasetsById[ds]) throw new Error("Dataset is not supported in this app yet.");
+          const effectiveMeta = ensured || state.datasetsById[ds] || null;
+          const loadData = hasLoadedSourceForMeta(effectiveMeta);
+          state.datasetLocked = true;
+          setView("explorer");
+          await openExplorerForDataset(ds, { savePrev: false, loadData });
+        } catch (e) {
+          setView("home");
+          setHomeError(`Failed to open explorer: ${e && e.message ? e.message : String(e)}`);
+        } finally {
+          openBtn.textContent = prevText;
+          openBtn.disabled = false;
+        }
+        return;
+      }
+
+      const editBtn = ev.target && ev.target.closest ? ev.target.closest("[data-edit-profile]") : null;
+      if (editBtn) {
+        const profileId = editBtn.getAttribute("data-edit-profile");
+        if (profileId) await openProfileWizardForEdit(profileId);
+        return;
+      }
+
+      const delBtn = ev.target && ev.target.closest ? ev.target.closest("[data-delete-profile]") : null;
+      if (delBtn) {
+        const profileId = delBtn.getAttribute("data-delete-profile");
+        if (profileId) await deleteConnectionProfile(profileId);
+        return;
+      }
+
+      const defBtn = ev.target && ev.target.closest ? ev.target.closest("[data-set-default-profile]") : null;
+      if (defBtn) {
+        const profileId = defBtn.getAttribute("data-set-default-profile");
+        if (profileId) await setDefaultConnectionProfile(profileId);
+      }
+    });
+  }
+
+  const modal = $("profileWizardModal");
+  if (modal) {
+    modal.addEventListener("click", (ev) => {
+      if (!ev.target) return;
+      const close = ev.target.closest ? ev.target.closest("[data-close-profile-wizard]") : null;
+      if (!close) return;
+      if (state.profileWizard.busy) return;
+      closeProfileWizard();
+    });
+  }
+  const closeBtn = $("profileWizardCloseBtn");
+  if (closeBtn) {
+    closeBtn.addEventListener("click", () => {
+      if (state.profileWizard.busy) return;
+      closeProfileWizard();
+    });
+  }
+
+  const wizTypeSel = $("wizType");
+  if (wizTypeSel) {
+    wizTypeSel.addEventListener("change", () => {
+      applyWizardDatasetBlocks();
+      syncProfileWizardUi();
+    });
+  }
+
+  const wizDetectBtn = $("wizDetectBtn");
+  if (wizDetectBtn) {
+    wizDetectBtn.addEventListener("click", () => {
+      wizardDetect().catch(() => {});
+    });
+  }
+  const wizValidateBtn = $("wizValidateBtn");
+  if (wizValidateBtn) {
+    wizValidateBtn.addEventListener("click", () => {
+      wizardValidate().catch(() => {});
+    });
+  }
+
+  const wizPrevBtn = $("wizPrevBtn");
+  if (wizPrevBtn) {
+    wizPrevBtn.addEventListener("click", () => {
+      if (state.profileWizard.busy) return;
+      state.profileWizard.step = Math.max(1, Number(state.profileWizard.step || 1) - 1);
+      syncProfileWizardUi();
+    });
+  }
+
+  const wizNextBtn = $("wizNextBtn");
+  if (wizNextBtn) {
+    wizNextBtn.addEventListener("click", async () => {
+      if (state.profileWizard.busy) return;
+      const step = Number(state.profileWizard.step || 1);
+      if (step === 1) {
+        if (state.profileWizard.draft && state.profileWizard.draft.profile) {
+          const nextProfile = buildProfileFromWizardInputs();
+          if (state.profileWizard.profileId) nextProfile.profile_id = state.profileWizard.profileId;
+          state.profileWizard.draft.profile = nextProfile;
+          state.profileWizard.step = 2;
+        } else {
+          const ok = await wizardDetect();
+          if (ok) state.profileWizard.step = 2;
+        }
+      } else if (step === 2) {
+        const ok = await wizardValidate();
+        if (ok) state.profileWizard.step = 3;
+      }
+      syncProfileWizardUi();
+    });
+  }
+
+  const wizSaveBtn = $("wizSaveBtn");
+  if (wizSaveBtn) {
+    wizSaveBtn.addEventListener("click", () => {
+      saveConnectionProfileFromWizard().catch(() => {});
+    });
+  }
+
+  window.addEventListener("keydown", (ev) => {
+    if (ev.key !== "Escape") return;
+    if (!state.profileWizard.open || state.profileWizard.busy) return;
+    closeProfileWizard();
+  });
+
   const wrap = $("homeDatasetCards");
   if (wrap) {
     wrap.addEventListener("click", async (ev) => {
@@ -3078,9 +4596,14 @@ function wireHomeUi() {
       const prevText = btn.textContent;
       btn.textContent = "Opening...";
 
-      setView("explorer");
       try {
-        await openExplorerForDataset(ds, { savePrev: false });
+        const ensured = ensureDatasetMetaForCard(ds);
+        if (!ensured && !state.datasetsById[ds]) throw new Error("Dataset is not supported in this app yet.");
+        const effectiveMeta = ensured || state.datasetsById[ds] || null;
+        const loadData = hasLoadedSourceForMeta(effectiveMeta);
+        state.datasetLocked = true;
+        setView("explorer");
+        await openExplorerForDataset(ds, { savePrev: false, loadData });
       } catch (e) {
         setView("home");
         setHomeError(`Failed to open explorer: ${e && e.message ? e.message : String(e)}`);
@@ -3100,6 +4623,7 @@ async function main() {
   syncUpdateUi();
 
   await loadDatasets();
+  await loadProfiles();
   await loadCatalog();
   renderHomeCategoryOptions();
   const mapSel = $("homeHasMap");
@@ -3108,6 +4632,7 @@ async function main() {
   if (tlSel) tlSel.value = String(state.homeHasTL || "");
   const sortSel = $("homeSort");
   if (sortSel) sortSel.value = String(state.homeSort || "available");
+  renderHomeProfilesList();
   renderHomeDatasetCards();
 
   // Update checks run in the background and should not block loading datasets.

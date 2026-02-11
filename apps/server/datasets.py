@@ -814,6 +814,356 @@ class V2XTrajAdapter:
         return out
 
 
+class V2XSeqAdapter(V2XTrajAdapter):
+    """
+    Adapter for V2X-Seq trajectory forecasting subset.
+
+    Notes:
+    - This dataset family is kept separate from V2X-Traj.
+    - We discover trajectory / traffic-light roles by schema so directory
+      name inconsistencies do not break loading.
+    - Scene unit is the native CSV clip (scene_id = file stem).
+    """
+
+    _SPLITS = ("train", "val")
+
+    def __init__(self, spec: DatasetSpec) -> None:
+        self._scene_files: Dict[str, Dict[str, Dict[str, Path]]] = {"train": {}, "val": {}}
+        self._roots_by_modality: Dict[str, List[Path]] = {"ego": [], "infra": [], "vehicle": [], "traffic_light": []}
+        self._csv_kind_cache: Dict[str, str] = {}
+        super().__init__(spec)
+
+    @staticmethod
+    def _norm_col(s: Any) -> str:
+        return re.sub(r"[^a-z0-9]+", "", str(s or "").strip().lower())
+
+    def _detect_csv_kind(self, path: Path) -> str:
+        """
+        Return one of: trajectory, traffic_light, unknown.
+        """
+        key = str(path.resolve())
+        cached = self._csv_kind_cache.get(key)
+        if cached is not None:
+            return cached
+
+        kind = "unknown"
+        try:
+            with path.open("r", newline="") as f:
+                r = csv.reader(f)
+                header = next(r, [])
+            cols = {self._norm_col(x) for x in header}
+            if {"timestamp", "id", "type", "x", "y", "vx", "vy"}.issubset(cols):
+                kind = "trajectory"
+            elif {"timestamp", "laneid", "color1", "remain1"}.issubset(cols):
+                kind = "traffic_light"
+        except Exception:
+            kind = "unknown"
+
+        self._csv_kind_cache[key] = kind
+        return kind
+
+    def _infer_dir_kind(self, root: Path) -> str:
+        if not root.exists() or not root.is_dir():
+            return "unknown"
+        counts: Counter = Counter()
+        # Sample a small set per split (fast and sufficient for schema detection).
+        for split in self._SPLITS:
+            files = self._iter_scene_csv_files(root, split)
+            for p in files[:4]:
+                counts[self._detect_csv_kind(p)] += 1
+        if not counts:
+            return "unknown"
+        kind, n = counts.most_common(1)[0]
+        if kind == "unknown" or n <= 0:
+            return "unknown"
+        return str(kind)
+
+    def _resolve_modality_roots(self) -> Dict[str, List[Path]]:
+        root = self.spec.root
+        raw_candidates: List[Tuple[Optional[str], Optional[Path]]] = [
+            ("ego", self._binding_dir("traj_cooperative")),
+            ("infra", self._binding_dir("traj_infra")),
+            ("vehicle", self._binding_dir("traj_vehicle")),
+            ("traffic_light", self._binding_dir("traffic_light")),
+            ("infra", root / "single-infrastructure" / "trajectories"),
+            ("vehicle", root / "single-vehicle" / "trajectories"),
+            ("ego", root / "cooperative-vehicle-infrastructure" / "cooperative-trajectories"),
+            # Some local copies split cooperative data into infra/vehicle dirs.
+            ("ego", root / "cooperative-vehicle-infrastructure" / "infrastructure-trajectories"),
+            ("ego", root / "cooperative-vehicle-infrastructure" / "vehicle-trajectories"),
+            ("traffic_light", root / "single-infrastructure" / "traffic-light"),
+            # In some local copies this folder contains trajectory clips.
+            ("ego", root / "cooperative-vehicle-infrastructure" / "traffic-light"),
+        ]
+
+        out: Dict[str, List[Path]] = {"ego": [], "infra": [], "vehicle": [], "traffic_light": []}
+        seen: set[str] = set()
+        for hinted_modality, p in raw_candidates:
+            if p is None:
+                continue
+            try:
+                rp = p.resolve()
+            except Exception:
+                continue
+            if not rp.exists() or not rp.is_dir():
+                continue
+            k = str(rp)
+            if k in seen:
+                continue
+            seen.add(k)
+
+            kind = self._infer_dir_kind(rp)
+            if kind == "trajectory":
+                target = hinted_modality if hinted_modality in ("ego", "infra", "vehicle") else "ego"
+                # Keep V2X-Seq modality semantics aligned with official subsets:
+                # cooperative / single-infrastructure / single-vehicle.
+                if "cooperative-vehicle-infrastructure" in k.lower():
+                    target = "ego"
+                out[target].append(rp)
+            elif kind == "traffic_light":
+                out["traffic_light"].append(rp)
+
+        return out
+
+    def _load_scenes_from_dirs(self) -> None:
+        self._roots_by_modality = self._resolve_modality_roots()
+        for split in self._SPLITS:
+            scenes = self._scene_index[split]
+            self._scene_files[split] = {}
+
+            for modality in ("ego", "infra", "vehicle", "traffic_light"):
+                for mod_root in self._roots_by_modality.get(modality, []):
+                    for p in self._iter_scene_csv_files(mod_root, split):
+                        scene_id = str(p.stem or "").strip()
+                        if not scene_id:
+                            continue
+                        kind = self._detect_csv_kind(p)
+                        if modality == "traffic_light" and kind != "traffic_light":
+                            continue
+                        if modality in ("ego", "infra", "vehicle") and kind != "trajectory":
+                            continue
+
+                        files_for_scene = self._scene_files[split].setdefault(scene_id, {})
+                        if modality not in files_for_scene:
+                            files_for_scene[modality] = p
+
+                        s = scenes.get(scene_id)
+                        if s is None:
+                            s = SceneSummary(
+                                scene_id=scene_id,
+                                split=split,
+                                city=None,
+                                intersect_id=None,
+                                intersect_label=None,
+                                by_modality={},
+                            )
+                            scenes[scene_id] = s
+
+                        if s.city is None or s.intersect_id is None:
+                            city, intersect_id = self._read_scene_meta_from_file(p)
+                            if s.city is None and city:
+                                s.city = city
+                            if s.intersect_id is None and intersect_id:
+                                s.intersect_id = intersect_id
+                                s.intersect_label = intersection_label(intersect_id)
+
+                        if modality not in s.by_modality:
+                            s.by_modality[modality] = {
+                                "rows": 0,
+                                "min_ts": None,
+                                "max_ts": None,
+                                "unique_ts": 0,
+                                "duration_s": None,
+                                "unique_agents": None,
+                            }
+
+            # Keep only scenes with at least one trajectory modality.
+            drop_ids = [
+                sid
+                for sid, s in scenes.items()
+                if ("ego" not in s.by_modality and "infra" not in s.by_modality and "vehicle" not in s.by_modality)
+            ]
+            for sid in drop_ids:
+                scenes.pop(sid, None)
+                self._scene_files[split].pop(sid, None)
+
+        for split, scenes in self._scene_index.items():
+            for s in scenes.values():
+                if s.intersect_id:
+                    self._intersections[split][s.intersect_id] += 1
+
+    def _scene_file(self, modality: str, split: str, scene_id: str) -> Path:
+        p = self._scene_files.get(split, {}).get(scene_id, {}).get(modality)
+        if p is not None:
+            return p
+        return self.spec.root / "__missing__" / split / f"{scene_id}_{modality}.csv"
+
+    def load_scene_bundle(
+        self,
+        split: str,
+        scene_id: str,
+        include_map: bool = True,
+        map_padding: float = 60.0,
+        map_points_step: int = 5,
+        max_lanes: int = 4000,
+        map_clip: str = "intersection",
+    ) -> Dict[str, Any]:
+        warnings: List[str] = []
+
+        ego_path = self._scene_file("ego", split, scene_id)
+        infra_path = self._scene_file("infra", split, scene_id)
+        veh_path = self._scene_file("vehicle", split, scene_id)
+        tl_path = self._scene_file("traffic_light", split, scene_id)
+
+        traj_paths = (ego_path, infra_path, veh_path)
+        if not any(p.exists() for p in traj_paths):
+            warnings.append("no_trajectory_modalities")
+
+        ego_by_ts, ego_extent, ego_meta = self._load_csv_cached("traj", ego_path)
+        infra_by_ts, infra_extent, infra_meta = self._load_csv_cached("traj", infra_path)
+        veh_by_ts, veh_extent, veh_meta = self._load_csv_cached("traj", veh_path)
+        tl_by_ts, tl_extent, tl_meta = self._load_csv_cached("traffic_light", tl_path)
+
+        city = ego_meta.get("city") or infra_meta.get("city") or veh_meta.get("city") or tl_meta.get("city")
+        intersect_id = (
+            ego_meta.get("intersect_id")
+            or infra_meta.get("intersect_id")
+            or veh_meta.get("intersect_id")
+            or tl_meta.get("intersect_id")
+        )
+
+        intersect_by_modality = {
+            "ego": ego_meta.get("intersect_id"),
+            "infra": infra_meta.get("intersect_id"),
+            "vehicle": veh_meta.get("intersect_id"),
+            "traffic_light": tl_meta.get("intersect_id"),
+        }
+        uniq_intersects = {v for v in intersect_by_modality.values() if v}
+        if len(uniq_intersects) > 1:
+            warnings.append("intersect_id_mismatch_across_modalities")
+        map_id = parse_intersect_to_map_id(intersect_id or "")
+
+        extent = bbox_init()
+        for b in [ego_extent, infra_extent, veh_extent, tl_extent]:
+            if bbox_is_valid(b):
+                bbox_update(extent, b["min_x"], b["min_y"])
+                bbox_update(extent, b["max_x"], b["max_y"])
+
+        if not bbox_is_valid(extent):
+            extent = {"min_x": 0.0, "min_y": 0.0, "max_x": 1.0, "max_y": 1.0}
+            warnings.append("extent_missing: could not compute extent from scene files")
+
+        ts_keys = set(ego_by_ts.keys()) | set(infra_by_ts.keys()) | set(veh_by_ts.keys()) | set(tl_by_ts.keys())
+        ts_sorted = sorted(ts_keys)
+        if not ts_sorted:
+            warnings.append("no_timestamps: scene appears empty across all modalities")
+
+        frames = []
+        for k in ts_sorted:
+            frames.append(
+                {
+                    "ego": ego_by_ts.get(k, []),
+                    "infra": infra_by_ts.get(k, []),
+                    "vehicle": veh_by_ts.get(k, []),
+                    "traffic_light": tl_by_ts.get(k, []),
+                }
+            )
+
+        timestamps = [ts_100ms_to_float(k) for k in ts_sorted]
+        t0 = timestamps[0] if timestamps else None
+
+        def stats_for(by_ts: Dict[int, List[Dict[str, Any]]]) -> Dict[str, Any]:
+            if not by_ts:
+                return {"rows": 0, "unique_ts": 0, "min_ts": None, "max_ts": None}
+            keys = sorted(by_ts.keys())
+            rows = sum(len(v) for v in by_ts.values())
+            return {
+                "rows": rows,
+                "unique_ts": len(keys),
+                "min_ts": ts_100ms_to_float(keys[0]),
+                "max_ts": ts_100ms_to_float(keys[-1]),
+            }
+
+        modality_stats = {
+            "ego": stats_for(ego_by_ts),
+            "infra": stats_for(infra_by_ts),
+            "vehicle": stats_for(veh_by_ts),
+            "traffic_light": stats_for(tl_by_ts),
+        }
+
+        if not tl_path.exists():
+            warnings.append("traffic_light_missing_file")
+        elif modality_stats["traffic_light"]["rows"] == 0:
+            warnings.append("traffic_light_empty")
+
+        ref_mod = None
+        for candidate in ["ego", "infra", "vehicle"]:
+            if modality_stats.get(candidate, {}).get("min_ts") is not None:
+                ref_mod = candidate
+                break
+        if ref_mod and modality_stats.get("traffic_light", {}).get("min_ts") is not None:
+            a = modality_stats[ref_mod]
+            b = modality_stats["traffic_light"]
+            d_min = round(float(b["min_ts"]) - float(a["min_ts"]), 3)
+            d_max = round(float(b["max_ts"]) - float(a["max_ts"]), 3)
+            if abs(d_min) >= 0.05:
+                warnings.append(f"traffic_light_min_ts_offset_vs_{ref_mod}:{d_min}s")
+            if abs(d_max) >= 0.05:
+                warnings.append(f"traffic_light_max_ts_offset_vs_{ref_mod}:{d_max}s")
+
+        out: Dict[str, Any] = {
+            "dataset_id": self.spec.id,
+            "split": split,
+            "scene_id": scene_id,
+            "city": city,
+            "intersect_id": intersect_id,
+            "intersect_label": intersection_label(intersect_id),
+            "intersect_by_modality": intersect_by_modality,
+            "map_id": map_id,
+            "t0": t0,
+            "timestamps": timestamps,
+            "extent": extent,
+            "modality_stats": modality_stats,
+            "frames": frames,
+            "warnings": warnings,
+        }
+
+        if include_map and map_id is not None:
+            try:
+                parsed_map = self._load_map_parsed(map_id=map_id, points_step=map_points_step)
+
+                clip_mode = (map_clip or "intersection").strip().lower()
+                if clip_mode not in ("scene", "intersection"):
+                    clip_mode = "intersection"
+
+                if clip_mode == "scene":
+                    clip_extent = bbox_pad(extent, map_padding)
+                else:
+                    base = parsed_map.get("bbox")
+                    clip_extent = bbox_pad(base, map_padding) if base else bbox_pad(extent, map_padding)
+
+                focus_xy = ((extent["min_x"] + extent["max_x"]) / 2.0, (extent["min_y"] + extent["max_y"]) / 2.0)
+                out["map"] = self._clip_map_features(parsed_map, clip_extent, max_lanes=max_lanes, focus_xy=focus_xy)
+                out["map"]["clip_mode"] = clip_mode
+                out["map"]["clip_extent"] = clip_extent
+                out["map"]["points_step"] = map_points_step
+                out["map"]["bbox"] = parsed_map.get("bbox")
+                out["map"]["counts"] = parsed_map.get("counts")
+                out["map"]["map_file"] = parsed_map.get("map_file")
+
+                map_bbox = parsed_map.get("bbox")
+                if map_bbox and bbox_is_valid(map_bbox):
+                    if not bbox_intersects(map_bbox, extent):
+                        warnings.append("scene_outside_map_bbox")
+                    cx, cy = focus_xy
+                    if not (map_bbox["min_x"] <= cx <= map_bbox["max_x"] and map_bbox["min_y"] <= cy <= map_bbox["max_y"]):
+                        warnings.append("scene_center_outside_map_bbox")
+            except Exception as e:
+                warnings.append(f"map_load_failed: {e}")
+
+        return out
+
+
 @dataclass
 class _CpmWindowIndex:
     bucket: int
@@ -1498,6 +1848,8 @@ class DatasetStore:
         for spec in self.specs.values():
             if spec.family == "v2x-traj":
                 self.adapters[spec.id] = V2XTrajAdapter(spec)
+            elif spec.family == "v2x-seq":
+                self.adapters[spec.id] = V2XSeqAdapter(spec)
             elif spec.family == "cpm-objects":
                 # Consider_it CPM object logs (CSV). No global map; viewed in local sensor frame.
                 self.adapters[spec.id] = CpmObjectsAdapter(spec)
@@ -1514,6 +1866,27 @@ class DatasetStore:
                 "modalities": ["ego", "infra", "vehicle", "traffic_light"],
                 "modality_labels": {"ego": "Ego vehicle", "infra": "Infrastructure", "vehicle": "Other vehicles", "traffic_light": "Traffic lights"},
                 "modality_short_labels": {"ego": "Ego", "infra": "Infra", "vehicle": "Vehicles", "traffic_light": "Lights"},
+            }
+        if spec.family == "v2x-seq":
+            bindings = spec.bindings if isinstance(spec.bindings, dict) else {}
+            map_path = ((bindings.get("maps_dir") or {}).get("path")) if isinstance(bindings.get("maps_dir"), dict) else None
+            tl_path = ((bindings.get("traffic_light") or {}).get("path")) if isinstance(bindings.get("traffic_light"), dict) else None
+            has_map = bool(Path(str(map_path)).expanduser().exists()) if map_path else bool((spec.root / "maps").exists())
+            has_tl = bool(Path(str(tl_path)).expanduser().exists()) if tl_path else bool((spec.root / "single-infrastructure" / "traffic-light").exists())
+            return {
+                "splits": ["train", "val"],
+                "default_split": "val",
+                "group_label": "Intersection",
+                "has_map": has_map,
+                "modalities": ["ego", "infra", "vehicle", "traffic_light"],
+                "modality_labels": {
+                    "ego": "Cooperative vehicle-infrastructure",
+                    "infra": "Single infrastructure",
+                    "vehicle": "Single vehicle",
+                    "traffic_light": "Traffic lights",
+                },
+                "modality_short_labels": {"ego": "Coop", "infra": "Infra", "vehicle": "Vehicle", "traffic_light": "Lights"},
+                "has_traffic_lights": has_tl,
             }
         if spec.family == "cpm-objects":
             meta: Dict[str, Any] = {
