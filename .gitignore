@@ -31,9 +31,14 @@ dataset/v2x-traj/
 dataset/full-dataset/
 dataset/V2X-Seq-TFD-Example/
 dataset/ConsiderIt/
+dataset/Consider-It/
+dataset/raw_ConsiderIt/
+dataset/V2X-Seq-TFD/
 
 # Local dataset overrides (private paths / basemap origins)
 dataset/registry.local.json
+dataset/registry.*.local.json
+dataset/registry.private.json
 
 # Generated profiling outputs
 dataset/PROFILE_REPORT.md
@@ -49,6 +54,3 @@ dataset/profiles.local/
 # Large local assets
 Map1.png
 Cooperative Trajectory.pdf
-dataset/Consider-It/
-dataset/raw_ConsiderIt/
-dataset/V2X-Seq-TFD/
