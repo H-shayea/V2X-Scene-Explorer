@@ -873,6 +873,10 @@ input.sceneJump:focus {
   color: rgba(2, 6, 23, 0.6);
 }
 
+#splitAvailabilityHint {
+  margin-top: 6px;
+}
+
 select {
   height: 34px;
   padding: 6px 10px;

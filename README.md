@@ -11,6 +11,7 @@ scene browsing, playback, full trajectories, per-class filters, and HD map rende
 
 - Dataset picker with per-dataset settings (saved locally in your browser)
 - Scene navigation (next/prev, jump to scene ID)
+- Split-level availability summary (scene counts per modality)
 - Playback (play/pause, next frame, speed control)
 - Visual layers: trajectories, velocity arrows, heading arrows
 - Filters: modality/stream, object type, and fine-grained classes (subtypes)
@@ -200,6 +201,23 @@ Note: current updater flow is "check + download latest DMG". It does not install
 
 Note: this repo includes a small, precomputed scene index in `dataset/profiles/v2x-traj/` (not the dataset itself).
 
+### V2X-Seq (`family: v2x-seq`)
+
+- Splits: `train`, `val`
+- Grouping: intersections -> scenes (scene id = CSV clip id)
+- Map: supported (vector HD map when `maps/` exists)
+- Modalities shown in the UI:
+  - `Cooperative vehicle-infrastructure`
+  - `Single infrastructure`
+  - `Single vehicle`
+  - `Traffic lights`
+
+Notes:
+
+- Loader is schema-driven (not folder-name-only), because some local copies have swapped folder semantics.
+- Scene sidebar includes split-level modality availability counts.
+- For V2X-Seq only, you can enable **Include traffic-light-only scenes** in Scene panel.
+
 ### Consider.it CPM Objects (private) (`family: cpm-objects`)
 
 - Splits: treated as a single continuous log (`all`)
@@ -210,6 +228,47 @@ Note: this repo includes a small, precomputed scene index in `dataset/profiles/v
 - Annotations: object detections with a fine-grained class id (decoded from `sensor_interface-v1.2.1.proto`)
 
 Note: this dataset is private and is not distributed with this repository.
+
+## Expected folder layouts
+
+### V2X-Traj
+
+```text
+<root>/
+  ego-trajectories/
+  infrastructure-trajectories/
+  vehicle-trajectories/
+  traffic-light/            # optional
+  maps/                     # optional
+```
+
+### V2X-Seq
+
+```text
+<root>/
+  single-infrastructure/
+    trajectories/
+    traffic-light/
+  single-vehicle/
+    trajectories/
+  cooperative-vehicle-infrastructure/
+    cooperative-trajectories/      # optional in some local subsets
+    infrastructure-trajectories/    # optional in some local subsets
+    vehicle-trajectories/           # optional in some local subsets
+    traffic-light/                  # optional
+  maps/                             # optional
+```
+
+### Consider.it CPM Objects
+
+```text
+<root>/
+  lidar/
+    *.csv
+  thermal_camera/
+    *.csv
+  sensor_interface-v1.2.1.proto     # optional but recommended
+```
 
 
 ## Keyboard shortcuts
@@ -228,6 +287,8 @@ Note: this dataset is private and is not distributed with this repository.
 ## Tutorials
 
 - `tutorials/01_scenes.md` - how this project defines "scenes" for each dataset family.
+- `tutorials/02_dataset_layouts.md` - expected folder layouts and data quirks.
+- `tutorials/03_qa_smoke.md` - latest QA smoke snapshot.
 
 ## Troubleshooting
 
