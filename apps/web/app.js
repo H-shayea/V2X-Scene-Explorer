@@ -434,6 +434,7 @@ const state = {
   basemapZoom: null,
   basemapFrameStats: null,
   modalities: ["ego", "infra", "vehicle", "traffic_light"],
+  sceneModalities: null,
   modalityLabels: {},
   modalityShortLabels: {},
   subTypesByDataset: {},
@@ -652,6 +653,12 @@ function setCheck(id, v) {
   const el = $(id);
   if (!el) return;
   el.checked = !!v;
+}
+
+function setCheckDisabled(id, disabled) {
+  const el = $(id);
+  if (!el) return;
+  el.disabled = !!disabled;
 }
 
 function setSelectValue(id, v) {
@@ -1054,16 +1061,81 @@ function applyDatasetUi() {
 
   const holdWrap = $("holdTLWrap");
   if (holdWrap) holdWrap.hidden = !available.has("traffic_light");
+  state.sceneModalities = null;
+  updateSceneModalityControls(null);
   updateSourcePanel();
 }
 
+function detectSceneModalities(bundle) {
+  if (!bundle || typeof bundle !== "object") return null;
+  const datasetAvailable = new Set(Array.isArray(state.modalities) ? state.modalities.map(String) : []);
+  if (!datasetAvailable.size) return null;
+
+  let out = new Set();
+  const stats = bundle.modality_stats && typeof bundle.modality_stats === "object" ? bundle.modality_stats : null;
+  if (stats) {
+    for (const m of datasetAvailable) {
+      const rows = Number((((stats[m] || {}).rows) || 0));
+      if (rows > 0) out.add(m);
+    }
+  }
+
+  // Fallback when stats are missing: inspect a small frame sample.
+  if (!out.size && Array.isArray(bundle.frames) && bundle.frames.length) {
+    const frames = bundle.frames;
+    const step = Math.max(1, Math.floor(frames.length / 20));
+    for (let i = 0; i < frames.length; i += step) {
+      const fr = frames[i] || {};
+      for (const m of datasetAvailable) {
+        const arr = fr[m];
+        if (Array.isArray(arr) && arr.length > 0) out.add(m);
+      }
+      if (out.size === datasetAvailable.size) break;
+    }
+  }
+
+  if (!out.size) return null;
+  return out;
+}
+
+function updateSceneModalityControls(bundle) {
+  const datasetAvailable = new Set(Array.isArray(state.modalities) ? state.modalities.map(String) : []);
+  const sceneAvailable = detectSceneModalities(bundle);
+  state.sceneModalities = sceneAvailable ? Array.from(sceneAvailable) : null;
+
+  const cfg = [
+    { modality: "ego", wrapId: "layerEgoWrap", inputId: "layerEgo" },
+    { modality: "infra", wrapId: "layerInfraWrap", inputId: "layerInfra" },
+    { modality: "vehicle", wrapId: "layerVehicleWrap", inputId: "layerVehicle" },
+    { modality: "traffic_light", wrapId: "layerTLWrap", inputId: "layerTL" },
+  ];
+
+  for (const it of cfg) {
+    const datasetOn = datasetAvailable.has(it.modality);
+    const sceneOn = !sceneAvailable || sceneAvailable.has(it.modality);
+    const disable = datasetOn && !sceneOn;
+    const wrap = $(it.wrapId);
+    if (wrap) wrap.classList.toggle("is-disabled", disable);
+    setCheckDisabled(it.inputId, disable);
+  }
+
+  const hold = $("holdTL");
+  if (hold) {
+    const tlDataset = datasetAvailable.has("traffic_light");
+    const tlScene = !sceneAvailable || sceneAvailable.has("traffic_light");
+    hold.disabled = !(tlDataset && tlScene);
+  }
+}
+
 function hasModality(modality) {
-  return Array.isArray(state.modalities) && state.modalities.includes(modality);
+  if (!Array.isArray(state.modalities) || !state.modalities.includes(modality)) return false;
+  if (!Array.isArray(state.sceneModalities) || !state.sceneModalities.length) return true;
+  return state.sceneModalities.includes(modality);
 }
 
 function agentModalitiesOrdered() {
   const ms = Array.isArray(state.modalities) ? state.modalities.map(String) : ["ego", "infra", "vehicle"];
-  const agent = ms.filter((m) => m !== "traffic_light");
+  const agent = ms.filter((m) => m !== "traffic_light" && hasModality(m));
   const pref = ["infra", "vehicle", "ego"];
   const out = [];
   for (const p of pref) if (agent.includes(p)) out.push(p);
@@ -1072,7 +1144,7 @@ function agentModalitiesOrdered() {
 }
 
 function countsModalitiesOrdered() {
-  const ms = Array.isArray(state.modalities) ? state.modalities.map(String) : ["ego", "infra", "vehicle", "traffic_light"];
+  const ms = (Array.isArray(state.modalities) ? state.modalities.map(String) : ["ego", "infra", "vehicle", "traffic_light"]).filter((m) => hasModality(m));
   const pref = ["ego", "infra", "vehicle", "traffic_light"];
   const out = [];
   for (const p of pref) if (ms.includes(p)) out.push(p);
@@ -1701,13 +1773,14 @@ function render() {
     }
   }
   let counts = parts.join(" · ");
+  const drawAllTrails = !!(state.trailAll || !state.selectedKey);
   if (state.showTrail) {
     if (state.trailAll) {
       counts += " · Trajectories: all objects in frame";
     } else if (state.selectedKey && state.selectedKey.id != null) {
       counts += ` · Selected ${state.selectedKey.modality}:${state.selectedKey.id}`;
     } else {
-      counts += " · Tip: click a dot to select + view its trajectory";
+      counts += " · Trajectories: all objects in frame (preview) · click a dot to lock selection";
     }
   }
   $("countsLabel").textContent = counts;
@@ -1840,7 +1913,7 @@ function render() {
 
   // Trajectories (selected or all objects in the current frame)
   if (state.showTrail) {
-    if (state.trailAll) {
+    if (drawAllTrails) {
       const seen = new Set();
       for (const modality of agentModalitiesOrdered()) {
         if (!state.layers[modality]) continue;
@@ -2221,6 +2294,7 @@ function cloneObj(obj) {
 function profileTypeLabel(datasetType) {
   const t = String(datasetType || "").toLowerCase();
   if (t === "v2x_traj") return "V2X-Traj";
+  if (t === "v2x_seq") return "V2X-Seq";
   if (t === "consider_it_cpm") return "Consider.it CPM";
   if (!t) return "Unknown";
   return datasetType;
@@ -2264,6 +2338,7 @@ function setConnectResult(msg, tone = "") {
 function datasetTypeFromFamily(family) {
   const fam = String(family || "").trim().toLowerCase();
   if (fam === "v2x-traj") return "v2x_traj";
+  if (fam === "v2x-seq") return "v2x_seq";
   if (fam === "cpm-objects") return "consider_it_cpm";
   return "";
 }
@@ -2275,7 +2350,7 @@ function datasetTypeFromMeta(meta) {
 
 function supportedLocalFamily(family) {
   const fam = String(family || "").trim().toLowerCase();
-  return fam === "v2x-traj" || fam === "cpm-objects";
+  return fam === "v2x-traj" || fam === "v2x-seq" || fam === "cpm-objects";
 }
 
 function virtualDatasetMeta(datasetId, title, family) {
@@ -2298,6 +2373,24 @@ function virtualDatasetMeta(datasetId, title, family) {
       modalities: ["ego", "infra", "vehicle", "traffic_light"],
       modality_labels: { ego: "Ego vehicle", infra: "Infrastructure", vehicle: "Other vehicles", traffic_light: "Traffic lights" },
       modality_short_labels: { ego: "Ego", infra: "Infra", vehicle: "Vehicles", traffic_light: "Lights" },
+    };
+  }
+  if (fam === "v2x-seq") {
+    return {
+      ...base,
+      splits: ["train", "val"],
+      default_split: "val",
+      group_label: "Intersection",
+      has_map: true,
+      has_traffic_lights: true,
+      modalities: ["ego", "infra", "vehicle", "traffic_light"],
+      modality_labels: {
+        ego: "Cooperative vehicle-infrastructure",
+        infra: "Single infrastructure",
+        vehicle: "Single vehicle",
+        traffic_light: "Traffic lights",
+      },
+      modality_short_labels: { ego: "Coop", infra: "Infra", vehicle: "Vehicle", traffic_light: "Lights" },
     };
   }
   if (fam === "cpm-objects") {
@@ -2359,6 +2452,15 @@ function runtimeProfilePreset(datasetType, meta) {
       profile_id: `runtime-${safe}`,
       dataset_id: datasetId,
       name: selectedTitle || "V2X-Traj",
+    };
+  }
+  if (t === "v2x_seq") {
+    const datasetId = selectedDatasetId || "v2x-seq";
+    const safe = safeFromId || "v2x-seq";
+    return {
+      profile_id: `runtime-${safe}`,
+      dataset_id: datasetId,
+      name: selectedTitle || "V2X-Seq",
     };
   }
   if (t === "consider_it_cpm") {
@@ -2612,9 +2714,9 @@ function parseIntClamp(raw, fallback, minV, maxV) {
 
 function wizardSelectedDatasetType() {
   const selected = getElValue("wizType");
-  if (selected === "v2x_traj" || selected === "consider_it_cpm") return selected;
+  if (selected === "v2x_traj" || selected === "v2x_seq" || selected === "consider_it_cpm") return selected;
   const draftType = String(((state.profileWizard.draft || {}).profile || {}).dataset_type || "").trim();
-  if (draftType === "v2x_traj" || draftType === "consider_it_cpm") return draftType;
+  if (draftType === "v2x_traj" || draftType === "v2x_seq" || draftType === "consider_it_cpm") return draftType;
   return "";
 }
 
@@ -2658,7 +2760,10 @@ function setWizardFromProfile(profile) {
   setElValue("wizPaths", Array.isArray(profile.roots) ? profile.roots.join("\n") : "");
 
   setElValue("wizV2xScenes", getBindingPath(profile, "scenes_index"));
-  setElValue("wizV2xEgo", getBindingPath(profile, "traj_ego"));
+  setElValue(
+    "wizV2xEgo",
+    datasetType === "v2x_seq" ? (getBindingPath(profile, "traj_cooperative") || getBindingPath(profile, "traj_ego")) : getBindingPath(profile, "traj_ego")
+  );
   setElValue("wizV2xInfra", getBindingPath(profile, "traj_infra"));
   setElValue("wizV2xVehicle", getBindingPath(profile, "traj_vehicle"));
   setElValue("wizV2xTl", getBindingPath(profile, "traffic_light"));
@@ -2687,7 +2792,7 @@ function applyWizardDatasetBlocks() {
   const datasetType = wizardSelectedDatasetType();
   const v2x = $("wizMapV2x");
   const cpm = $("wizMapCpm");
-  if (v2x) v2x.hidden = datasetType !== "v2x_traj";
+  if (v2x) v2x.hidden = !(datasetType === "v2x_traj" || datasetType === "v2x_seq");
   if (cpm) cpm.hidden = datasetType !== "consider_it_cpm";
 }
 
@@ -2715,6 +2820,20 @@ function buildProfileFromWizardInputs() {
     setBindingPath(bindings, "traj_vehicle", getElValue("wizV2xVehicle"), true, "dir");
     setBindingPath(bindings, "traffic_light", getElValue("wizV2xTl"), false, "dir");
     setBindingPath(bindings, "maps_dir", getElValue("wizV2xMaps"), false, "dir");
+    delete bindings.traj_cooperative;
+    delete bindings.cpm_logs;
+    delete bindings.proto_schema;
+  }
+
+  if (datasetType === "v2x_seq") {
+    profile.scene_strategy = { mode: "sequence_scene" };
+    setBindingPath(bindings, "traj_cooperative", getElValue("wizV2xEgo"), false, "dir");
+    setBindingPath(bindings, "traj_infra", getElValue("wizV2xInfra"), false, "dir");
+    setBindingPath(bindings, "traj_vehicle", getElValue("wizV2xVehicle"), false, "dir");
+    setBindingPath(bindings, "traffic_light", getElValue("wizV2xTl"), false, "dir");
+    setBindingPath(bindings, "maps_dir", getElValue("wizV2xMaps"), false, "dir");
+    delete bindings.scenes_index;
+    delete bindings.traj_ego;
     delete bindings.cpm_logs;
     delete bindings.proto_schema;
   }
@@ -2755,6 +2874,7 @@ function buildProfileFromWizardInputs() {
     profile.scene_strategy = { mode: "time_window", window_s: windowS, gap_s: gapS };
     delete bindings.scenes_index;
     delete bindings.traj_ego;
+    delete bindings.traj_cooperative;
     delete bindings.traj_infra;
     delete bindings.traj_vehicle;
     delete bindings.traffic_light;
@@ -3493,6 +3613,7 @@ function clearExplorerSceneState(message) {
   setPlaying(false);
   setCanvasLoading(false);
   state.bundle = null;
+  state.sceneModalities = null;
   state.frame = 0;
   state.sceneIds = [];
   state.sceneId = null;
@@ -3549,6 +3670,7 @@ function clearExplorerSceneState(message) {
 
   updateSceneHint(0, 0, 0);
   setPlaybackEnabled(false);
+  updateSceneModalityControls(null);
   updateStatusBox(msg);
   const si = $("sceneInfo");
   if (si) si.textContent = msg;
@@ -3710,6 +3832,8 @@ async function loadSceneBundle() {
   const split = state.split;
   const scene = state.sceneId;
   if (!ds || !split || !scene) {
+    state.sceneModalities = null;
+    updateSceneModalityControls(null);
     setCanvasLoading(false);
     return;
   }
@@ -3737,6 +3861,7 @@ async function loadSceneBundle() {
     state.frame = 0;
     state.selectedKey = null;
     state.selected = null;
+    updateSceneModalityControls(bundle);
     resetTrailCache();
     updateSubTypeUi(bundle);
 
@@ -3851,7 +3976,9 @@ function wireUi() {
       }
       const prompt = datasetType === "v2x_traj"
         ? "Enter a V2X-Traj dataset directory path:"
-        : "Enter a Consider.it dataset directory path:";
+        : datasetType === "v2x_seq"
+          ? "Enter a V2X-Seq dataset directory path:"
+          : "Enter a Consider.it dataset directory path:";
       const paths = await pickPathsDesktop("pick_folder", prompt);
       if (!paths.length) return;
       await loadDatasetFromFolder(paths[0]);

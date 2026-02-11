@@ -940,6 +940,10 @@ select:focus {
   margin: 6px 0;
 }
 
+.check.is-disabled {
+  opacity: 0.5;
+}
+
 .check.small {
   font-size: 12px;
   color: var(--muted);

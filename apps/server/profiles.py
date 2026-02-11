@@ -145,6 +145,14 @@ _V2X_TRAJ_ALIASES: Dict[str, set[str]] = {
 }
 
 
+_V2X_TL_ALIASES: Dict[str, set[str]] = {
+    "timestamp": _alias_set("timestamp", ["ts", "time", "time_s", "unix_time"]),
+    "lane_id": _alias_set("lane_id", ["laneid", "lane"]),
+    "color_1": _alias_set("color_1", ["color1", "signal_1"]),
+    "remain_1": _alias_set("remain_1", ["remain1", "remain_time_1", "time_left_1"]),
+}
+
+
 def _build_field_map(fieldnames: Iterable[str], aliases: Dict[str, set[str]], explicit: Optional[Dict[str, str]] = None) -> Dict[str, str]:
     actual = [str(x or "").strip() for x in fieldnames]
     by_norm: Dict[str, str] = {}
@@ -466,6 +474,147 @@ def _score_traj_dir(path: Path) -> float:
     return 20.0
 
 
+def _score_tl_dir(path: Path) -> float:
+    if not path.exists() or not path.is_dir():
+        return 0.0
+    sample_csv: Optional[Path] = None
+    for f in path.rglob("*.csv"):
+        sample_csv = f
+        break
+    if sample_csv is None:
+        return 0.0
+    header, _, _ = _read_csv_header(sample_csv)
+    fmap = _build_field_map(header, _V2X_TL_ALIASES)
+    if all(k in fmap for k in ("timestamp", "lane_id", "color_1", "remain_1")):
+        return 100.0
+    if "timestamp" in fmap and ("lane_id" in fmap or "color_1" in fmap):
+        return 55.0
+    return 20.0
+
+
+def _infer_v2x_seq_bindings(roots: List[Path]) -> Dict[str, Any]:
+    """
+    Infer V2X-Seq role bindings from root candidates using directory layout and
+    CSV schema checks. This supports local copies with swapped folder names.
+    """
+    best_root: Optional[Path] = None
+    best_score = -1.0
+    best_bindings: Dict[str, Path] = {}
+    best_quality: Dict[str, float] = {}
+
+    # Probe root + a few parents so users can pick either dataset root or subfolders.
+    candidate_roots: List[Path] = []
+    for p in roots:
+        candidate_roots.extend(_parent_chain(p.resolve(), max_depth=4))
+
+    seen = set()
+    uniq_roots: List[Path] = []
+    for r in candidate_roots:
+        k = str(r)
+        if k in seen:
+            continue
+        seen.add(k)
+        uniq_roots.append(r)
+
+    def _pick_best(cands: List[Path], scorer) -> Tuple[Optional[Path], float]:
+        best_p: Optional[Path] = None
+        best_s = -1.0
+        for p in cands:
+            if not p.exists() or not p.is_dir():
+                continue
+            s = float(scorer(p))
+            if s > best_s:
+                best_s = s
+                best_p = p
+        return best_p, max(0.0, best_s)
+
+    for root in uniq_roots[:80]:
+        si_traj = root / "single-infrastructure" / "trajectories"
+        si_tl = root / "single-infrastructure" / "traffic-light"
+        sv_traj = root / "single-vehicle" / "trajectories"
+        coop_infra = root / "cooperative-vehicle-infrastructure" / "infrastructure-trajectories"
+        coop_vehicle = root / "cooperative-vehicle-infrastructure" / "vehicle-trajectories"
+        coop_traj = root / "cooperative-vehicle-infrastructure" / "cooperative-trajectories"
+        coop_tl = root / "cooperative-vehicle-infrastructure" / "traffic-light"
+        maps_dir = root / "maps"
+
+        coop_cands = [coop_traj, coop_infra, coop_vehicle, coop_tl]
+        infra_cands = [si_traj]
+        vehicle_cands = [sv_traj]
+        tl_cands = [si_tl, coop_tl]
+
+        traj_coop, q_coop = _pick_best(coop_cands, _score_traj_dir)
+        traj_infra, q_infra = _pick_best(infra_cands, _score_traj_dir)
+        traj_vehicle, q_vehicle = _pick_best(vehicle_cands, _score_traj_dir)
+        traffic_light, q_tl = _pick_best(tl_cands, _score_tl_dir)
+
+        if q_coop < 50.0:
+            traj_coop = None
+        if q_infra < 50.0:
+            traj_infra = None
+        if q_vehicle < 50.0:
+            traj_vehicle = None
+        if q_tl < 50.0:
+            traffic_light = None
+
+        # Prefer distinct sources when possible.
+        if traj_infra is not None and traj_vehicle is not None and traj_infra.resolve() == traj_vehicle.resolve():
+            second_vehicle, second_q_vehicle = _pick_best(
+                [p for p in vehicle_cands if p.exists() and p.is_dir() and p.resolve() != traj_infra.resolve()],
+                _score_traj_dir,
+            )
+            if second_vehicle is not None and second_q_vehicle >= 50.0:
+                traj_vehicle = second_vehicle
+                q_vehicle = second_q_vehicle
+
+        root_score = 0.0
+        if traj_coop is not None:
+            root_score += 36.0
+            root_score += q_coop * 0.16
+        if traj_infra is not None:
+            root_score += 24.0
+            root_score += q_infra * 0.10
+        if traj_vehicle is not None:
+            root_score += 24.0
+            root_score += q_vehicle * 0.10
+        if traffic_light is not None:
+            root_score += 12.0
+            root_score += q_tl * 0.08
+        if maps_dir.exists() and maps_dir.is_dir():
+            root_score += 10.0
+        # Strongly down-rank roots that have no trajectory source.
+        if traj_coop is None and traj_infra is None and traj_vehicle is None:
+            root_score *= 0.25
+
+        if root_score > best_score:
+            best_score = root_score
+            best_root = root
+            best_bindings = {}
+            best_quality = {}
+            if traj_coop is not None:
+                best_bindings["traj_cooperative"] = traj_coop.resolve()
+                best_quality["traj_cooperative"] = float(q_coop)
+            if traj_infra is not None:
+                best_bindings["traj_infra"] = traj_infra.resolve()
+                best_quality["traj_infra"] = float(q_infra)
+            if traj_vehicle is not None:
+                best_bindings["traj_vehicle"] = traj_vehicle.resolve()
+                best_quality["traj_vehicle"] = float(q_vehicle)
+            if traffic_light is not None:
+                best_bindings["traffic_light"] = traffic_light.resolve()
+                best_quality["traffic_light"] = float(q_tl)
+            if maps_dir.exists() and maps_dir.is_dir():
+                best_bindings["maps_dir"] = maps_dir.resolve()
+                best_quality["maps_dir"] = 100.0
+
+    return {
+        "root": best_root.resolve() if best_root is not None else None,
+        "bindings": best_bindings,
+        "quality": best_quality,
+        "score": float(_clamp(best_score if best_score >= 0 else 0.0, 0.0, 100.0)),
+    }
+
+
 def _parent_chain(p: Path, max_depth: int = 6) -> List[Path]:
     out = [p]
     cur = p
@@ -651,6 +800,81 @@ def _detect_v2x(paths: List[Path], profile_name: str) -> Dict[str, Any]:
     }
 
 
+def _detect_v2x_seq(paths: List[Path], profile_name: str) -> Dict[str, Any]:
+    inferred = _infer_v2x_seq_bindings(paths)
+    root = inferred.get("root")
+    root_bindings = inferred.get("bindings") if isinstance(inferred.get("bindings"), dict) else {}
+    quality = inferred.get("quality") if isinstance(inferred.get("quality"), dict) else {}
+    score = float(inferred.get("score") or 0.0)
+
+    if not isinstance(root, Path):
+        return {
+            "dataset_type": "v2x_seq",
+            "score": 0.0,
+            "second_best": 0.0,
+            "decision_mode": "manual",
+            "profile": None,
+            "validation": {
+                "status": "schema_mismatch",
+                "errors": [_issue("E_SCHEMA_REQUIRED_COLUMNS", "Could not infer a valid V2X-Seq root from selected path(s).")],
+                "warnings": [],
+                "last_checked": _now_utc_iso(),
+            },
+        }
+
+    has_traj = ("traj_cooperative" in root_bindings) or ("traj_infra" in root_bindings) or ("traj_vehicle" in root_bindings)
+    if not has_traj:
+        return {
+            "dataset_type": "v2x_seq",
+            "score": float(_clamp(score * 0.4, 0, 100)),
+            "second_best": 0.0,
+            "decision_mode": "manual",
+            "profile": None,
+            "validation": {
+                "status": "schema_mismatch",
+                "errors": [_issue("E_SCHEMA_REQUIRED_COLUMNS", "No trajectory directories were detected for V2X-Seq.")],
+                "warnings": [],
+                "last_checked": _now_utc_iso(),
+            },
+        }
+
+    decision = "auto" if score >= 75 else ("confirm" if score >= 50 else "manual")
+    bindings: Dict[str, Dict[str, Any]] = {}
+    for role in ("traj_cooperative", "traj_infra", "traj_vehicle", "traffic_light", "maps_dir"):
+        p = root_bindings.get(role)
+        if not isinstance(p, Path):
+            continue
+        bindings[role] = {
+            "kind": "dir",
+            "required": False,
+            "path": str(p),
+            "detected_score": float(quality.get(role, 0.0)),
+        }
+
+    profile = {
+        "schema_version": PROFILE_SCHEMA_VERSION,
+        "name": profile_name or "V2X-Seq Local",
+        "dataset_type": "v2x_seq",
+        "adapter_version": PROFILE_ADAPTER_VERSION,
+        "roots": [str(root)],
+        "bindings": bindings,
+        "scene_strategy": {"mode": "sequence_scene"},
+        "detector": {
+            "score": score,
+            "second_best": 0.0,
+            "decision_mode": decision,
+            "checked_at": _now_utc_iso(),
+        },
+    }
+    return {
+        "dataset_type": "v2x_seq",
+        "score": score,
+        "second_best": 0.0,
+        "decision_mode": decision,
+        "profile": profile,
+    }
+
+
 def _detect_cpm(paths: List[Path], profile_name: str) -> Dict[str, Any]:
     csv_files = _collect_cpm_csv_files(paths, max_files=None)
     score_inputs = _uniform_sample_paths(csv_files, max_n=3000)
@@ -726,6 +950,8 @@ def _normalize_dataset_type(raw: Any) -> str:
     s = str(raw or "").strip().lower()
     if s in ("v2x-traj", "v2x_traj", "v2xtraj"):
         return "v2x_traj"
+    if s in ("v2x-seq", "v2x_seq", "v2xseq"):
+        return "v2x_seq"
     if s in ("consider-it-cpm", "consider_it_cpm", "cpm", "cpm-objects", "considerit"):
         return "consider_it_cpm"
     return ""
@@ -751,17 +977,21 @@ def detect_profile(repo_root: Path, payload: Dict[str, Any]) -> Dict[str, Any]:
 
     if type_hint == "v2x_traj":
         picked = _detect_v2x(paths, profile_name)
+    elif type_hint == "v2x_seq":
+        picked = _detect_v2x_seq(paths, profile_name)
     elif type_hint == "consider_it_cpm":
         picked = _detect_cpm(paths, profile_name)
     else:
         cpm = _detect_cpm(paths, profile_name)
         v2x = _detect_v2x(paths, profile_name)
-        if float(cpm.get("score", 0.0)) >= float(v2x.get("score", 0.0)):
-            picked = cpm
-            picked["second_best"] = float(v2x.get("score", 0.0))
-        else:
-            picked = v2x
-            picked["second_best"] = float(cpm.get("score", 0.0))
+        v2x_seq = _detect_v2x_seq(paths, profile_name)
+        ranked = sorted(
+            [cpm, v2x, v2x_seq],
+            key=lambda x: float(x.get("score", 0.0)),
+            reverse=True,
+        )
+        picked = ranked[0]
+        picked["second_best"] = float(ranked[1].get("score", 0.0)) if len(ranked) > 1 else 0.0
         score = float(picked.get("score", 0.0))
         margin = score - float(picked.get("second_best", 0.0))
         if score >= 75 and margin >= 12:
@@ -920,6 +1150,77 @@ def validate_profile(repo_root: Path, profile_in: Dict[str, Any]) -> Dict[str, A
 
         if tl_dir and (not Path(tl_dir).exists() or not Path(tl_dir).is_dir()):
             warnings.append(_issue("W_OPTIONAL_ROLE_MISSING", "Traffic light directory is missing.", role="traffic_light", path=tl_dir))
+        if maps_dir and (not Path(maps_dir).exists() or not Path(maps_dir).is_dir()):
+            warnings.append(_issue("W_OPTIONAL_ROLE_MISSING", "Map directory is missing.", role="maps_dir", path=maps_dir))
+
+        capabilities = {
+            "has_map": bool(maps_dir and Path(maps_dir).exists()),
+            "has_traffic_lights": bool(tl_dir and Path(tl_dir).exists()),
+            "splits": ["train", "val"],
+            "group_label": "Intersection",
+        }
+
+    elif dataset_type == "v2x_seq":
+        scene_strategy = {"mode": "sequence_scene"}
+        traj_coop = get_binding_path("traj_cooperative", required=False, kind="dir")
+        traj_infra = get_binding_path("traj_infra", required=False, kind="dir")
+        traj_vehicle = get_binding_path("traj_vehicle", required=False, kind="dir")
+        tl_dir = get_binding_path("traffic_light", required=False, kind="dir")
+        maps_dir = get_binding_path("maps_dir", required=False, kind="dir")
+        get_binding_path("profile_file", required=False, kind="file")
+
+        if (not traj_coop and not traj_infra and not traj_vehicle) and roots:
+            inferred = _infer_v2x_seq_bindings(roots)
+            inf_bindings = inferred.get("bindings") if isinstance(inferred.get("bindings"), dict) else {}
+            for role in ("traj_cooperative", "traj_infra", "traj_vehicle", "traffic_light", "maps_dir"):
+                p = inf_bindings.get(role)
+                if not isinstance(p, Path):
+                    continue
+                if role not in bindings:
+                    bindings[role] = {
+                        "kind": "dir",
+                        "required": role == "traj_infra",
+                        "path": str(p),
+                        "detected_score": float((inferred.get("quality") or {}).get(role, 0.0)),
+                    }
+            traj_coop = traj_coop or ((bindings.get("traj_cooperative") or {}).get("path") if isinstance(bindings.get("traj_cooperative"), dict) else None)
+            traj_infra = traj_infra or ((bindings.get("traj_infra") or {}).get("path") if isinstance(bindings.get("traj_infra"), dict) else None)
+            traj_vehicle = traj_vehicle or ((bindings.get("traj_vehicle") or {}).get("path") if isinstance(bindings.get("traj_vehicle"), dict) else None)
+            tl_dir = tl_dir or ((bindings.get("traffic_light") or {}).get("path") if isinstance(bindings.get("traffic_light"), dict) else None)
+            maps_dir = maps_dir or ((bindings.get("maps_dir") or {}).get("path") if isinstance(bindings.get("maps_dir"), dict) else None)
+
+        if not traj_coop and not traj_infra and not traj_vehicle:
+            errors.append(
+                _issue(
+                    "E_ROLE_REQUIRED_MISSING",
+                    "At least one trajectory directory is required (traj_cooperative, traj_infra, or traj_vehicle).",
+                    role="traj_cooperative",
+                )
+            )
+
+        for role, role_path in (("traj_cooperative", traj_coop), ("traj_infra", traj_infra), ("traj_vehicle", traj_vehicle)):
+            if not role_path:
+                continue
+            pp = Path(role_path)
+            if not pp.exists():
+                errors.append(_issue("E_PATH_MISSING", f"Path does not exist for {role}.", role=role, path=role_path))
+                continue
+            if not pp.is_dir():
+                errors.append(_issue("E_PATH_UNREADABLE", f"Expected a directory for {role}.", role=role, path=role_path))
+                continue
+            quality = _score_traj_dir(pp)
+            if quality < 50:
+                errors.append(_issue("E_SCHEMA_REQUIRED_COLUMNS", f"Directory for {role} does not look like trajectory CSV data.", role=role, path=role_path))
+
+        if tl_dir:
+            pp = Path(tl_dir)
+            if not pp.exists() or not pp.is_dir():
+                warnings.append(_issue("W_OPTIONAL_ROLE_MISSING", "Traffic light directory is missing.", role="traffic_light", path=tl_dir))
+            else:
+                q_tl = _score_tl_dir(pp)
+                if q_tl < 50:
+                    warnings.append(_issue("W_LOW_CONFIDENCE_DETECTION", "Traffic light directory schema looks unusual; verify mapping.", role="traffic_light", path=tl_dir))
+
         if maps_dir and (not Path(maps_dir).exists() or not Path(maps_dir).is_dir()):
             warnings.append(_issue("W_OPTIONAL_ROLE_MISSING", "Map directory is missing.", role="maps_dir", path=maps_dir))
 
@@ -1262,6 +1563,8 @@ class ProfileStore:
                 scenes_path = (((entry.get("bindings") or {}).get("scenes_index") or {}).get("path")) if isinstance(entry.get("bindings"), dict) else None
                 if scenes_path:
                     entry["scenes"] = str(scenes_path)
+            elif dataset_type == "v2x_seq":
+                entry["family"] = "v2x-seq"
             elif dataset_type == "consider_it_cpm":
                 entry["family"] = "cpm-objects"
                 basemap = p.get("basemap") if isinstance(p.get("basemap"), dict) else None

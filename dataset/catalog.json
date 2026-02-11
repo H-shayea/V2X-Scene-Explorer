@@ -163,7 +163,7 @@
         },
         { "label": "Project code / download", "url": "https://github.com/AIR-THU/DAIR-V2X-Seq" }
       ],
-      "app": { "supported": false, "family": null }
+      "app": { "supported": true, "family": "v2x-seq" }
     },
     {
       "id": "interaction",
@@ -207,4 +207,3 @@
     }
   ]
 }
-

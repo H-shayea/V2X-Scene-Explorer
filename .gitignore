@@ -34,6 +34,7 @@ dataset/ConsiderIt/
 dataset/Consider-It/
 dataset/raw_ConsiderIt/
 dataset/V2X-Seq-TFD/
+dataset/inD/
 
 # Local dataset overrides (private paths / basemap origins)
 dataset/registry.local.json
@@ -54,3 +55,6 @@ dataset/profiles.local/
 # Large local assets
 Map1.png
 Cooperative Trajectory.pdf
+
+# 
+drone-dataset-tools
