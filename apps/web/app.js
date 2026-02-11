@@ -3073,6 +3073,53 @@ function sourceState(datasetType) {
   return state.sourceByType[key];
 }
 
+function updateExplorerHeaderContext() {
+  const meta = currentDatasetMeta() || {};
+  const datasetName = String(meta.title || state.datasetId || "Dataset").trim() || "Dataset";
+  const datasetType = datasetTypeFromMeta(meta);
+
+  const datasetChip = $("activeDatasetName");
+  if (datasetChip) datasetChip.textContent = datasetName;
+
+  const breadcrumb = $("explorerBreadcrumb");
+  if (breadcrumb) breadcrumb.textContent = `Home / ${datasetName} / Explorer`;
+
+  const loadChip = $("activeDatasetLoadState");
+  const folderEl = $("activeDatasetFolder");
+
+  let folderPath = "";
+  let folderName = "";
+  if (datasetType) {
+    const src = sourceState(datasetType);
+    folderPath = String(src.folderPath || "").trim();
+    folderName = String(src.folderName || folderNameFromPath(folderPath) || "").trim();
+  }
+  const loaded = !!folderPath;
+
+  if (loadChip) {
+    loadChip.classList.remove("chip--yes", "chip--no");
+    if (loaded) {
+      loadChip.textContent = "Loaded";
+      loadChip.classList.add("chip--yes");
+    } else {
+      loadChip.textContent = "Not loaded";
+      loadChip.classList.add("chip--no");
+    }
+  }
+
+  if (folderEl) {
+    if (loaded && folderName) {
+      folderEl.hidden = false;
+      folderEl.textContent = `Folder: ${folderName}`;
+      folderEl.title = folderPath;
+    } else {
+      folderEl.hidden = true;
+      folderEl.textContent = "";
+      folderEl.title = "";
+    }
+  }
+}
+
 function hasLoadedSourceForMeta(meta) {
   const datasetType = datasetTypeFromMeta(meta || {});
   if (!datasetType) return false;
@@ -3130,7 +3177,10 @@ function updateSourcePanel() {
   const sourceCardTitle = $("sourceCardTitle");
   const sourceCardPath = $("sourceCardPath");
   const folderBtn = $("sourceFolderBtn");
-  if (!sourceHintEl) return;
+  if (!sourceHintEl) {
+    updateExplorerHeaderContext();
+    return;
+  }
 
   const busy = !!state.sourceBusy;
   if (folderBtn) {
@@ -3177,6 +3227,7 @@ function updateSourcePanel() {
       sourceCardPath.title = "";
     }
   }
+  updateExplorerHeaderContext();
 }
 
 function expectedDatasetLayoutHint(datasetType) {

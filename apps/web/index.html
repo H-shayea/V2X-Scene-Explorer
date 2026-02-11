@@ -131,6 +131,15 @@
             </label>
           </div>
         </div>
+        <div class="topbar__context" aria-live="polite">
+          <div class="topbar__contextMain">
+            <span class="topbar__contextLabel">Active dataset</span>
+            <span id="activeDatasetName" class="chip chip--dataset">Dataset</span>
+            <span id="activeDatasetLoadState" class="chip chip--no">Not loaded</span>
+            <span id="activeDatasetFolder" class="topbar__contextFolder" hidden></span>
+          </div>
+          <div id="explorerBreadcrumb" class="topbar__breadcrumb">Home / Dataset / Explorer</div>
+        </div>
 
       </header>
 
@@ -215,10 +224,18 @@
 	            <summary class="panelFold__summary">Trajectory Settings</summary>
 		            <label class="check small"><input type="checkbox" id="showVelocity" /> Show velocity arrows</label>
 		            <label class="check small"><input type="checkbox" id="showHeading" /> Show heading arrows</label>
-		            <div class="field">
-		              <span>Trajectory range</span>
-                  <label class="check small"><input type="radio" name="trajectoryRange" id="trajectoryRangePast" value="past" /> Past only</label>
-                  <label class="check small"><input type="radio" name="trajectoryRange" id="trajectoryRangeFull" value="full" checked /> Past + future</label>
+		            <div class="trajectoryRange" role="radiogroup" aria-labelledby="trajectoryRangeLabel">
+		              <div class="trajectoryRange__label" id="trajectoryRangeLabel">Trajectory range</div>
+		              <div class="trajectoryRange__options">
+		                <label class="check small trajectoryRange__option">
+		                  <input type="radio" name="trajectoryRange" id="trajectoryRangePast" value="past" />
+		                  <span>Past only</span>
+		                </label>
+		                <label class="check small trajectoryRange__option">
+		                  <input type="radio" name="trajectoryRange" id="trajectoryRangeFull" value="full" checked />
+		                  <span>Past + future</span>
+		                </label>
+		              </div>
 		            </div>
 	          </details>
 		          <label class="check small" id="holdTLWrap"><input type="checkbox" id="holdTL" checked /> Hold traffic lights between updates</label>
