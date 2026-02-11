@@ -22,15 +22,43 @@ scene browsing, playback, full trajectories, per-class filters, and HD map rende
 
 - Python 3.10+ (backend uses only the Python standard library)
 
+### `dev.sh` launcher
+
+Use the root launcher script for common workflows:
+
+```bash
+./dev.sh            # same as: ./dev.sh web
+./dev.sh web        # run web app with auto-reload (HOST=127.0.0.1, PORT=8000)
+./dev.sh desktop    # run native macOS desktop app (dev mode)
+./dev.sh build      # build dist/V2X Scene Explorer.app
+./dev.sh dmg        # build dist/V2X Scene Explorer.dmg
+./dev.sh help       # show all options
+```
+
+Optional web env vars:
+
+```bash
+HOST=127.0.0.1 PORT=9000 ./dev.sh web
+```
+
 ### 1) Configure datasets (not included in this repo)
 
 Datasets are intentionally not committed to GitHub (they are large). After downloading a dataset locally,
-edit `dataset/registry.json` and set each dataset's `root` to your local path.
+you can connect them directly from the app home page:
+
+- Open **Connect Local Dataset**
+- Choose dataset type (or Auto detect)
+- Paste one or more local paths
+- Click **Detect + Validate** then **Save Connection**
+
+Connections are stored per-user and can use custom folder structures.
+
+Fallback/manual config is still supported by editing `dataset/registry.json` and setting each dataset `root`.
 
 Default expected locations (recommended):
 
 - `dataset/v2x-traj/` (V2X-Traj dataset root)
-- `dataset/ConsiderIt/` (Consider.it CPM Objects dataset root)
+- `dataset/Consider-It/` (Consider.it CPM Objects dataset root)
 
 ### 2) Run the server
 

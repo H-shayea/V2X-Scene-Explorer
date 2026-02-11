@@ -218,6 +218,245 @@ kbd {
   box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.12);
 }
 
+.textArea {
+  min-height: 92px;
+  height: auto;
+  resize: vertical;
+  line-height: 1.35;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+  font-size: 12px;
+}
+
+.connectCard {
+  margin-top: 14px;
+  border-radius: 18px;
+  border: 1px solid rgba(2, 6, 23, 0.1);
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0.76), rgba(248, 250, 252, 0.9));
+  box-shadow: 0 10px 28px rgba(2, 6, 23, 0.05);
+  padding: 12px;
+  display: grid;
+  gap: 10px;
+}
+
+.connectCard__head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.connectCard__title {
+  font-size: 12px;
+  font-weight: 900;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: rgba(2, 6, 23, 0.75);
+}
+
+.connectCard__subtitle {
+  margin-top: -3px;
+  color: rgba(2, 6, 23, 0.62);
+  font-size: 12px;
+}
+
+.connectGrid {
+  display: grid;
+  grid-template-columns: 220px 1fr;
+  gap: 10px;
+}
+
+.profileList {
+  display: grid;
+  gap: 8px;
+}
+
+.profileEmpty {
+  border-radius: 12px;
+  border: 1px dashed rgba(2, 6, 23, 0.16);
+  background: rgba(255, 255, 255, 0.62);
+  padding: 10px 12px;
+  color: rgba(2, 6, 23, 0.62);
+  font-size: 12px;
+}
+
+.profileRow {
+  border-radius: 12px;
+  border: 1px solid rgba(2, 6, 23, 0.1);
+  background: rgba(255, 255, 255, 0.76);
+  padding: 10px 12px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.profileRow__name {
+  font-size: 13px;
+  font-weight: 800;
+  letter-spacing: -0.01em;
+}
+
+.profileRow__meta {
+  margin-top: 2px;
+  font-size: 11px;
+  color: rgba(2, 6, 23, 0.62);
+}
+
+.profileActions {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+
+.chip--default {
+  border-color: rgba(37, 99, 235, 0.3);
+  background: rgba(37, 99, 235, 0.12);
+  color: rgba(30, 64, 175, 0.95);
+}
+
+.btn--danger {
+  border-color: rgba(220, 38, 38, 0.25);
+  background: rgba(220, 38, 38, 0.12);
+  color: rgba(153, 27, 27, 0.95);
+}
+
+.modal {
+  position: fixed;
+  inset: 0;
+  z-index: 60;
+  display: grid;
+  place-items: center;
+  padding: 16px;
+}
+
+.modal__backdrop {
+  position: absolute;
+  inset: 0;
+  background: rgba(2, 6, 23, 0.45);
+  backdrop-filter: blur(3px);
+}
+
+.modal__card {
+  position: relative;
+  width: min(940px, 100%);
+  max-height: calc(100vh - 32px);
+  overflow: auto;
+  border-radius: 18px;
+  border: 1px solid rgba(2, 6, 23, 0.16);
+  background:
+    radial-gradient(900px 400px at 12% 0%, rgba(37, 99, 235, 0.1), transparent 65%),
+    radial-gradient(760px 360px at 86% 0%, rgba(16, 185, 129, 0.09), transparent 62%),
+    rgba(255, 255, 255, 0.95);
+  box-shadow: 0 22px 70px rgba(2, 6, 23, 0.35);
+  padding: 16px;
+  display: grid;
+  gap: 12px;
+}
+
+.modal__head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.modal__title {
+  font-size: 18px;
+  font-weight: 820;
+  letter-spacing: -0.02em;
+}
+
+.modal__subtitle {
+  margin-top: 2px;
+  font-size: 12px;
+  color: rgba(2, 6, 23, 0.62);
+}
+
+.wizardSteps {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.wizardStep {
+  border-radius: 999px;
+  border: 1px solid rgba(2, 6, 23, 0.14);
+  background: rgba(255, 255, 255, 0.76);
+  color: rgba(2, 6, 23, 0.7);
+  padding: 4px 10px;
+  font-size: 11px;
+  font-weight: 800;
+}
+
+.wizardStep--active {
+  border-color: rgba(37, 99, 235, 0.32);
+  background: rgba(37, 99, 235, 0.12);
+  color: rgba(30, 64, 175, 0.96);
+}
+
+.wizardStep--done {
+  border-color: rgba(16, 185, 129, 0.28);
+  background: rgba(16, 185, 129, 0.12);
+  color: rgba(6, 95, 70, 0.96);
+}
+
+.wizardBody {
+  display: grid;
+  gap: 12px;
+}
+
+.wizardPane {
+  display: grid;
+  gap: 10px;
+}
+
+.wizardMapBlock {
+  display: grid;
+  gap: 10px;
+  border: 1px solid rgba(2, 6, 23, 0.1);
+  border-radius: 14px;
+  background: rgba(255, 255, 255, 0.72);
+  padding: 10px;
+}
+
+.wizardFoot {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  padding-top: 10px;
+  border-top: 1px solid rgba(2, 6, 23, 0.1);
+}
+
+.wizardIssues {
+  margin-top: 8px;
+  display: grid;
+  gap: 8px;
+}
+
+.wizardIssue {
+  border-radius: 12px;
+  padding: 8px 10px;
+  font-size: 12px;
+  line-height: 1.35;
+  border: 1px solid rgba(2, 6, 23, 0.14);
+  background: rgba(255, 255, 255, 0.68);
+}
+
+.wizardIssue--bad {
+  border-color: rgba(239, 68, 68, 0.32);
+  background: rgba(239, 68, 68, 0.08);
+  color: rgba(153, 27, 27, 0.95);
+}
+
+.wizardIssue--warn {
+  border-color: rgba(245, 158, 11, 0.35);
+  background: rgba(245, 158, 11, 0.1);
+  color: rgba(146, 64, 14, 0.95);
+}
+
 .dsList {
   margin-top: 14px;
   display: grid;
@@ -731,6 +970,64 @@ select:focus {
   margin-bottom: 10px;
 }
 
+.sourceRow {
+  margin-bottom: 8px;
+  flex-wrap: wrap;
+}
+
+.sourceCard {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  border-radius: 12px;
+  border: 1px solid rgba(2, 6, 23, 0.14);
+  background: rgba(255, 255, 255, 0.78);
+  padding: 10px 12px;
+}
+
+.sourceCard__icon {
+  position: relative;
+  width: 34px;
+  height: 24px;
+  border-radius: 6px;
+  background: linear-gradient(180deg, rgba(245, 158, 11, 0.95), rgba(217, 119, 6, 0.95));
+  box-shadow: inset 0 0 0 1px rgba(120, 53, 15, 0.18);
+  flex: 0 0 auto;
+}
+
+.sourceCard__icon::before {
+  content: "";
+  position: absolute;
+  left: 3px;
+  top: -5px;
+  width: 14px;
+  height: 8px;
+  border-radius: 4px 4px 0 0;
+  background: rgba(245, 158, 11, 0.92);
+}
+
+.sourceCard__body {
+  min-width: 0;
+  display: grid;
+  gap: 2px;
+}
+
+.sourceCard__title {
+  font-size: 12px;
+  font-weight: 800;
+  letter-spacing: -0.01em;
+  color: rgba(2, 6, 23, 0.9);
+}
+
+.sourceCard__path {
+  font-size: 11px;
+  color: rgba(2, 6, 23, 0.62);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 240px;
+}
+
 .btn {
   height: 34px;
   padding: 0 12px;
@@ -848,6 +1145,13 @@ select:focus {
   min-height: 120px;
 }
 
+.codebox--tiny {
+  min-height: 72px;
+  max-height: 160px;
+  padding: 8px 10px;
+  font-size: 10px;
+}
+
 .stage {
   display: grid;
   grid-template-rows: 1fr auto;
@@ -862,6 +1166,68 @@ select:focus {
   border: 1px solid var(--stroke);
   background: rgba(255, 255, 255, 0.5);
   box-shadow: var(--shadow);
+  transition: box-shadow 220ms ease, border-color 220ms ease;
+}
+
+.canvasWrap canvas {
+  transition: opacity 160ms ease;
+}
+
+.canvasWrap.is-loading canvas {
+  opacity: 0.42;
+}
+
+.canvasWrap.is-loading {
+  border-color: rgba(30, 64, 175, 0.45);
+}
+
+.canvasWrap.is-switched {
+  animation: canvasPulse 420ms ease-out;
+}
+
+@keyframes canvasPulse {
+  0% {
+    box-shadow: 0 0 0 0 rgba(37, 99, 235, 0.25), var(--shadow);
+    border-color: rgba(37, 99, 235, 0.45);
+  }
+  100% {
+    box-shadow: var(--shadow);
+    border-color: var(--stroke);
+  }
+}
+
+.canvasOverlay {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  align-content: center;
+  justify-items: center;
+  gap: 10px;
+  background: linear-gradient(180deg, rgba(241, 245, 249, 0.7), rgba(226, 232, 240, 0.5));
+  backdrop-filter: blur(1.5px);
+  pointer-events: none;
+}
+
+.canvasOverlay__spinner {
+  width: 24px;
+  height: 24px;
+  border-radius: 999px;
+  border: 3px solid rgba(37, 99, 235, 0.2);
+  border-top-color: rgba(37, 99, 235, 0.95);
+  animation: spin 760ms linear infinite;
+}
+
+.canvasOverlay__text {
+  font-size: 12px;
+  letter-spacing: 0.01em;
+  color: rgba(2, 6, 23, 0.8);
+  font-weight: 700;
+}
+
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
 }
 
 canvas {
@@ -886,6 +1252,12 @@ canvas {
   color: var(--muted);
   font-size: 12px;
   margin-top: 8px;
+}
+
+.sceneTransitionLabel {
+  color: rgba(30, 64, 175, 0.95);
+  font-weight: 700;
+  transition: opacity 220ms ease;
 }
 
 input[type="range"] {
@@ -934,5 +1306,24 @@ input[type="range"] {
 
   .homeGrid {
     grid-template-columns: 1fr;
+  }
+
+  .connectGrid {
+    grid-template-columns: 1fr;
+  }
+
+  .connectCard__head {
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .profileRow {
+    flex-direction: column;
+    align-items: flex-start;
+  }
+
+  .profileActions {
+    width: 100%;
+    justify-content: flex-start;
   }
 }

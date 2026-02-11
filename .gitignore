@@ -39,6 +39,7 @@ dataset/registry.local.json
 dataset/PROFILE_REPORT.md
 scripts/dataset/
 dataset/profiles/**
+dataset/profiles.local/
 !dataset/profiles/
 !dataset/profiles/v2x-traj/
 !dataset/profiles/v2x-traj/PROFILE_REPORT.md
@@ -48,3 +49,6 @@ dataset/profiles/**
 # Large local assets
 Map1.png
 Cooperative Trajectory.pdf
+dataset/Consider-It/
+dataset/raw_ConsiderIt/
+dataset/V2X-Seq-TFD/
