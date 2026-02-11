@@ -2,16 +2,22 @@ from __future__ import annotations
 
 import csv
 import datetime as _dt
-import io
 import json
 import math
 import os
 import re
+import threading
+import xml.etree.ElementTree as ET
 from collections import Counter, OrderedDict, defaultdict
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
+
+try:
+    from apps.server.profiles import load_profile_dataset_entries
+except ModuleNotFoundError:
+    from profiles import load_profile_dataset_entries  # type: ignore
 
 
 def safe_float(x: Any) -> Optional[float]:
@@ -145,6 +151,32 @@ def bbox_intersects(a: Dict[str, float], b: Dict[str, float]) -> bool:
     return not (a["max_x"] < b["min_x"] or a["min_x"] > b["max_x"] or a["max_y"] < b["min_y"] or a["min_y"] > b["max_y"])
 
 
+def read_png_size(path: Path) -> Optional[Tuple[int, int]]:
+    """
+    Read PNG width/height from IHDR chunk without external deps.
+    """
+    try:
+        with path.open("rb") as f:
+            raw = f.read(24)
+    except Exception:
+        return None
+    if len(raw) < 24:
+        return None
+    # PNG signature + IHDR length/type.
+    if raw[:8] != b"\x89PNG\r\n\x1a\n":
+        return None
+    if raw[12:16] != b"IHDR":
+        return None
+    try:
+        w = int.from_bytes(raw[16:20], "big", signed=False)
+        h = int.from_bytes(raw[20:24], "big", signed=False)
+    except Exception:
+        return None
+    if w <= 0 or h <= 0:
+        return None
+    return (w, h)
+
+
 @dataclass(frozen=True)
 class DatasetSpec:
     id: str
@@ -153,6 +185,10 @@ class DatasetSpec:
     root: Path
     profile: Optional[Path] = None
     scenes: Optional[Path] = None
+    # Optional role/path mappings from profile-based dataset connections.
+    bindings: Optional[Dict[str, Any]] = None
+    # Optional scene policy from profile-based dataset connections.
+    scene_strategy: Optional[Dict[str, Any]] = None
     # Optional basemap config for datasets that are in a local sensor frame but have a known geo origin.
     # Origin is (lat, lon) in degrees and corresponds to world (x=0, y=0) for that dataset.
     geo_origin: Optional[Tuple[float, float]] = None
@@ -170,6 +206,71 @@ class SceneSummary:
     intersect_id: Optional[str]
     intersect_label: Optional[str]
     by_modality: Dict[str, Dict[str, Any]]
+
+
+@dataclass
+class _IndTrackMeta:
+    track_id: int
+    initial_frame: int
+    final_frame: int
+    width: Optional[float]
+    length: Optional[float]
+    cls: str
+
+
+@dataclass
+class _IndRecordingIndex:
+    recording_id: str
+    recording_id_num: int
+    location_id: str
+    location_label: str
+    frame_rate: float
+    duration_s: float
+    lat_location: Optional[float]
+    lon_location: Optional[float]
+    x_utm_origin: Optional[float]
+    y_utm_origin: Optional[float]
+    tracks_path: Path
+    tracks_meta_path: Path
+    recording_meta_path: Path
+    background_path: Optional[Path]
+    ortho_px_to_meter: float
+    tracks_meta: Dict[int, _IndTrackMeta]
+    tracks_meta_list: List[_IndTrackMeta]
+    max_frame: int
+    offsets_by_track: Optional[Dict[int, Tuple[int, int]]] = None
+    csv_columns: Optional[Dict[str, int]] = None
+
+
+@dataclass
+class _IndSceneRef:
+    scene_id: str
+    split: str
+    recording_id: str
+    location_id: str
+    location_label: str
+    window_i: int
+    frame_start: int
+    frame_end: int
+    min_ts: float
+    max_ts: float
+    rows: int
+    unique_agents: int
+
+
+@dataclass
+class _SindScenarioRef:
+    scene_id: str
+    split: str
+    city_id: str
+    city_label: str
+    scenario_id: str
+    scenario_label: str
+    veh_path: Optional[Path]
+    ped_path: Optional[Path]
+    tl_path: Optional[Path]
+    map_path: Optional[Path]
+    background_path: Optional[Path]
 
 
 def _split_from_table_name(name: str) -> str:
@@ -195,12 +296,15 @@ def _modality_from_table_name(name: str) -> str:
 class V2XTrajAdapter:
     def __init__(self, spec: DatasetSpec) -> None:
         self.spec = spec
-        if spec.scenes is None:
-            raise ValueError("v2x-traj adapter requires scenes.csv")
+        self._bindings = spec.bindings if isinstance(spec.bindings, dict) else {}
+        scenes_csv = spec.scenes or self._binding_file("scenes_index")
 
         self._scene_index: Dict[str, Dict[str, SceneSummary]] = {"train": {}, "val": {}}
         self._intersections: Dict[str, Counter] = {"train": Counter(), "val": Counter()}
-        self._load_scenes_csv(spec.scenes)
+        if scenes_csv is not None and scenes_csv.exists() and scenes_csv.is_file():
+            self._load_scenes_csv(scenes_csv)
+        else:
+            self._load_scenes_from_dirs()
 
         # Precompute stable scene ordering and indices for paging/jump-to-scene UX.
         self._sorted_scene_ids: Dict[str, List[str]] = {"train": [], "val": []}
@@ -209,8 +313,48 @@ class V2XTrajAdapter:
         self._scene_id_to_index_by_intersect: Dict[str, Dict[str, Dict[str, int]]] = {"train": {}, "val": {}}
         self._build_scene_indices()
 
+        if not self._scene_index["train"] and not self._scene_index["val"]:
+            raise ValueError("v2x-traj adapter could not discover any scenes from index or trajectory folders")
+
         self._map_cache: Dict[Tuple[int, int], Dict[str, Any]] = {}
         self._csv_cache: _LRUCache = _LRUCache(max_items=24)
+
+    def _binding_obj(self, role: str) -> Dict[str, Any]:
+        v = self._bindings.get(role) if isinstance(self._bindings, dict) else None
+        return v if isinstance(v, dict) else {}
+
+    def _binding_path(self, role: str) -> Optional[Path]:
+        obj = self._binding_obj(role)
+        raw = obj.get("path")
+        if raw is None and isinstance(self._bindings.get(role), str):
+            raw = self._bindings.get(role)
+        if not raw:
+            return None
+        try:
+            return Path(str(raw)).expanduser().resolve()
+        except Exception:
+            return None
+
+    def _binding_file(self, role: str) -> Optional[Path]:
+        p = self._binding_path(role)
+        if p and p.exists() and p.is_file():
+            return p
+        return p
+
+    def _binding_dir(self, role: str) -> Optional[Path]:
+        p = self._binding_path(role)
+        if p and p.exists() and p.is_dir():
+            return p
+        return p
+
+    @staticmethod
+    def _resolve_scene_csv_from_base(base: Path, split: str, scene_id: str) -> Path:
+        filename = f"{scene_id}.csv"
+        candidates = [base / split / "data" / filename, base / split / filename, base / filename]
+        for p in candidates:
+            if p.exists():
+                return p
+        return candidates[0]
 
     @staticmethod
     def _scene_sort_key(scene_id: str) -> Tuple[int, str]:
@@ -276,6 +420,93 @@ class V2XTrajAdapter:
                     "duration_s": safe_float(row.get("duration_s")),
                     "unique_agents": int(row.get("unique_agents") or 0) if (row.get("unique_agents") not in (None, "")) else None,
                 }
+
+        for split, scenes in self._scene_index.items():
+            for s in scenes.values():
+                if s.intersect_id:
+                    self._intersections[split][s.intersect_id] += 1
+
+    @staticmethod
+    def _iter_scene_csv_files(base: Path, split: str) -> List[Path]:
+        out: List[Path] = []
+        roots = [base / split / "data", base / split]
+        seen: set[str] = set()
+        for root in roots:
+            if not root.exists() or not root.is_dir():
+                continue
+            files = list(root.glob("*.csv"))
+            # Fallback for uncommon nested layouts.
+            if not files:
+                files = list(root.rglob("*.csv"))
+            for p in files:
+                k = str(p.resolve())
+                if k in seen:
+                    continue
+                seen.add(k)
+                out.append(p.resolve())
+        out.sort(key=lambda p: p.name)
+        return out
+
+    @staticmethod
+    def _read_scene_meta_from_file(path: Path) -> Tuple[Optional[str], Optional[str]]:
+        try:
+            with path.open("r", newline="") as f:
+                r = csv.DictReader(f)
+                row = next(r, None)
+        except Exception:
+            return None, None
+        if not isinstance(row, dict):
+            return None, None
+        city = str(row.get("city") or "").strip() or None
+        intersect_id = str(row.get("intersect_id") or "").strip() or None
+        return city, intersect_id
+
+    def _load_scenes_from_dirs(self) -> None:
+        base = self.spec.root
+        modality_roots: Dict[str, Optional[Path]] = {
+            "ego": self._binding_dir("traj_ego") or (base / "ego-trajectories"),
+            "infra": self._binding_dir("traj_infra") or (base / "infrastructure-trajectories"),
+            "vehicle": self._binding_dir("traj_vehicle") or (base / "vehicle-trajectories"),
+            "traffic_light": self._binding_dir("traffic_light") or (base / "traffic-light"),
+        }
+
+        for split in ("train", "val"):
+            scenes = self._scene_index[split]
+            for modality, mod_root in modality_roots.items():
+                if mod_root is None or not mod_root.exists() or not mod_root.is_dir():
+                    continue
+                for p in self._iter_scene_csv_files(mod_root, split):
+                    scene_id = str(p.stem or "").strip()
+                    if not scene_id:
+                        continue
+                    s = scenes.get(scene_id)
+                    if s is None:
+                        s = SceneSummary(
+                            scene_id=scene_id,
+                            split=split,
+                            city=None,
+                            intersect_id=None,
+                            intersect_label=None,
+                            by_modality={},
+                        )
+                        scenes[scene_id] = s
+
+                    if s.city is None or s.intersect_id is None:
+                        city, intersect_id = self._read_scene_meta_from_file(p)
+                        if s.city is None and city:
+                            s.city = city
+                        if s.intersect_id is None and intersect_id:
+                            s.intersect_id = intersect_id
+                            s.intersect_label = intersection_label(intersect_id)
+
+                    s.by_modality[modality] = {
+                        "rows": 0,
+                        "min_ts": None,
+                        "max_ts": None,
+                        "unique_ts": 0,
+                        "duration_s": None,
+                        "unique_agents": None,
+                    }
 
         for split, scenes in self._scene_index.items():
             for s in scenes.values():
@@ -370,12 +601,24 @@ class V2XTrajAdapter:
     def _scene_file(self, modality: str, split: str, scene_id: str) -> Path:
         base = self.spec.root
         if modality == "ego":
+            bound = self._binding_dir("traj_ego")
+            if bound:
+                return self._resolve_scene_csv_from_base(bound, split, scene_id)
             return base / "ego-trajectories" / split / "data" / f"{scene_id}.csv"
         if modality == "infra":
+            bound = self._binding_dir("traj_infra")
+            if bound:
+                return self._resolve_scene_csv_from_base(bound, split, scene_id)
             return base / "infrastructure-trajectories" / split / "data" / f"{scene_id}.csv"
         if modality == "vehicle":
+            bound = self._binding_dir("traj_vehicle")
+            if bound:
+                return self._resolve_scene_csv_from_base(bound, split, scene_id)
             return base / "vehicle-trajectories" / split / "data" / f"{scene_id}.csv"
         if modality == "traffic_light":
+            bound = self._binding_dir("traffic_light")
+            if bound:
+                return self._resolve_scene_csv_from_base(bound, split, scene_id)
             return base / "traffic-light" / split / "data" / f"{scene_id}.csv"
         raise ValueError(f"unknown modality: {modality}")
 
@@ -488,7 +731,7 @@ class V2XTrajAdapter:
         if cached is not None:
             return cached
 
-        maps_dir = self.spec.root / "maps"
+        maps_dir = self._binding_dir("maps_dir") or (self.spec.root / "maps")
         candidates = list(maps_dir.glob(f"*hdmap{map_id}.json"))
         if not candidates:
             raise FileNotFoundError(f"map file for map_id={map_id} not found in {maps_dir}")
@@ -1184,6 +1427,2042 @@ class V2XSeqAdapter(V2XTrajAdapter):
         return out
 
 
+class InDAdapter:
+    """
+    Adapter for inD (drone) trajectories.
+
+    Scene model:
+    - split is always "all"
+    - group/intersection is inD locationId
+    - scene is a fixed-duration time window inside one recording
+    """
+
+    DEFAULT_WINDOW_S = 60
+    _SPLIT = "all"
+    _DEFAULT_BACKGROUND_SCALE_DOWN = 12.0
+
+    def __init__(self, spec: DatasetSpec, window_s: int | None = None) -> None:
+        self.spec = spec
+        self._bindings = spec.bindings if isinstance(spec.bindings, dict) else {}
+        strategy = spec.scene_strategy if isinstance(spec.scene_strategy, dict) else {}
+        strategy_window = strategy.get("window_s")
+        self.window_s = int(window_s or strategy_window or self.DEFAULT_WINDOW_S)
+        self.window_s = max(10, min(600, self.window_s))
+        self.background_scale_down = safe_float(strategy.get("background_scale_down"))
+        if self.background_scale_down is None or not (self.background_scale_down > 0):
+            self.background_scale_down = self._DEFAULT_BACKGROUND_SCALE_DOWN
+        self._lanelet_maps_by_location = self._discover_lanelet_maps()
+        self._lanelet_map_cache: Dict[Tuple[str, float, float, int], Dict[str, Any]] = {}
+
+        self._recordings: Dict[str, _IndRecordingIndex] = {}
+        self._scenes: Dict[str, _IndSceneRef] = {}
+        self._scene_ids_sorted: Dict[str, List[str]] = {self._SPLIT: []}
+        self._scene_ids_by_location: Dict[str, Dict[str, List[str]]] = {self._SPLIT: {}}
+        self._scene_index: Dict[str, Dict[str, int]] = {self._SPLIT: {}}
+        self._scene_index_by_location: Dict[str, Dict[str, Dict[str, int]]] = {self._SPLIT: {}}
+
+        self._build_index()
+        if not self._scenes:
+            raise ValueError("inD adapter could not discover any scenes")
+
+    def _binding_obj(self, role: str) -> Dict[str, Any]:
+        v = self._bindings.get(role) if isinstance(self._bindings, dict) else None
+        return v if isinstance(v, dict) else {}
+
+    def _binding_dir(self, role: str) -> Optional[Path]:
+        obj = self._binding_obj(role)
+        raw = obj.get("path")
+        if raw is None and isinstance(self._bindings.get(role), str):
+            raw = self._bindings.get(role)
+        if not raw:
+            return None
+        try:
+            p = Path(str(raw)).expanduser().resolve()
+        except Exception:
+            return None
+        if p.exists() and p.is_dir():
+            return p
+        return p
+
+    @staticmethod
+    def _location_label(location_id: str) -> str:
+        s = str(location_id or "").strip()
+        if s.isdigit():
+            return f"Location {int(s):02d}"
+        return f"Location {s or '?'}"
+
+    @staticmethod
+    def _as_int(raw: Any) -> Optional[int]:
+        v = safe_float(raw)
+        if v is None:
+            return None
+        try:
+            return int(v)
+        except Exception:
+            return None
+
+    @staticmethod
+    def _as_num_str(path: Path) -> Optional[Tuple[str, int]]:
+        m = re.match(r"^(\d+)_tracks\.csv$", path.name)
+        if not m:
+            return None
+        num_s = m.group(1)
+        try:
+            num = int(num_s)
+        except Exception:
+            return None
+        return num_s, num
+
+    def _discover_data_dir(self) -> Optional[Path]:
+        bound = self._binding_dir("data_dir")
+        if bound and bound.exists() and bound.is_dir():
+            return bound
+        root_data = (self.spec.root / "data").resolve()
+        if root_data.exists() and root_data.is_dir():
+            return root_data
+        if self.spec.root.exists() and self.spec.root.is_dir():
+            return self.spec.root
+        return None
+
+    def _discover_maps_dir(self) -> Optional[Path]:
+        bound = self._binding_dir("maps_dir")
+        candidates: List[Path] = []
+        if bound is not None:
+            candidates.append((bound / "lanelets").resolve())
+            candidates.append(bound.resolve())
+        candidates.append((self.spec.root / "maps" / "lanelets").resolve())
+        candidates.append((self.spec.root / "maps").resolve())
+        for p in candidates:
+            if p.exists() and p.is_dir():
+                return p
+        return None
+
+    def _discover_lanelet_maps(self) -> Dict[str, Dict[str, Path]]:
+        root = self._discover_maps_dir()
+        if root is None or not root.exists() or not root.is_dir():
+            return {}
+        files = sorted([p.resolve() for p in root.rglob("*.osm") if p.is_file()])
+        out: Dict[str, Dict[str, Path]] = {}
+        for p in files:
+            stem = p.stem.lower()
+            m = re.search(r"location\s*([0-9]+)", stem)
+            if not m:
+                continue
+            loc_id = str(int(m.group(1)))
+            bucket = out.setdefault(loc_id, {})
+            key = "construction" if "construction" in stem else "default"
+            if key not in bucket:
+                bucket[key] = p
+        return out
+
+    def _lanelet_map_path_for_recording(self, rec: _IndRecordingIndex) -> Optional[Path]:
+        loc = str(rec.location_id or "").strip()
+        if not loc:
+            return None
+        bucket = self._lanelet_maps_by_location.get(loc, {})
+        if not bucket:
+            return None
+        # inD note: location 1 uses a dedicated construction map for recordings 11..17.
+        if loc == "1" and rec.recording_id_num in {11, 12, 13, 14, 15, 16, 17}:
+            p = bucket.get("construction")
+            if p is not None:
+                return p
+        return bucket.get("default") or bucket.get("construction")
+
+    @staticmethod
+    def _utm_zone_from_lon(lon: float) -> int:
+        z = int((float(lon) + 180.0) / 6.0) + 1
+        return max(1, min(60, z))
+
+    @staticmethod
+    def _lat_lon_to_utm(lat: float, lon: float, zone: int) -> Tuple[float, float]:
+        # WGS84 -> UTM forward projection (no external dependency).
+        a = 6378137.0
+        f = 1.0 / 298.257223563
+        e2 = f * (2.0 - f)
+        ep2 = e2 / (1.0 - e2)
+        k0 = 0.9996
+
+        phi = math.radians(float(lat))
+        lam = math.radians(float(lon))
+        lam0 = math.radians((int(zone) - 1) * 6 - 180 + 3)
+
+        sin_phi = math.sin(phi)
+        cos_phi = math.cos(phi)
+        tan_phi = math.tan(phi)
+        n = a / math.sqrt(1.0 - e2 * sin_phi * sin_phi)
+        t = tan_phi * tan_phi
+        c = ep2 * cos_phi * cos_phi
+        a_ = cos_phi * (lam - lam0)
+
+        m = a * (
+            (1.0 - e2 / 4.0 - 3.0 * e2 * e2 / 64.0 - 5.0 * e2 * e2 * e2 / 256.0) * phi
+            - (3.0 * e2 / 8.0 + 3.0 * e2 * e2 / 32.0 + 45.0 * e2 * e2 * e2 / 1024.0) * math.sin(2.0 * phi)
+            + (15.0 * e2 * e2 / 256.0 + 45.0 * e2 * e2 * e2 / 1024.0) * math.sin(4.0 * phi)
+            - (35.0 * e2 * e2 * e2 / 3072.0) * math.sin(6.0 * phi)
+        )
+
+        easting = k0 * n * (
+            a_
+            + (1.0 - t + c) * (a_ ** 3) / 6.0
+            + (5.0 - 18.0 * t + t * t + 72.0 * c - 58.0 * ep2) * (a_ ** 5) / 120.0
+        ) + 500000.0
+
+        northing = k0 * (
+            m
+            + n * tan_phi * (
+                (a_ ** 2) / 2.0
+                + (5.0 - t + 9.0 * c + 4.0 * c * c) * (a_ ** 4) / 24.0
+                + (61.0 - 58.0 * t + t * t + 600.0 * c - 330.0 * ep2) * (a_ ** 6) / 720.0
+            )
+        )
+        if float(lat) < 0.0:
+            northing += 10000000.0
+        return easting, northing
+
+    def _lanelet_local_xy(self, rec: _IndRecordingIndex, lat: float, lon: float) -> Optional[Tuple[float, float]]:
+        x0 = rec.x_utm_origin
+        y0 = rec.y_utm_origin
+        if x0 is None or y0 is None:
+            return None
+        zone_hint = self._utm_zone_from_lon(rec.lon_location if rec.lon_location is not None else lon)
+        try:
+            x_utm, y_utm = self._lat_lon_to_utm(lat, lon, zone=zone_hint)
+        except Exception:
+            return None
+        return (float(x_utm) - float(x0), float(y_utm) - float(y0))
+
+    @staticmethod
+    def _resample_polyline(points: List[Tuple[float, float]], n_out: int) -> List[Tuple[float, float]]:
+        if n_out <= 1:
+            return points[:1]
+        if len(points) <= 1:
+            return points[:]
+        if len(points) == n_out:
+            return points[:]
+        out: List[Tuple[float, float]] = []
+        span = float(len(points) - 1)
+        for i in range(n_out):
+            t = span * (float(i) / float(n_out - 1))
+            j0 = int(math.floor(t))
+            j1 = min(len(points) - 1, j0 + 1)
+            a = t - float(j0)
+            x0, y0 = points[j0]
+            x1, y1 = points[j1]
+            out.append(((1.0 - a) * x0 + a * x1, (1.0 - a) * y0 + a * y1))
+        return out
+
+    @staticmethod
+    def _downsample_polyline(points: List[Tuple[float, float]], step: int) -> List[Tuple[float, float]]:
+        s = max(1, int(step))
+        if s <= 1 or len(points) <= max(12, s * 2):
+            return points
+        idxs = list(range(0, len(points), s))
+        last = len(points) - 1
+        if idxs[-1] != last:
+            idxs.append(last)
+        out: List[Tuple[float, float]] = [points[i] for i in idxs]
+        if len(out) < 2 and len(points) >= 2:
+            out = [points[0], points[-1]]
+        return out
+
+    @staticmethod
+    def _polyline_bbox(points: List[Tuple[float, float]]) -> Optional[Dict[str, float]]:
+        if not points:
+            return None
+        b = bbox_init()
+        for x, y in points:
+            bbox_update(b, x, y)
+        return b if bbox_is_valid(b) else None
+
+    def _load_lanelet_map_parsed(self, rec: _IndRecordingIndex, points_step: int) -> Optional[Dict[str, Any]]:
+        map_path = self._lanelet_map_path_for_recording(rec)
+        if map_path is None or not map_path.exists() or not map_path.is_file():
+            return None
+        if rec.x_utm_origin is None or rec.y_utm_origin is None:
+            return None
+
+        step = max(1, int(points_step))
+        key = (str(map_path), round(float(rec.x_utm_origin), 3), round(float(rec.y_utm_origin), 3), step)
+        cached = self._lanelet_map_cache.get(key)
+        if cached is not None:
+            return cached
+
+        tree = ET.parse(map_path)
+        root = tree.getroot()
+
+        nodes: Dict[str, Tuple[float, float]] = {}
+        for n in root.findall("node"):
+            nid = str(n.attrib.get("id") or "").strip()
+            lat = safe_float(n.attrib.get("lat"))
+            lon = safe_float(n.attrib.get("lon"))
+            if not nid or lat is None or lon is None:
+                continue
+            nodes[nid] = (float(lat), float(lon))
+
+        ways: Dict[str, List[str]] = {}
+        for w in root.findall("way"):
+            wid = str(w.attrib.get("id") or "").strip()
+            if not wid:
+                continue
+            refs = [str(nd.attrib.get("ref") or "").strip() for nd in w.findall("nd")]
+            ways[wid] = [r for r in refs if r]
+
+        def _way_points(wid: Optional[str]) -> List[Tuple[float, float]]:
+            if wid is None:
+                return []
+            refs = ways.get(wid, [])
+            out_pts: List[Tuple[float, float]] = []
+            for rid in refs:
+                ll = nodes.get(rid)
+                if ll is None:
+                    continue
+                xy = self._lanelet_local_xy(rec, ll[0], ll[1])
+                if xy is None:
+                    continue
+                x, y = xy
+                if out_pts and abs(x - out_pts[-1][0]) < 1e-9 and abs(y - out_pts[-1][1]) < 1e-9:
+                    continue
+                out_pts.append((x, y))
+            return out_pts
+
+        lanes: List[Dict[str, Any]] = []
+        map_bbox = bbox_init()
+        for rel in root.findall("relation"):
+            tags = {str(t.attrib.get("k") or ""): str(t.attrib.get("v") or "") for t in rel.findall("tag")}
+            if tags.get("type") != "lanelet":
+                continue
+
+            left_id: Optional[str] = None
+            right_id: Optional[str] = None
+            for m in rel.findall("member"):
+                if str(m.attrib.get("type") or "") != "way":
+                    continue
+                role = str(m.attrib.get("role") or "")
+                ref = str(m.attrib.get("ref") or "").strip()
+                if not ref:
+                    continue
+                if role == "left":
+                    left_id = ref
+                elif role == "right":
+                    right_id = ref
+
+            left = _way_points(left_id)
+            right = _way_points(right_id)
+
+            center: List[Tuple[float, float]] = []
+            if len(left) >= 2 and len(right) >= 2:
+                d_same = (left[0][0] - right[0][0]) ** 2 + (left[0][1] - right[0][1]) ** 2
+                d_same += (left[-1][0] - right[-1][0]) ** 2 + (left[-1][1] - right[-1][1]) ** 2
+                d_rev = (left[0][0] - right[-1][0]) ** 2 + (left[0][1] - right[-1][1]) ** 2
+                d_rev += (left[-1][0] - right[0][0]) ** 2 + (left[-1][1] - right[0][1]) ** 2
+                if d_rev < d_same:
+                    right = list(reversed(right))
+                n = max(len(left), len(right))
+                l2 = self._resample_polyline(left, n)
+                r2 = self._resample_polyline(right, n)
+                center = [((lp[0] + rp[0]) * 0.5, (lp[1] + rp[1]) * 0.5) for lp, rp in zip(l2, r2)]
+            elif len(left) >= 2:
+                center = left
+            elif len(right) >= 2:
+                center = right
+
+            center = self._downsample_polyline(center, step)
+            if len(center) < 2:
+                continue
+
+            b = self._polyline_bbox(center)
+            if b is None:
+                continue
+            bbox_update_from_bbox(map_bbox, b)
+            lanes.append(
+                {
+                    "id": str(rel.attrib.get("id") or f"lane_{len(lanes)+1}"),
+                    "lane_type": tags.get("subtype") or "road",
+                    "turn_direction": None,
+                    "is_intersection": bool((tags.get("subtype") or "").lower() in ("intersection",)),
+                    "has_traffic_control": False,
+                    "centerline": center,
+                    "bbox": b,
+                }
+            )
+
+        parsed = {
+            "map_id": map_path.stem,
+            "map_file": map_path.name,
+            "counts": {"LANE": len(lanes), "STOPLINE": 0, "CROSSWALK": 0, "JUNCTION": 0},
+            "lanes": lanes,
+            "stoplines": [],
+            "crosswalks": [],
+            "junctions": [],
+            "bbox": map_bbox if bbox_is_valid(map_bbox) else None,
+        }
+        self._lanelet_map_cache[key] = parsed
+        return parsed
+
+    def _clip_lanelet_map(
+        self,
+        parsed_map: Dict[str, Any],
+        extent: Dict[str, float],
+        max_lanes: int,
+        focus_xy: Optional[Tuple[float, float]] = None,
+    ) -> Dict[str, Any]:
+        lanes: List[Dict[str, Any]] = []
+        for lane in parsed_map.get("lanes", []) or []:
+            b = lane.get("bbox") if isinstance(lane, dict) else None
+            if not isinstance(b, dict):
+                continue
+            try:
+                if bbox_intersects(b, extent):
+                    lanes.append(lane)
+            except Exception:
+                continue
+        lanes_truncated = False
+        if max_lanes and len(lanes) > max_lanes:
+            if focus_xy:
+                cx, cy = focus_xy
+            else:
+                cx = (extent["min_x"] + extent["max_x"]) * 0.5
+                cy = (extent["min_y"] + extent["max_y"]) * 0.5
+
+            def _dist2(l: Dict[str, Any]) -> float:
+                b = l.get("bbox") or {}
+                mx = (float(b.get("min_x", 0.0)) + float(b.get("max_x", 0.0))) * 0.5
+                my = (float(b.get("min_y", 0.0)) + float(b.get("max_y", 0.0))) * 0.5
+                dx = mx - cx
+                dy = my - cy
+                return dx * dx + dy * dy
+
+            lanes.sort(key=_dist2)
+            lanes = lanes[: int(max_lanes)]
+            lanes_truncated = True
+
+        return {
+            "map_id": parsed_map.get("map_id"),
+            "map_file": parsed_map.get("map_file"),
+            "lanes_truncated": lanes_truncated,
+            "lanes": [
+                {
+                    "id": l.get("id"),
+                    "lane_type": l.get("lane_type"),
+                    "turn_direction": l.get("turn_direction"),
+                    "is_intersection": l.get("is_intersection"),
+                    "has_traffic_control": l.get("has_traffic_control"),
+                    "centerline": l.get("centerline") or [],
+                }
+                for l in lanes
+            ],
+            "stoplines": [],
+            "crosswalks": [],
+            "junctions": [],
+        }
+
+    def _read_recording_meta(self, path: Path) -> Dict[str, Any]:
+        try:
+            with path.open("r", newline="") as f:
+                row = next(csv.DictReader(f), None)
+        except Exception:
+            row = None
+        return row if isinstance(row, dict) else {}
+
+    def _read_tracks_meta(self, path: Path) -> Tuple[Dict[int, _IndTrackMeta], List[_IndTrackMeta], int]:
+        out: Dict[int, _IndTrackMeta] = {}
+        seq: List[_IndTrackMeta] = []
+        max_frame = -1
+        try:
+            with path.open("r", newline="") as f:
+                r = csv.DictReader(f)
+                for row in r:
+                    tid = self._as_int(row.get("trackId"))
+                    if tid is None:
+                        continue
+                    i0 = self._as_int(row.get("initialFrame"))
+                    i1 = self._as_int(row.get("finalFrame"))
+                    if i0 is None or i1 is None:
+                        continue
+                    tm = _IndTrackMeta(
+                        track_id=tid,
+                        initial_frame=int(i0),
+                        final_frame=int(i1),
+                        width=safe_float(row.get("width")),
+                        length=safe_float(row.get("length")),
+                        cls=str(row.get("class") or "").strip().lower(),
+                    )
+                    out[tid] = tm
+                    seq.append(tm)
+                    if tm.final_frame > max_frame:
+                        max_frame = tm.final_frame
+        except Exception:
+            pass
+        seq.sort(key=lambda x: x.track_id)
+        return out, seq, int(max_frame)
+
+    def _discover_recordings(self) -> List[_IndRecordingIndex]:
+        data_dir = self._discover_data_dir()
+        if data_dir is None or not data_dir.exists() or not data_dir.is_dir():
+            return []
+
+        tracks_files = sorted([p.resolve() for p in data_dir.glob("*_tracks.csv") if p.is_file()])
+        out: List[_IndRecordingIndex] = []
+
+        for tracks_path in tracks_files:
+            parsed = self._as_num_str(tracks_path)
+            if parsed is None:
+                continue
+            rec_s, rec_num = parsed
+            tracks_meta_path = (data_dir / f"{rec_s}_tracksMeta.csv").resolve()
+            recording_meta_path = (data_dir / f"{rec_s}_recordingMeta.csv").resolve()
+            if not tracks_meta_path.exists() or not recording_meta_path.exists():
+                continue
+
+            rec_meta = self._read_recording_meta(recording_meta_path)
+            frame_rate = safe_float(rec_meta.get("frameRate")) or 25.0
+            if not (frame_rate > 0):
+                frame_rate = 25.0
+            duration_s = safe_float(rec_meta.get("duration")) or 0.0
+            location_id = str(rec_meta.get("locationId") or "").strip() or "0"
+            location_label = self._location_label(location_id)
+            lat_location = safe_float(rec_meta.get("latLocation"))
+            lon_location = safe_float(rec_meta.get("lonLocation"))
+            x_utm_origin = safe_float(rec_meta.get("xUtmOrigin"))
+            y_utm_origin = safe_float(rec_meta.get("yUtmOrigin"))
+            ortho_px_to_meter = safe_float(rec_meta.get("orthoPxToMeter"))
+            if ortho_px_to_meter is None or not (ortho_px_to_meter > 0):
+                ortho_px_to_meter = 1.0
+
+            tmeta, tmeta_list, max_frame = self._read_tracks_meta(tracks_meta_path)
+            if max_frame < 0 and duration_s > 0:
+                max_frame = max(0, int(round(duration_s * frame_rate)) - 1)
+            if max_frame < 0:
+                continue
+
+            bg = (data_dir / f"{rec_s}_background.png").resolve()
+            bg_path = bg if bg.exists() and bg.is_file() else None
+
+            out.append(
+                _IndRecordingIndex(
+                    recording_id=rec_s,
+                    recording_id_num=rec_num,
+                    location_id=location_id,
+                    location_label=location_label,
+                    frame_rate=float(frame_rate),
+                    duration_s=float(duration_s),
+                    lat_location=lat_location,
+                    lon_location=lon_location,
+                    x_utm_origin=x_utm_origin,
+                    y_utm_origin=y_utm_origin,
+                    tracks_path=tracks_path,
+                    tracks_meta_path=tracks_meta_path,
+                    recording_meta_path=recording_meta_path,
+                    background_path=bg_path,
+                    ortho_px_to_meter=float(ortho_px_to_meter),
+                    tracks_meta=tmeta,
+                    tracks_meta_list=tmeta_list,
+                    max_frame=int(max_frame),
+                )
+            )
+
+        out.sort(key=lambda x: x.recording_id_num)
+        return out
+
+    def _window_stats(self, rec: _IndRecordingIndex, frame_start: int, frame_end: int) -> Tuple[int, int]:
+        rows = 0
+        unique_agents = 0
+        for tm in rec.tracks_meta_list:
+            lo = max(frame_start, tm.initial_frame)
+            hi = min(frame_end, tm.final_frame)
+            if hi < lo:
+                continue
+            unique_agents += 1
+            rows += (hi - lo + 1)
+        return rows, unique_agents
+
+    def _build_index(self) -> None:
+        split = self._SPLIT
+        by_location: Dict[str, List[str]] = defaultdict(list)
+        scene_n = 1
+        for rec in self._discover_recordings():
+            self._recordings[rec.recording_id] = rec
+            window_frames = max(1, int(round(float(self.window_s) * float(rec.frame_rate))))
+            max_frame = int(rec.max_frame)
+
+            if max_frame < 0:
+                continue
+
+            start = 0
+            wi = 0
+            while start <= max_frame:
+                end = min(max_frame, start + window_frames - 1)
+                scene_id = str(scene_n)
+                scene_n += 1
+                rows, unique_agents = self._window_stats(rec, start, end)
+                min_ts = float(start) / float(rec.frame_rate)
+                max_ts = float(end) / float(rec.frame_rate)
+
+                ref = _IndSceneRef(
+                    scene_id=scene_id,
+                    split=split,
+                    recording_id=rec.recording_id,
+                    location_id=rec.location_id,
+                    location_label=rec.location_label,
+                    window_i=wi,
+                    frame_start=int(start),
+                    frame_end=int(end),
+                    min_ts=min_ts,
+                    max_ts=max_ts,
+                    rows=int(rows),
+                    unique_agents=int(unique_agents),
+                )
+                self._scenes[scene_id] = ref
+                self._scene_ids_sorted[split].append(scene_id)
+                by_location[rec.location_id].append(scene_id)
+
+                wi += 1
+                start = end + 1
+
+        self._scene_ids_by_location[split] = dict(by_location)
+        self._scene_index[split] = {sid: i for i, sid in enumerate(self._scene_ids_sorted[split])}
+        self._scene_index_by_location[split] = {
+            lid: {sid: i for i, sid in enumerate(ids)}
+            for lid, ids in self._scene_ids_by_location[split].items()
+        }
+
+    def list_intersections(self, split: str) -> List[Dict[str, Any]]:
+        split = self._SPLIT
+        items = []
+        by_loc = self._scene_ids_by_location.get(split, {})
+        for loc_id, ids in by_loc.items():
+            items.append(
+                {
+                    "intersect_id": str(loc_id),
+                    "intersect_label": self._location_label(loc_id),
+                    "count": int(len(ids)),
+                }
+            )
+
+        def _loc_key(it: Dict[str, Any]) -> Tuple[int, str]:
+            s = str(it.get("intersect_id") or "")
+            return (int(s), s) if s.isdigit() else (10**9, s)
+
+        items.sort(key=_loc_key)
+        return items
+
+    def _list_scene_ids(self, intersect_id: Optional[str]) -> List[str]:
+        split = self._SPLIT
+        if intersect_id:
+            return list(self._scene_ids_by_location.get(split, {}).get(str(intersect_id), []))
+        return list(self._scene_ids_sorted.get(split, []))
+
+    @staticmethod
+    def _scene_label(ref: _IndSceneRef) -> str:
+        dur = max(0.0, float(ref.max_ts) - float(ref.min_ts))
+        return f"Recording {ref.recording_id} · Window {ref.window_i + 1} · {dur:.1f}s"
+
+    def list_scenes(
+        self,
+        split: str,
+        intersect_id: Optional[str] = None,
+        limit: int = 200,
+        offset: int = 0,
+        include_tl_only: bool = False,
+    ) -> Dict[str, Any]:
+        split = self._SPLIT
+        ids = self._list_scene_ids(intersect_id=intersect_id)
+        total = len(ids)
+        slice_ids = ids[offset : offset + limit]
+
+        items = []
+        for sid in slice_ids:
+            ref = self._scenes[sid]
+            duration_s = max(0.0, ref.max_ts - ref.min_ts)
+            items.append(
+                {
+                    "scene_id": ref.scene_id,
+                    "scene_label": self._scene_label(ref),
+                    "recording_id": ref.recording_id,
+                    "window_index": int(ref.window_i),
+                    "split": split,
+                    "city": None,
+                    "intersect_id": ref.location_id,
+                    "intersect_label": ref.location_label,
+                    "by_modality": {
+                        "infra": {
+                            "rows": int(ref.rows),
+                            "min_ts": float(ref.min_ts),
+                            "max_ts": float(ref.max_ts),
+                            "unique_ts": int(max(0, ref.frame_end - ref.frame_start + 1)),
+                            "duration_s": duration_s,
+                            "unique_agents": int(ref.unique_agents),
+                        }
+                    },
+                }
+            )
+
+        return {
+            "total": total,
+            "limit": int(limit),
+            "offset": int(offset),
+            "items": items,
+            "availability": {"scene_count": total, "by_modality": {"infra": total}},
+            "include_tl_only": bool(include_tl_only),
+        }
+
+    def locate_scene(self, split: str, scene_id: str) -> Dict[str, Any]:
+        split = self._SPLIT
+        sid = str(scene_id or "")
+        ref = self._scenes.get(sid)
+        if ref is None:
+            return {"split": split, "scene_id": sid, "found": False}
+
+        idx_all = self._scene_index.get(split, {}).get(sid)
+        idx_loc = self._scene_index_by_location.get(split, {}).get(ref.location_id, {}).get(sid)
+        total_loc = len(self._scene_ids_by_location.get(split, {}).get(ref.location_id, []))
+
+        return {
+            "split": split,
+            "scene_id": sid,
+            "found": True,
+            "city": None,
+            "intersect_id": ref.location_id,
+            "intersect_label": ref.location_label,
+            "recording_id": ref.recording_id,
+            "window_index": int(ref.window_i),
+            "index_all": idx_all,
+            "total_all": len(self._scene_ids_sorted.get(split, [])),
+            "index_in_intersection": idx_loc,
+            "total_in_intersection": total_loc,
+        }
+
+    @staticmethod
+    def _class_to_type_and_subtype(raw_cls: str) -> Tuple[str, Optional[str]]:
+        c = str(raw_cls or "").strip().lower()
+        if c in ("car", "truck_bus", "truck", "bus", "van", "motorcycle"):
+            return "VEHICLE", c.upper()
+        if c in ("pedestrian",):
+            return "PEDESTRIAN", "PEDESTRIAN"
+        if c in ("bicycle",):
+            return "BICYCLE", "BICYCLE"
+        if c:
+            return "OTHER", c.upper()
+        return "UNKNOWN", None
+
+    @staticmethod
+    def _csv_index_map(header_line: str) -> Dict[str, int]:
+        try:
+            header = next(csv.reader([header_line]))
+        except Exception:
+            header = [x.strip() for x in str(header_line or "").strip().split(",")]
+        return {str(name): i for i, name in enumerate(header)}
+
+    def _ensure_offsets(self, rec: _IndRecordingIndex) -> None:
+        if rec.offsets_by_track is not None and rec.csv_columns is not None:
+            return
+
+        offsets: Dict[int, Tuple[int, int]] = {}
+        columns: Dict[str, int] = {}
+        with rec.tracks_path.open("r", encoding="utf-8", errors="replace", newline="") as f:
+            header_line = f.readline()
+            if not header_line:
+                rec.offsets_by_track = {}
+                rec.csv_columns = {}
+                return
+            idx_by_name = self._csv_index_map(header_line)
+
+            def idx(name: str) -> int:
+                v = idx_by_name.get(name)
+                return int(v) if v is not None else -1
+
+            columns = {
+                "trackId": idx("trackId"),
+                "frame": idx("frame"),
+                "xCenter": idx("xCenter"),
+                "yCenter": idx("yCenter"),
+                "heading": idx("heading"),
+                "width": idx("width"),
+                "length": idx("length"),
+                "xVelocity": idx("xVelocity"),
+                "yVelocity": idx("yVelocity"),
+            }
+
+            if columns["trackId"] < 0 or columns["frame"] < 0:
+                rec.offsets_by_track = {}
+                rec.csv_columns = columns
+                return
+
+            cur_track: Optional[int] = None
+            cur_start = f.tell()
+            while True:
+                pos = f.tell()
+                line = f.readline()
+                if not line:
+                    break
+                parts = line.rstrip("\r\n").split(",")
+                i_tid = columns["trackId"]
+                if i_tid >= len(parts):
+                    continue
+                tid = self._as_int(parts[i_tid])
+                if tid is None:
+                    continue
+
+                if cur_track is None:
+                    cur_track = int(tid)
+                    cur_start = pos
+                elif tid != cur_track:
+                    offsets[int(cur_track)] = (int(cur_start), int(pos))
+                    cur_track = int(tid)
+                    cur_start = pos
+
+            end_pos = f.tell()
+            if cur_track is not None:
+                offsets[int(cur_track)] = (int(cur_start), int(end_pos))
+
+        rec.offsets_by_track = offsets
+        rec.csv_columns = columns
+
+    @staticmethod
+    def _col(parts: List[str], cols: Dict[str, int], key: str) -> Optional[str]:
+        i = int(cols.get(key, -1))
+        if i < 0 or i >= len(parts):
+            return None
+        return parts[i]
+
+    def _active_tracks(self, rec: _IndRecordingIndex, frame_start: int, frame_end: int) -> List[_IndTrackMeta]:
+        out: List[_IndTrackMeta] = []
+        for tm in rec.tracks_meta_list:
+            if tm.final_frame < frame_start or tm.initial_frame > frame_end:
+                continue
+            out.append(tm)
+        return out
+
+    def _background_meta_for_recording(self, rec: _IndRecordingIndex) -> Optional[Dict[str, Any]]:
+        if rec.background_path is None or not rec.background_path.exists() or not rec.background_path.is_file():
+            return None
+        size = read_png_size(rec.background_path)
+        if not size:
+            return None
+        width_px, height_px = size
+        meters_per_px = float(rec.ortho_px_to_meter) * float(self.background_scale_down)
+        if not (meters_per_px > 0):
+            return None
+        return {
+            "kind": "scene_image",
+            "path": str(rec.background_path),
+            "size_px": {"width": int(width_px), "height": int(height_px)},
+            "meters_per_px": float(meters_per_px),
+            # inD helper uses xCenterVis = x/ortho and yCenterVis = -y/ortho;
+            # displayed image is down-scaled by `background_scale_down`.
+            "extent": {
+                "min_x": 0.0,
+                "max_x": float(width_px) * meters_per_px,
+                "min_y": -float(height_px) * meters_per_px,
+                "max_y": 0.0,
+            },
+        }
+
+    def get_scene_background(self, split: str, scene_id: str) -> Optional[Path]:
+        split = self._SPLIT
+        sid = str(scene_id or "")
+        ref = self._scenes.get(sid)
+        if ref is None:
+            return None
+        rec = self._recordings.get(ref.recording_id)
+        if rec is None:
+            return None
+        bg = rec.background_path
+        if bg is None or not bg.exists() or not bg.is_file():
+            return None
+        return bg
+
+    def load_scene_bundle(
+        self,
+        split: str,
+        scene_id: str,
+        include_map: bool = True,
+        map_padding: float = 60.0,
+        map_points_step: int = 5,
+        max_lanes: int = 4000,
+        map_clip: str = "intersection",
+    ) -> Dict[str, Any]:
+        split = self._SPLIT
+        sid = str(scene_id or "")
+        ref = self._scenes.get(sid)
+        if ref is None:
+            raise KeyError(f"scene not found: {sid}")
+        rec = self._recordings.get(ref.recording_id)
+        if rec is None:
+            raise KeyError(f"recording not found for scene: {sid}")
+
+        self._ensure_offsets(rec)
+        cols = rec.csv_columns or {}
+        offsets = rec.offsets_by_track or {}
+
+        warnings: List[str] = []
+        by_frame: Dict[int, List[Dict[str, Any]]] = defaultdict(list)
+        extent = bbox_init()
+        rows = 0
+        obj_ids: set[str] = set()
+
+        active_tracks = self._active_tracks(rec, ref.frame_start, ref.frame_end)
+        if not active_tracks:
+            warnings.append("scene_window_empty")
+
+        with rec.tracks_path.open("r", encoding="utf-8", errors="replace", newline="") as f:
+            # Iterate by track segments, not by full file scan.
+            for tm in active_tracks:
+                off = offsets.get(tm.track_id)
+                if not off:
+                    continue
+                start_off, end_off = off
+                f.seek(start_off)
+                while f.tell() < end_off:
+                    line = f.readline()
+                    if not line:
+                        break
+                    parts = line.rstrip("\r\n").split(",")
+
+                    frame_i = self._as_int(self._col(parts, cols, "frame"))
+                    if frame_i is None:
+                        continue
+                    frame = int(frame_i)
+                    if frame < ref.frame_start or frame > ref.frame_end:
+                        continue
+
+                    x = safe_float(self._col(parts, cols, "xCenter"))
+                    y = safe_float(self._col(parts, cols, "yCenter"))
+                    if x is not None and y is not None:
+                        bbox_update(extent, x, y)
+
+                    heading = safe_float(self._col(parts, cols, "heading"))
+                    theta = math.radians(float(heading)) if heading is not None else None
+
+                    width = safe_float(self._col(parts, cols, "width"))
+                    length = safe_float(self._col(parts, cols, "length"))
+                    if width is None:
+                        width = tm.width
+                    if length is None:
+                        length = tm.length
+
+                    v_x = safe_float(self._col(parts, cols, "xVelocity"))
+                    v_y = safe_float(self._col(parts, cols, "yVelocity"))
+                    t, st = self._class_to_type_and_subtype(tm.cls)
+
+                    obj_id = str(tm.track_id)
+                    rec_out = {
+                        "id": obj_id,
+                        "track_id": obj_id,
+                        "object_id": obj_id,
+                        "type": t,
+                        "sub_type": st,
+                        "sub_type_code": None,
+                        "tag": f"recording-{rec.recording_id}",
+                        "x": x,
+                        "y": y,
+                        "z": None,
+                        "length": length,
+                        "width": width,
+                        "height": None,
+                        "theta": theta,
+                        "v_x": v_x,
+                        "v_y": v_y,
+                    }
+                    by_frame[frame].append(rec_out)
+                    obj_ids.add(obj_id)
+                    rows += 1
+
+        frame_keys = sorted(by_frame.keys())
+        timestamps = [float(fr) / float(rec.frame_rate) for fr in frame_keys]
+        t0 = timestamps[0] if timestamps else 0.0
+
+        if not bbox_is_valid(extent):
+            extent = {"min_x": -10.0, "min_y": -10.0, "max_x": 10.0, "max_y": 10.0}
+            warnings.append("extent_missing")
+        if rows <= 0:
+            warnings.append("scene_window_empty")
+
+        frames: List[Dict[str, Any]] = []
+        for fr in frame_keys:
+            frames.append({"infra": by_frame.get(fr, [])})
+
+        modality_stats = {
+            "ego": {"rows": 0, "unique_ts": 0, "min_ts": None, "max_ts": None},
+            "vehicle": {"rows": 0, "unique_ts": 0, "min_ts": None, "max_ts": None},
+            "traffic_light": {"rows": 0, "unique_ts": 0, "min_ts": None, "max_ts": None},
+            "infra": {
+                "rows": int(rows),
+                "unique_ts": int(len(frame_keys)),
+                "min_ts": timestamps[0] if timestamps else None,
+                "max_ts": timestamps[-1] if timestamps else None,
+                "unique_agents": int(len(obj_ids)),
+            },
+        }
+
+        background = self._background_meta_for_recording(rec)
+        if background is not None:
+            background["url"] = f"/api/datasets/{self.spec.id}/scene/{split}/{sid}/background"
+            background["recording_id"] = rec.recording_id
+
+        map_out: Optional[Dict[str, Any]] = None
+        map_id: Optional[str] = None
+        if include_map:
+            try:
+                parsed_map = self._load_lanelet_map_parsed(rec, points_step=map_points_step)
+                if parsed_map is None:
+                    warnings.append("map_missing")
+                elif parsed_map.get("bbox") is not None:
+                    if map_clip == "scene":
+                        clip_extent = bbox_pad(extent, map_padding)
+                    else:
+                        clip_extent = parsed_map["bbox"]
+                    focus_xy = (
+                        (extent["min_x"] + extent["max_x"]) * 0.5,
+                        (extent["min_y"] + extent["max_y"]) * 0.5,
+                    )
+                    map_out = self._clip_lanelet_map(parsed_map, clip_extent, max_lanes=max_lanes, focus_xy=focus_xy)
+                    map_out["clip_mode"] = str(map_clip or "intersection")
+                    map_out["clip_extent"] = clip_extent
+                    map_out["points_step"] = int(max(1, map_points_step))
+                    map_out["counts"] = dict(parsed_map.get("counts") or {})
+                    map_out["bbox"] = parsed_map.get("bbox")
+                    map_id = str(parsed_map.get("map_id") or "")
+                    if map_id == "":
+                        map_id = None
+                else:
+                    warnings.append("map_empty")
+            except Exception as e:
+                warnings.append(f"map_load_failed:{e}")
+
+        window_count = 0
+        for x in self._scenes.values():
+            if x.recording_id == ref.recording_id:
+                window_count += 1
+
+        return {
+            "dataset_id": self.spec.id,
+            "split": split,
+            "scene_id": sid,
+            "scene_label": self._scene_label(ref),
+            "city": None,
+            "intersect_id": ref.location_id,
+            "intersect_label": ref.location_label,
+            "recording_id": rec.recording_id,
+            "recording_label": f"Recording {rec.recording_id}",
+            "window_index": int(ref.window_i),
+            "window_count": int(window_count),
+            "intersect_by_modality": {"infra": ref.location_id},
+            "map_id": map_id,
+            "t0": t0,
+            "timestamps": timestamps,
+            "extent": extent,
+            "map": map_out,
+            "background": background,
+            "modality_stats": modality_stats,
+            "frames": frames,
+            "warnings": warnings,
+        }
+
+
+class SinDAdapter:
+    """
+    Adapter for SinD (signalized intersection drone dataset).
+
+    Scene model:
+    - split is always "all"
+    - group/intersection is city
+    - scene is one scenario folder
+    """
+
+    _SPLIT = "all"
+
+    def __init__(self, spec: DatasetSpec) -> None:
+        self.spec = spec
+        self._bindings = spec.bindings if isinstance(spec.bindings, dict) else {}
+        self._scenes: Dict[str, _SindScenarioRef] = {}
+        self._scene_ids_sorted: Dict[str, List[str]] = {self._SPLIT: []}
+        self._scene_ids_by_city: Dict[str, Dict[str, List[str]]] = {self._SPLIT: {}}
+        self._scene_index: Dict[str, Dict[str, int]] = {self._SPLIT: {}}
+        self._scene_index_by_city: Dict[str, Dict[str, Dict[str, int]]] = {self._SPLIT: {}}
+        self._lanelet_map_cache: Dict[Tuple[str, int], Dict[str, Any]] = {}
+        self._build_index()
+        if not self._scenes:
+            raise ValueError("SinD adapter could not discover any scenes")
+
+    def _binding_obj(self, role: str) -> Dict[str, Any]:
+        v = self._bindings.get(role) if isinstance(self._bindings, dict) else None
+        return v if isinstance(v, dict) else {}
+
+    def _binding_dir(self, role: str) -> Optional[Path]:
+        obj = self._binding_obj(role)
+        raw = obj.get("path")
+        if raw is None and isinstance(self._bindings.get(role), str):
+            raw = self._bindings.get(role)
+        if not raw:
+            return None
+        try:
+            p = Path(str(raw)).expanduser().resolve()
+        except Exception:
+            return None
+        if p.exists() and p.is_dir():
+            return p
+        return p
+
+    def _discover_data_dir(self) -> Optional[Path]:
+        bound = self._binding_dir("data_dir")
+        if bound and bound.exists() and bound.is_dir():
+            return bound
+        if self.spec.root.exists() and self.spec.root.is_dir():
+            return self.spec.root.resolve()
+        return None
+
+    @staticmethod
+    def _city_label(city_id: str) -> str:
+        s = str(city_id or "").strip()
+        if not s:
+            return "City ?"
+        return s.replace("_", " ")
+
+    @staticmethod
+    def _scenario_sort_key(name: str) -> Tuple[int, str]:
+        m = re.search(r"(\d+)", str(name or ""))
+        if m:
+            try:
+                return int(m.group(1)), str(name)
+            except Exception:
+                pass
+        return (10**9), str(name)
+
+    @staticmethod
+    def _is_scenario_dir(path: Path) -> bool:
+        if not path.exists() or not path.is_dir():
+            return False
+        return (path / "Veh_smoothed_tracks.csv").exists() or (path / "Ped_smoothed_tracks.csv").exists()
+
+    def _discover_city_blocks(self) -> List[Tuple[str, Path, List[Path], Optional[Path], Optional[Path]]]:
+        data_dir = self._discover_data_dir()
+        if data_dir is None or not data_dir.exists() or not data_dir.is_dir():
+            return []
+
+        first_level = [p for p in sorted(data_dir.iterdir()) if p.is_dir() and not p.name.startswith(".")]
+        direct_scenarios = [p for p in first_level if self._is_scenario_dir(p)]
+
+        blocks: List[Tuple[str, Path, List[Path], Optional[Path], Optional[Path]]] = []
+        if direct_scenarios:
+            city_id = str(data_dir.name or "city").strip()
+            city_dir = data_dir
+            map_file = next(iter(sorted([p for p in city_dir.glob("*.osm") if p.is_file()])), None)
+            bg_file = next(iter(sorted([p for p in city_dir.glob("*.png") if p.is_file()])), None)
+            blocks.append((city_id, city_dir, sorted(direct_scenarios, key=lambda x: self._scenario_sort_key(x.name)), map_file, bg_file))
+            return blocks
+
+        for city_dir in first_level:
+            scenarios = [p for p in sorted(city_dir.iterdir()) if p.is_dir() and not p.name.startswith(".") and self._is_scenario_dir(p)]
+            if not scenarios:
+                continue
+            city_id = str(city_dir.name).strip()
+            map_file = next(iter(sorted([p for p in city_dir.glob("*.osm") if p.is_file()])), None)
+            bg_file = next(iter(sorted([p for p in city_dir.glob("*.png") if p.is_file()])), None)
+            blocks.append((city_id, city_dir, sorted(scenarios, key=lambda x: self._scenario_sort_key(x.name)), map_file, bg_file))
+
+        blocks.sort(key=lambda x: str(x[0]).lower())
+        return blocks
+
+    def _build_index(self) -> None:
+        split = self._SPLIT
+        by_city: Dict[str, List[str]] = defaultdict(list)
+        sid_n = 1
+        for city_id, city_dir, scenarios, map_file, bg_file in self._discover_city_blocks():
+            _ = city_dir
+            city_label = self._city_label(city_id)
+            for scen in scenarios:
+                sid = str(sid_n)
+                sid_n += 1
+                ref = _SindScenarioRef(
+                    scene_id=sid,
+                    split=split,
+                    city_id=city_id,
+                    city_label=city_label,
+                    scenario_id=scen.name,
+                    scenario_label=scen.name.replace("_", " "),
+                    veh_path=(scen / "Veh_smoothed_tracks.csv").resolve() if (scen / "Veh_smoothed_tracks.csv").exists() else None,
+                    ped_path=(scen / "Ped_smoothed_tracks.csv").resolve() if (scen / "Ped_smoothed_tracks.csv").exists() else None,
+                    tl_path=self._discover_traffic_light_file(scen),
+                    map_path=map_file.resolve() if isinstance(map_file, Path) and map_file.exists() else None,
+                    background_path=bg_file.resolve() if isinstance(bg_file, Path) and bg_file.exists() else None,
+                )
+                self._scenes[sid] = ref
+                self._scene_ids_sorted[split].append(sid)
+                by_city[city_id].append(sid)
+
+        self._scene_ids_by_city[split] = dict(by_city)
+        self._scene_index[split] = {sid: i for i, sid in enumerate(self._scene_ids_sorted[split])}
+        self._scene_index_by_city[split] = {
+            cid: {sid: i for i, sid in enumerate(ids)}
+            for cid, ids in self._scene_ids_by_city[split].items()
+        }
+
+    @staticmethod
+    def _discover_traffic_light_file(scene_dir: Path) -> Optional[Path]:
+        csvs = [p for p in scene_dir.glob("*.csv") if p.is_file()]
+        ranked: List[Tuple[int, Path]] = []
+        for p in csvs:
+            n = p.name.lower()
+            if "traffic" not in n or "meta" in n or n.startswith(".~lock"):
+                continue
+            score = 0
+            if "trafficlight" in n:
+                score += 2
+            if "traffic_lights" in n:
+                score += 1
+            ranked.append((score, p.resolve()))
+        if not ranked:
+            return None
+        ranked.sort(key=lambda x: (-x[0], str(x[1]).lower()))
+        return ranked[0][1]
+
+    def list_intersections(self, split: str) -> List[Dict[str, Any]]:
+        split = self._SPLIT
+        out = []
+        for cid, ids in self._scene_ids_by_city.get(split, {}).items():
+            out.append(
+                {
+                    "intersect_id": str(cid),
+                    "intersect_label": self._city_label(cid),
+                    "count": int(len(ids)),
+                }
+            )
+        out.sort(key=lambda x: str(x.get("intersect_label") or "").lower())
+        return out
+
+    def _list_scene_ids(self, intersect_id: Optional[str]) -> List[str]:
+        split = self._SPLIT
+        if intersect_id:
+            return list(self._scene_ids_by_city.get(split, {}).get(str(intersect_id), []))
+        return list(self._scene_ids_sorted.get(split, []))
+
+    @staticmethod
+    def _scene_label(ref: _SindScenarioRef) -> str:
+        return f"{ref.scenario_label} · {ref.city_label}"
+
+    def list_scenes(
+        self,
+        split: str,
+        intersect_id: Optional[str] = None,
+        limit: int = 200,
+        offset: int = 0,
+        include_tl_only: bool = False,
+    ) -> Dict[str, Any]:
+        split = self._SPLIT
+        ids = self._list_scene_ids(intersect_id=intersect_id)
+        if include_tl_only:
+            ids = [sid for sid in ids if self._scenes.get(sid) and self._scenes[sid].tl_path is not None]
+        total = len(ids)
+        slice_ids = ids[offset : offset + limit]
+
+        items: List[Dict[str, Any]] = []
+        n_tl = 0
+        for sid in slice_ids:
+            ref = self._scenes[sid]
+            has_tl = ref.tl_path is not None and ref.tl_path.exists()
+            if has_tl:
+                n_tl += 1
+            items.append(
+                {
+                    "scene_id": ref.scene_id,
+                    "scene_label": self._scene_label(ref),
+                    "recording_id": ref.scenario_id,
+                    "window_index": 0,
+                    "split": split,
+                    "city": ref.city_id,
+                    "intersect_id": ref.city_id,
+                    "intersect_label": ref.city_label,
+                    "by_modality": {
+                        "infra": {
+                            "rows": 0,
+                            "min_ts": None,
+                            "max_ts": None,
+                            "unique_ts": 0,
+                            "duration_s": None,
+                            "unique_agents": 0,
+                        },
+                        "traffic_light": {
+                            "rows": 0,
+                            "min_ts": None,
+                            "max_ts": None,
+                            "unique_ts": 0,
+                        } if has_tl else {"rows": 0, "min_ts": None, "max_ts": None, "unique_ts": 0},
+                    },
+                }
+            )
+
+        return {
+            "total": total,
+            "limit": int(limit),
+            "offset": int(offset),
+            "items": items,
+            "availability": {
+                "scene_count": total,
+                "by_modality": {
+                    "infra": total,
+                    "traffic_light": n_tl if slice_ids else len([sid for sid in ids if self._scenes[sid].tl_path is not None]),
+                },
+            },
+            "include_tl_only": bool(include_tl_only),
+        }
+
+    def locate_scene(self, split: str, scene_id: str) -> Dict[str, Any]:
+        split = self._SPLIT
+        sid = str(scene_id or "")
+        ref = self._scenes.get(sid)
+        if ref is None:
+            return {"split": split, "scene_id": sid, "found": False}
+        idx_all = self._scene_index.get(split, {}).get(sid)
+        idx_city = self._scene_index_by_city.get(split, {}).get(ref.city_id, {}).get(sid)
+        total_city = len(self._scene_ids_by_city.get(split, {}).get(ref.city_id, []))
+        return {
+            "split": split,
+            "scene_id": sid,
+            "found": True,
+            "city": ref.city_id,
+            "intersect_id": ref.city_id,
+            "intersect_label": ref.city_label,
+            "recording_id": ref.scenario_id,
+            "window_index": 0,
+            "index_all": idx_all,
+            "total_all": len(self._scene_ids_sorted.get(split, [])),
+            "index_in_intersection": idx_city,
+            "total_in_intersection": total_city,
+        }
+
+    @staticmethod
+    def _as_int(raw: Any) -> Optional[int]:
+        v = safe_float(raw)
+        if v is None:
+            return None
+        try:
+            return int(v)
+        except Exception:
+            return None
+
+    @staticmethod
+    def _ts_key_from_ms(raw: Any) -> Optional[int]:
+        v = safe_float(raw)
+        if v is None:
+            return None
+        return int(round(float(v) / 100.0))
+
+    @staticmethod
+    def _ts_from_key(ts_key: int) -> float:
+        return float(ts_key) / 10.0
+
+    @staticmethod
+    def _class_to_type_and_subtype(raw_cls: str) -> Tuple[str, Optional[str]]:
+        c = str(raw_cls or "").strip().lower()
+        if c in ("car", "truck", "bus", "van", "motorcycle", "tricycle"):
+            return "VEHICLE", c.upper()
+        if c in ("pedestrian", "person"):
+            return "PEDESTRIAN", "PEDESTRIAN"
+        if c in ("bicycle", "cyclist"):
+            return "BICYCLE", "BICYCLE"
+        if c in ("animal",):
+            return "ANIMAL", "ANIMAL"
+        if c:
+            return "OTHER", c.upper()
+        return "UNKNOWN", None
+
+    def _read_tracks_csv(
+        self,
+        path: Path,
+        source_tag: str,
+    ) -> Tuple[Dict[int, List[Dict[str, Any]]], Dict[str, float], int, set[str]]:
+        by_ts: Dict[int, List[Dict[str, Any]]] = defaultdict(list)
+        extent = bbox_init()
+        rows = 0
+        unique_ids: set[str] = set()
+
+        if not path.exists() or not path.is_file():
+            return {}, extent, 0, unique_ids
+
+        with path.open("r", encoding="utf-8", errors="replace", newline="") as f:
+            r = csv.DictReader(f)
+            for row in r:
+                ts_key = self._ts_key_from_ms(row.get("timestamp_ms"))
+                if ts_key is None:
+                    fr = self._as_int(row.get("frame_id"))
+                    if fr is not None:
+                        ts_key = int(fr)
+                if ts_key is None:
+                    continue
+
+                x = safe_float(row.get("x"))
+                y = safe_float(row.get("y"))
+                if x is not None and y is not None:
+                    bbox_update(extent, x, y)
+
+                track_raw = row.get("track_id")
+                if track_raw is None or str(track_raw).strip() == "":
+                    track_raw = row.get("id")
+                track_id = str(track_raw or f"row{rows+1}")
+                obj_id = f"{source_tag}:{track_id}"
+
+                cls_raw = str(row.get("agent_type") or "").strip()
+                if not cls_raw:
+                    cls_raw = "pedestrian" if source_tag == "ped" else "vehicle"
+                obj_type, sub_type = self._class_to_type_and_subtype(cls_raw)
+                theta = safe_float(row.get("heading_rad"))
+                if theta is None:
+                    theta = safe_float(row.get("yaw_rad"))
+
+                rec = {
+                    "id": obj_id,
+                    "track_id": track_id,
+                    "object_id": track_id,
+                    "type": obj_type,
+                    "sub_type": sub_type,
+                    "sub_type_code": None,
+                    "tag": source_tag,
+                    "x": x,
+                    "y": y,
+                    "z": None,
+                    "length": safe_float(row.get("length")),
+                    "width": safe_float(row.get("width")),
+                    "height": None,
+                    "theta": theta,
+                    "v_x": safe_float(row.get("vx")),
+                    "v_y": safe_float(row.get("vy")),
+                }
+                by_ts[ts_key].append(rec)
+                unique_ids.add(obj_id)
+                rows += 1
+
+        return by_ts, extent, rows, unique_ids
+
+    @staticmethod
+    def _normalize_col_name(raw: str) -> str:
+        return re.sub(r"[^a-z0-9]+", "", str(raw or "").strip().lower())
+
+    def _tl_timestamp_column(self, fieldnames: List[str]) -> Optional[str]:
+        if not fieldnames:
+            return None
+        norm = {self._normalize_col_name(x): x for x in fieldnames}
+        for key in ("timestampms", "timestamp", "timems", "time"):
+            if key in norm:
+                return norm[key]
+        for x in fieldnames:
+            n = self._normalize_col_name(x)
+            if "timestamp" in n:
+                return x
+        return None
+
+    def _tl_state_columns(self, path: Optional[Path]) -> List[str]:
+        if path is None or not path.exists() or not path.is_file():
+            return []
+        try:
+            with path.open("r", encoding="utf-8", errors="replace", newline="") as f:
+                r = csv.DictReader(f)
+                fieldnames = [str(x or "").strip() for x in (r.fieldnames or []) if str(x or "").strip()]
+        except Exception:
+            return []
+        out = []
+        for col in fieldnames:
+            n = self._normalize_col_name(col)
+            if "trafficlight" in n or ("traffic" in n and "light" in n):
+                out.append(col)
+        return out
+
+    @staticmethod
+    def _tl_color_from_value(raw: Any) -> Optional[str]:
+        s = str(raw or "").strip()
+        if s == "":
+            return None
+        low = s.lower()
+        if "red" in low:
+            return "RED"
+        if "yellow" in low:
+            return "YELLOW"
+        if "green" in low:
+            return "GREEN"
+        try:
+            v = int(float(low))
+        except Exception:
+            return None
+        if v == 0:
+            return "RED"
+        if v == 1:
+            return "YELLOW"
+        if v in (2, 3):
+            return "GREEN"
+        return None
+
+    def _read_traffic_lights_csv(
+        self,
+        path: Optional[Path],
+        anchors: List[Tuple[float, float]],
+    ) -> Tuple[Dict[int, List[Dict[str, Any]]], Dict[str, float], int]:
+        by_ts: Dict[int, List[Dict[str, Any]]] = defaultdict(list)
+        extent = bbox_init()
+        rows = 0
+        if path is None or not path.exists() or not path.is_file():
+            return {}, extent, 0
+
+        with path.open("r", encoding="utf-8", errors="replace", newline="") as f:
+            r = csv.DictReader(f)
+            fieldnames = [str(x or "").strip() for x in (r.fieldnames or []) if str(x or "").strip()]
+            ts_col = self._tl_timestamp_column(fieldnames)
+            state_cols = self._tl_state_columns(path)
+            if ts_col is None or not state_cols:
+                return {}, extent, 0
+            if not anchors:
+                anchors = [(0.0, 0.0)]
+
+            for row in r:
+                ts_key = self._ts_key_from_ms(row.get(ts_col))
+                if ts_key is None:
+                    fr = self._as_int(row.get("RawFrameID"))
+                    if fr is not None:
+                        ts_key = int(fr)
+                if ts_key is None:
+                    continue
+
+                for i, col in enumerate(state_cols):
+                    color = self._tl_color_from_value(row.get(col))
+                    if color is None:
+                        continue
+                    x, y = anchors[i % len(anchors)]
+                    bbox_update(extent, x, y)
+                    rec = {
+                        "id": f"{i+1}:{col}",
+                        "x": x,
+                        "y": y,
+                        "direction": None,
+                        "lane_id": col,
+                        "color_1": color,
+                        "remain_1": None,
+                        "color_2": None,
+                        "remain_2": None,
+                        "color_3": None,
+                        "remain_3": None,
+                    }
+                    by_ts[ts_key].append(rec)
+                    rows += 1
+
+        return by_ts, extent, rows
+
+    @staticmethod
+    def _latlon_to_local_xy(lat: float, lon: float) -> Tuple[float, float]:
+        # SinD lanelet maps encode near-origin lat/lon values in a local projection-like frame.
+        # Equirectangular scaling is sufficient for this small field of view.
+        x = float(lon) * 111319.49079327357
+        y = float(lat) * 110574.0
+        return x, y
+
+    @staticmethod
+    def _resample_polyline(points: List[Tuple[float, float]], n_out: int) -> List[Tuple[float, float]]:
+        if n_out <= 1:
+            return points[:1]
+        if len(points) <= 1:
+            return points[:]
+        if len(points) == n_out:
+            return points[:]
+        out: List[Tuple[float, float]] = []
+        span = float(len(points) - 1)
+        for i in range(n_out):
+            t = span * (float(i) / float(n_out - 1))
+            j0 = int(math.floor(t))
+            j1 = min(len(points) - 1, j0 + 1)
+            a = t - float(j0)
+            x0, y0 = points[j0]
+            x1, y1 = points[j1]
+            out.append(((1.0 - a) * x0 + a * x1, (1.0 - a) * y0 + a * y1))
+        return out
+
+    @staticmethod
+    def _downsample_polyline(points: List[Tuple[float, float]], step: int) -> List[Tuple[float, float]]:
+        s = max(1, int(step))
+        if s <= 1 or len(points) <= max(12, s * 2):
+            return points
+        idxs = list(range(0, len(points), s))
+        last = len(points) - 1
+        if idxs[-1] != last:
+            idxs.append(last)
+        out = [points[i] for i in idxs]
+        if len(out) < 2 and len(points) >= 2:
+            out = [points[0], points[-1]]
+        return out
+
+    @staticmethod
+    def _polyline_bbox(points: List[Tuple[float, float]]) -> Optional[Dict[str, float]]:
+        if not points:
+            return None
+        b = bbox_init()
+        for x, y in points:
+            bbox_update(b, x, y)
+        return b if bbox_is_valid(b) else None
+
+    @staticmethod
+    def _polygon_bbox(points: List[Tuple[float, float]]) -> Optional[Dict[str, float]]:
+        return SinDAdapter._polyline_bbox(points)
+
+    def _load_lanelet_map_parsed(self, map_path: Path, points_step: int) -> Optional[Dict[str, Any]]:
+        if map_path is None or not map_path.exists() or not map_path.is_file():
+            return None
+        step = max(1, int(points_step))
+        key = (str(map_path.resolve()), step)
+        cached = self._lanelet_map_cache.get(key)
+        if cached is not None:
+            return cached
+
+        tree = ET.parse(map_path)
+        root = tree.getroot()
+
+        nodes: Dict[str, Tuple[float, float]] = {}
+        for n in root.findall("node"):
+            nid = str(n.attrib.get("id") or "").strip()
+            lat = safe_float(n.attrib.get("lat"))
+            lon = safe_float(n.attrib.get("lon"))
+            if not nid or lat is None or lon is None:
+                continue
+            nodes[nid] = self._latlon_to_local_xy(float(lat), float(lon))
+
+        ways: Dict[str, List[str]] = {}
+        way_tags: Dict[str, Dict[str, str]] = {}
+        for w in root.findall("way"):
+            wid = str(w.attrib.get("id") or "").strip()
+            if not wid:
+                continue
+            refs = [str(nd.attrib.get("ref") or "").strip() for nd in w.findall("nd")]
+            ways[wid] = [r for r in refs if r]
+            tags = {str(t.attrib.get("k") or ""): str(t.attrib.get("v") or "") for t in w.findall("tag")}
+            way_tags[wid] = tags
+
+        def _way_points(wid: Optional[str]) -> List[Tuple[float, float]]:
+            if wid is None:
+                return []
+            refs = ways.get(wid, [])
+            pts: List[Tuple[float, float]] = []
+            for rid in refs:
+                xy = nodes.get(rid)
+                if xy is None:
+                    continue
+                if pts and abs(xy[0] - pts[-1][0]) < 1e-9 and abs(xy[1] - pts[-1][1]) < 1e-9:
+                    continue
+                pts.append(xy)
+            return pts
+
+        lanes: List[Dict[str, Any]] = []
+        stoplines: List[Dict[str, Any]] = []
+        crosswalks: List[Dict[str, Any]] = []
+        junctions: List[Dict[str, Any]] = []
+        map_bbox = bbox_init()
+
+        for rel in root.findall("relation"):
+            tags = {str(t.attrib.get("k") or ""): str(t.attrib.get("v") or "") for t in rel.findall("tag")}
+            if tags.get("type") != "lanelet":
+                continue
+
+            left_id: Optional[str] = None
+            right_id: Optional[str] = None
+            for m in rel.findall("member"):
+                if str(m.attrib.get("type") or "") != "way":
+                    continue
+                role = str(m.attrib.get("role") or "")
+                ref = str(m.attrib.get("ref") or "").strip()
+                if not ref:
+                    continue
+                if role == "left":
+                    left_id = ref
+                elif role == "right":
+                    right_id = ref
+
+            left = _way_points(left_id)
+            right = _way_points(right_id)
+            center: List[Tuple[float, float]] = []
+            if len(left) >= 2 and len(right) >= 2:
+                d_same = (left[0][0] - right[0][0]) ** 2 + (left[0][1] - right[0][1]) ** 2
+                d_same += (left[-1][0] - right[-1][0]) ** 2 + (left[-1][1] - right[-1][1]) ** 2
+                d_rev = (left[0][0] - right[-1][0]) ** 2 + (left[0][1] - right[-1][1]) ** 2
+                d_rev += (left[-1][0] - right[0][0]) ** 2 + (left[-1][1] - right[0][1]) ** 2
+                if d_rev < d_same:
+                    right = list(reversed(right))
+                n = max(len(left), len(right))
+                l2 = self._resample_polyline(left, n)
+                r2 = self._resample_polyline(right, n)
+                center = [((lp[0] + rp[0]) * 0.5, (lp[1] + rp[1]) * 0.5) for lp, rp in zip(l2, r2)]
+            elif len(left) >= 2:
+                center = left
+            elif len(right) >= 2:
+                center = right
+
+            center = self._downsample_polyline(center, step)
+            if len(center) < 2:
+                continue
+            b = self._polyline_bbox(center)
+            if b is None:
+                continue
+            bbox_update_from_bbox(map_bbox, b)
+            subtype = str(tags.get("subtype") or tags.get("location") or "road")
+            st_low = subtype.lower()
+            lanes.append(
+                {
+                    "id": str(rel.attrib.get("id") or f"lane_{len(lanes)+1}"),
+                    "lane_type": subtype,
+                    "turn_direction": None,
+                    "is_intersection": bool(("intersection" in st_low) or ("junction" in st_low)),
+                    "has_traffic_control": False,
+                    "centerline": center,
+                    "bbox": b,
+                }
+            )
+
+        for wid, tags in way_tags.items():
+            typ = str(tags.get("type") or "").strip().lower()
+            pts = self._downsample_polyline(_way_points(wid), step)
+            if len(pts) < 2:
+                continue
+            b = self._polyline_bbox(pts)
+            if b is None:
+                continue
+            if typ == "stop_line":
+                bbox_update_from_bbox(map_bbox, b)
+                stoplines.append({"id": wid, "centerline": pts, "bbox": b})
+            elif typ == "zebra":
+                poly = pts[:]
+                if len(poly) >= 3 and (poly[0][0] != poly[-1][0] or poly[0][1] != poly[-1][1]):
+                    poly.append(poly[0])
+                pb = self._polygon_bbox(poly)
+                if pb is None:
+                    continue
+                bbox_update_from_bbox(map_bbox, pb)
+                crosswalks.append({"id": wid, "polygon": poly, "bbox": pb})
+
+        parsed = {
+            "map_id": map_path.stem,
+            "map_file": map_path.name,
+            "counts": {
+                "LANE": len(lanes),
+                "STOPLINE": len(stoplines),
+                "CROSSWALK": len(crosswalks),
+                "JUNCTION": len(junctions),
+            },
+            "lanes": lanes,
+            "stoplines": stoplines,
+            "crosswalks": crosswalks,
+            "junctions": junctions,
+            "bbox": map_bbox if bbox_is_valid(map_bbox) else None,
+        }
+        self._lanelet_map_cache[key] = parsed
+        return parsed
+
+    def _clip_lanelet_map(
+        self,
+        parsed_map: Dict[str, Any],
+        extent: Dict[str, float],
+        max_lanes: int,
+        focus_xy: Optional[Tuple[float, float]] = None,
+    ) -> Dict[str, Any]:
+        def _clip_items(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+            out: List[Dict[str, Any]] = []
+            for it in items:
+                b = it.get("bbox")
+                if not isinstance(b, dict):
+                    continue
+                try:
+                    if bbox_intersects(b, extent):
+                        out.append(it)
+                except Exception:
+                    continue
+            return out
+
+        lanes = _clip_items(parsed_map.get("lanes", []) or [])
+        stoplines = _clip_items(parsed_map.get("stoplines", []) or [])
+        crosswalks = _clip_items(parsed_map.get("crosswalks", []) or [])
+        junctions = _clip_items(parsed_map.get("junctions", []) or [])
+
+        lanes_truncated = False
+        if max_lanes and len(lanes) > max_lanes:
+            if focus_xy:
+                cx, cy = focus_xy
+            else:
+                cx = (extent["min_x"] + extent["max_x"]) * 0.5
+                cy = (extent["min_y"] + extent["max_y"]) * 0.5
+
+            def _dist2(l: Dict[str, Any]) -> float:
+                b = l.get("bbox") or {}
+                mx = (float(b.get("min_x", 0.0)) + float(b.get("max_x", 0.0))) * 0.5
+                my = (float(b.get("min_y", 0.0)) + float(b.get("max_y", 0.0))) * 0.5
+                dx = mx - cx
+                dy = my - cy
+                return dx * dx + dy * dy
+
+            lanes.sort(key=_dist2)
+            lanes = lanes[: int(max_lanes)]
+            lanes_truncated = True
+
+        return {
+            "map_id": parsed_map.get("map_id"),
+            "map_file": parsed_map.get("map_file"),
+            "lanes_truncated": lanes_truncated,
+            "lanes": [
+                {
+                    "id": l.get("id"),
+                    "lane_type": l.get("lane_type"),
+                    "turn_direction": l.get("turn_direction"),
+                    "is_intersection": l.get("is_intersection"),
+                    "has_traffic_control": l.get("has_traffic_control"),
+                    "centerline": l.get("centerline") or [],
+                }
+                for l in lanes
+            ],
+            "stoplines": [{"id": x.get("id"), "centerline": x.get("centerline") or []} for x in stoplines],
+            "crosswalks": [{"id": x.get("id"), "polygon": x.get("polygon") or []} for x in crosswalks],
+            "junctions": [{"id": x.get("id"), "polygon": x.get("polygon") or []} for x in junctions],
+        }
+
+    @staticmethod
+    def _polyline_midpoint(pts: List[Tuple[float, float]]) -> Optional[Tuple[float, float]]:
+        if not pts:
+            return None
+        i = int(max(0, (len(pts) - 1) // 2))
+        x, y = pts[i]
+        return float(x), float(y)
+
+    def _traffic_light_anchors(
+        self,
+        parsed_map: Optional[Dict[str, Any]],
+        extent_hint: Optional[Dict[str, float]],
+        n: int,
+    ) -> List[Tuple[float, float]]:
+        pts: List[Tuple[float, float]] = []
+        if parsed_map:
+            for s in parsed_map.get("stoplines", []) or []:
+                mid = self._polyline_midpoint(s.get("centerline") or [])
+                if mid is not None:
+                    pts.append(mid)
+            if not pts:
+                for ln in parsed_map.get("lanes", []) or []:
+                    mid = self._polyline_midpoint(ln.get("centerline") or [])
+                    if mid is not None:
+                        pts.append(mid)
+                        if len(pts) >= 12:
+                            break
+
+        if not pts and extent_hint and bbox_is_valid(extent_hint):
+            cx = (extent_hint["min_x"] + extent_hint["max_x"]) * 0.5
+            cy = (extent_hint["min_y"] + extent_hint["max_y"]) * 0.5
+            w = max(8.0, abs(extent_hint["max_x"] - extent_hint["min_x"]))
+            h = max(8.0, abs(extent_hint["max_y"] - extent_hint["min_y"]))
+            r = 0.32 * min(w, h)
+            for i in range(max(4, n)):
+                a = (2.0 * math.pi * float(i)) / float(max(4, n))
+                pts.append((cx + r * math.cos(a), cy + r * math.sin(a)))
+
+        if not pts:
+            pts = [(0.0, 0.0)]
+
+        uniq: List[Tuple[float, float]] = []
+        seen = set()
+        for x, y in pts:
+            key = (round(float(x), 3), round(float(y), 3))
+            if key in seen:
+                continue
+            seen.add(key)
+            uniq.append((float(x), float(y)))
+        if not uniq:
+            uniq = [(0.0, 0.0)]
+
+        if n <= 0:
+            return uniq
+        out = list(uniq)
+        i = 0
+        while len(out) < n:
+            out.append(uniq[i % len(uniq)])
+            i += 1
+        return out[:n]
+
+    def _background_meta_for_scene(
+        self,
+        ref: _SindScenarioRef,
+        map_bbox: Optional[Dict[str, float]],
+    ) -> Optional[Dict[str, Any]]:
+        bg = ref.background_path
+        if bg is None or not bg.exists() or not bg.is_file():
+            return None
+        size = read_png_size(bg)
+        if not size:
+            return None
+        if map_bbox is None or not bbox_is_valid(map_bbox):
+            return None
+        w_px, h_px = size
+        if w_px <= 0 or h_px <= 0:
+            return None
+        width_m = max(1e-6, float(map_bbox["max_x"]) - float(map_bbox["min_x"]))
+        height_m = max(1e-6, float(map_bbox["max_y"]) - float(map_bbox["min_y"]))
+        meters_per_px = 0.5 * (width_m / float(w_px) + height_m / float(h_px))
+        return {
+            "kind": "scene_image",
+            "path": str(bg),
+            "size_px": {"width": int(w_px), "height": int(h_px)},
+            "meters_per_px": float(meters_per_px),
+            "extent": {
+                "min_x": float(map_bbox["min_x"]),
+                "max_x": float(map_bbox["max_x"]),
+                "min_y": float(map_bbox["min_y"]),
+                "max_y": float(map_bbox["max_y"]),
+            },
+        }
+
+    def get_scene_background(self, split: str, scene_id: str) -> Optional[Path]:
+        split = self._SPLIT
+        sid = str(scene_id or "")
+        ref = self._scenes.get(sid)
+        if ref is None:
+            return None
+        bg = ref.background_path
+        if bg is None or not bg.exists() or not bg.is_file():
+            return None
+        return bg
+
+    def load_scene_bundle(
+        self,
+        split: str,
+        scene_id: str,
+        include_map: bool = True,
+        map_padding: float = 60.0,
+        map_points_step: int = 5,
+        max_lanes: int = 4000,
+        map_clip: str = "intersection",
+    ) -> Dict[str, Any]:
+        split = self._SPLIT
+        sid = str(scene_id or "")
+        ref = self._scenes.get(sid)
+        if ref is None:
+            raise KeyError(f"scene not found: {sid}")
+
+        warnings: List[str] = []
+        infra_by_ts: Dict[int, List[Dict[str, Any]]] = defaultdict(list)
+        tl_by_ts: Dict[int, List[Dict[str, Any]]] = defaultdict(list)
+        extent = bbox_init()
+        rows_infra = 0
+        unique_agents: set[str] = set()
+
+        for src_tag, path in (("veh", ref.veh_path), ("ped", ref.ped_path)):
+            if path is None:
+                continue
+            by_ts, ext, rows, ids = self._read_tracks_csv(path, source_tag=src_tag)
+            for k, arr in by_ts.items():
+                infra_by_ts[k].extend(arr)
+            if bbox_is_valid(ext):
+                bbox_update_from_bbox(extent, ext)
+            rows_infra += int(rows)
+            unique_agents.update(ids)
+
+        parsed_map: Optional[Dict[str, Any]] = None
+        map_out: Optional[Dict[str, Any]] = None
+        map_id: Optional[str] = None
+        if ref.map_path is not None:
+            try:
+                parsed_map = self._load_lanelet_map_parsed(ref.map_path, points_step=map_points_step)
+            except Exception as e:
+                warnings.append(f"map_load_failed:{e}")
+
+        tl_rows = 0
+        if ref.tl_path is not None:
+            tl_cols = self._tl_state_columns(ref.tl_path)
+            anchors = self._traffic_light_anchors(parsed_map, extent if bbox_is_valid(extent) else None, len(tl_cols))
+            tl_loaded, tl_extent, tl_rows = self._read_traffic_lights_csv(ref.tl_path, anchors=anchors)
+            for k, arr in tl_loaded.items():
+                tl_by_ts[k].extend(arr)
+            if bbox_is_valid(tl_extent):
+                bbox_update_from_bbox(extent, tl_extent)
+
+        if not bbox_is_valid(extent):
+            if parsed_map and parsed_map.get("bbox") and bbox_is_valid(parsed_map["bbox"]):
+                extent = dict(parsed_map["bbox"])
+                warnings.append("extent_from_map_bbox")
+            else:
+                extent = {"min_x": -10.0, "min_y": -10.0, "max_x": 10.0, "max_y": 10.0}
+                warnings.append("extent_missing")
+
+        if include_map:
+            if parsed_map is None:
+                warnings.append("map_missing")
+            elif parsed_map.get("bbox") is not None:
+                if map_clip == "scene":
+                    clip_extent = bbox_pad(extent, map_padding)
+                else:
+                    clip_extent = parsed_map["bbox"]
+                focus_xy = (
+                    (extent["min_x"] + extent["max_x"]) * 0.5,
+                    (extent["min_y"] + extent["max_y"]) * 0.5,
+                )
+                map_out = self._clip_lanelet_map(parsed_map, clip_extent, max_lanes=max_lanes, focus_xy=focus_xy)
+                map_out["clip_mode"] = str(map_clip or "intersection")
+                map_out["clip_extent"] = clip_extent
+                map_out["points_step"] = int(max(1, map_points_step))
+                map_out["counts"] = dict(parsed_map.get("counts") or {})
+                map_out["bbox"] = parsed_map.get("bbox")
+                map_id = str(parsed_map.get("map_id") or "") or None
+            else:
+                warnings.append("map_empty")
+
+        all_keys = sorted(set(infra_by_ts.keys()) | set(tl_by_ts.keys()))
+        timestamps = [self._ts_from_key(k) for k in all_keys]
+        t0 = timestamps[0] if timestamps else 0.0
+        frames = [{"infra": infra_by_ts.get(k, []), "traffic_light": tl_by_ts.get(k, [])} for k in all_keys]
+
+        if rows_infra <= 0:
+            warnings.append("scene_window_empty")
+        if ref.tl_path is not None and tl_rows <= 0:
+            warnings.append("traffic_light_empty")
+
+        modality_stats = {
+            "ego": {"rows": 0, "unique_ts": 0, "min_ts": None, "max_ts": None},
+            "vehicle": {"rows": 0, "unique_ts": 0, "min_ts": None, "max_ts": None},
+            "infra": {
+                "rows": int(rows_infra),
+                "unique_ts": int(len(infra_by_ts)),
+                "min_ts": min((self._ts_from_key(k) for k in infra_by_ts.keys()), default=None),
+                "max_ts": max((self._ts_from_key(k) for k in infra_by_ts.keys()), default=None),
+                "unique_agents": int(len(unique_agents)),
+            },
+            "traffic_light": {
+                "rows": int(tl_rows),
+                "unique_ts": int(len(tl_by_ts)),
+                "min_ts": min((self._ts_from_key(k) for k in tl_by_ts.keys()), default=None),
+                "max_ts": max((self._ts_from_key(k) for k in tl_by_ts.keys()), default=None),
+            },
+        }
+
+        background = self._background_meta_for_scene(ref, parsed_map.get("bbox") if parsed_map else None)
+        if background is not None:
+            background["url"] = f"/api/datasets/{self.spec.id}/scene/{split}/{sid}/background"
+
+        return {
+            "dataset_id": self.spec.id,
+            "split": split,
+            "scene_id": sid,
+            "scene_label": self._scene_label(ref),
+            "city": ref.city_id,
+            "intersect_id": ref.city_id,
+            "intersect_label": ref.city_label,
+            "recording_id": ref.scenario_id,
+            "recording_label": ref.scenario_label,
+            "window_index": 0,
+            "window_count": 1,
+            "intersect_by_modality": {
+                "infra": ref.city_id,
+                "traffic_light": ref.city_id,
+            },
+            "map_id": map_id,
+            "t0": t0,
+            "timestamps": timestamps,
+            "extent": extent,
+            "map": map_out,
+            "background": background,
+            "modality_stats": modality_stats,
+            "frames": frames,
+            "warnings": warnings,
+        }
+
+
 @dataclass
 class _CpmWindowIndex:
     bucket: int
@@ -1203,6 +3482,8 @@ class _CpmSensorIndex:
     sensor_label: str
     path: Path
     header: str
+    row_filter_field: Optional[str]
+    row_filter_value: Optional[str]
     t0_ms: int
     window_ms: int
     windows: List[_CpmWindowIndex]
@@ -1236,13 +3517,35 @@ class CpmObjectsAdapter:
     # - but short enough to load quickly (especially for dense LiDAR logs)
     DEFAULT_WINDOW_S = 300
     DEFAULT_GAP_S = 120
+    DEFAULT_FRAME_BIN_MS = 100
+    _CPM_ALIASES: Dict[str, Tuple[str, ...]] = {
+        "generationTime_ms": ("generationTime_ms", "generation_time_ms", "generationtime", "timestamp_ms", "gen_time_ms"),
+        "trackID": ("track_id", "trackID", "trackId", "track"),
+        "objectID": ("objectID", "object_id", "track_id", "id"),
+        "rsu": ("rsu", "rsu_id", "sensor_id", "sensor"),
+        "xDistance_m": ("xDistance_m", "x_distance_m", "x_distance", "xdist_m", "north_m"),
+        "yDistance_m": ("yDistance_m", "y_distance_m", "y_distance", "ydist_m", "east_m"),
+        "xSpeed_mps": ("xSpeed_mps", "x_speed_mps", "vx_mps", "speed_x_mps", "north_speed_mps"),
+        "ySpeed_mps": ("ySpeed_mps", "y_speed_mps", "vy_mps", "speed_y_mps", "east_speed_mps"),
+        "yawAngle_deg": ("yawAngle_deg", "yaw_angle_deg", "heading_deg", "yaw_deg"),
+        "classificationType": ("classificationType", "classification_type", "class_id", "object_class"),
+        "objLength_m": ("objLength_m", "obj_length_m", "length_m"),
+        "objWidth_m": ("objWidth_m", "obj_width_m", "width_m"),
+        "objHeight_m": ("objHeight_m", "obj_height_m", "height_m"),
+    }
 
     def __init__(self, spec: DatasetSpec, window_s: int | None = None, gap_s: int | None = None) -> None:
         self.spec = spec
-        self.window_s = int(window_s or self.DEFAULT_WINDOW_S)
+        self._bindings = spec.bindings if isinstance(spec.bindings, dict) else {}
+        strategy = spec.scene_strategy if isinstance(spec.scene_strategy, dict) else {}
+        strategy_window = strategy.get("window_s")
+        strategy_gap = strategy.get("gap_s")
+        strategy_bin = strategy.get("frame_bin_ms")
+        self.window_s = int(window_s or strategy_window or self.DEFAULT_WINDOW_S)
         self.window_ms = max(1, self.window_s) * 1000
-        self.gap_s = int(gap_s or self.DEFAULT_GAP_S)
+        self.gap_s = int(gap_s or strategy_gap or self.DEFAULT_GAP_S)
         self.gap_ms = max(0, self.gap_s) * 1000
+        self.frame_bin_ms = max(1, int(strategy_bin or self.DEFAULT_FRAME_BIN_MS))
 
         self._sensors: Dict[str, _CpmSensorIndex] = {}
         self._scenes: Dict[str, _CpmSceneRef] = {}
@@ -1252,6 +3555,155 @@ class CpmObjectsAdapter:
         self._scene_index_by_sensor: Dict[str, Dict[str, Dict[str, int]]] = {"all": {}}
 
         self._build_index()
+
+    def _bucket_ts_ms(self, ts_ms: int) -> int:
+        b = int(self.frame_bin_ms)
+        if b <= 1:
+            return int(ts_ms)
+        # Keep stable temporal ordering while coalescing close timestamps into one frame.
+        return int(ts_ms // b) * b
+
+    @staticmethod
+    def _norm_col(s: Any) -> str:
+        return re.sub(r"[^a-z0-9]+", "", str(s or "").strip().lower())
+
+    def _binding_obj(self, role: str) -> Dict[str, Any]:
+        v = self._bindings.get(role) if isinstance(self._bindings, dict) else None
+        return v if isinstance(v, dict) else {}
+
+    def _binding_paths(self, role: str) -> List[Path]:
+        obj = self._binding_obj(role)
+        out: List[Path] = []
+        if isinstance(obj.get("paths"), list):
+            for raw in obj.get("paths"):
+                try:
+                    p = Path(str(raw)).expanduser().resolve()
+                except Exception:
+                    continue
+                out.append(p)
+        elif obj.get("path"):
+            try:
+                out.append(Path(str(obj.get("path"))).expanduser().resolve())
+            except Exception:
+                pass
+        return out
+
+    def _binding_column_map(self) -> Dict[str, str]:
+        obj = self._binding_obj("cpm_logs")
+        raw = obj.get("column_map")
+        if not isinstance(raw, dict):
+            return {}
+        out: Dict[str, str] = {}
+        for k, v in raw.items():
+            kk = str(k or "").strip()
+            vv = str(v or "").strip()
+            if kk and vv:
+                out[kk] = vv
+        return out
+
+    def _binding_delimiter(self) -> str:
+        obj = self._binding_obj("cpm_logs")
+        raw = str(obj.get("delimiter") or ",")
+        if raw not in (",", ";", "\t"):
+            return ","
+        return raw
+
+    def _binding_encoding(self) -> str:
+        obj = self._binding_obj("cpm_logs")
+        enc = str(obj.get("encoding") or "utf-8").strip().lower()
+        if not enc:
+            return "utf-8"
+        return enc
+
+    def _resolve_field_map(self, fieldnames: Iterable[str]) -> Dict[str, str]:
+        fields = [str(x or "").strip() for x in fieldnames]
+        by_norm: Dict[str, str] = {}
+        for f in fields:
+            n = self._norm_col(f)
+            if n and n not in by_norm:
+                by_norm[n] = f
+
+        out: Dict[str, str] = {}
+        # Prefer canonical columns whenever they exist in the file.
+        for canonical in self._CPM_ALIASES.keys():
+            got = by_norm.get(self._norm_col(canonical))
+            if got:
+                out[canonical] = got
+
+        explicit = self._binding_column_map()
+        for canonical, actual in explicit.items():
+            if canonical in out:
+                continue
+            if actual in fields:
+                out[canonical] = actual
+
+        for canonical, aliases in self._CPM_ALIASES.items():
+            if canonical in out:
+                continue
+            for alias in aliases:
+                got = by_norm.get(self._norm_col(alias))
+                if got:
+                    out[canonical] = got
+                    break
+        return out
+
+    def _row_value(self, row: Dict[str, Any], field_map: Dict[str, str], canonical: str) -> Any:
+        key = field_map.get(canonical)
+        if not key:
+            return None
+        return row.get(key)
+
+    @staticmethod
+    def _as_int_ms(raw: Any) -> Optional[int]:
+        v = safe_float(raw)
+        if v is None:
+            return None
+        try:
+            return int(v)
+        except Exception:
+            return None
+
+    def _open_reader_with_map(self, path: Path) -> Tuple[Any, Any, Dict[str, str], str]:
+        encoding = self._binding_encoding()
+        pref = self._binding_delimiter()
+        candidates: List[str] = []
+        for d in (pref, ",", ";", "\t"):
+            if d not in candidates:
+                candidates.append(d)
+
+        fallback: Optional[Tuple[Any, Any, Dict[str, str], str]] = None
+        for d in candidates:
+            f = path.open("r", encoding=encoding, errors="replace", newline="")
+            r = csv.DictReader(f, delimiter=d)
+            fmap = self._resolve_field_map(r.fieldnames or [])
+            if "generationTime_ms" in fmap:
+                return f, r, fmap, d
+            if fallback is None:
+                fallback = (f, r, fmap, d)
+            else:
+                f.close()
+
+        if fallback is not None:
+            return fallback
+
+        # Defensive fallback.
+        f = path.open("r", encoding=encoding, errors="replace", newline="")
+        r = csv.DictReader(f, delimiter=pref)
+        fmap = self._resolve_field_map(r.fieldnames or [])
+        return f, r, fmap, pref
+
+    def _looks_like_cpm_csv(self, path: Path) -> bool:
+        try:
+            with path.open("r", encoding="utf-8", errors="replace") as f:
+                header_line = f.readline().strip()
+        except Exception:
+            return False
+        if not header_line:
+            return False
+        delimiter = "," if header_line.count(",") >= header_line.count(";") else ";"
+        fields = [x.strip() for x in header_line.split(delimiter)]
+        fmap = self._resolve_field_map(fields)
+        return all(k in fmap for k in ("generationTime_ms", "xDistance_m", "yDistance_m"))
 
     @staticmethod
     def _sensor_id_from_rel(rel: Path) -> str:
@@ -1278,121 +3730,179 @@ class CpmObjectsAdapter:
             if m:
                 date = self._fmt_date_from_yyyymmdd(m.group(1))
                 return f"Thermal camera ({date})"
-            return "Thermal camera"
+            return f"Thermal camera {rel.name}"
         return rel.stem
 
     def _discover_csv_files(self) -> List[Path]:
+        # Keep bound file list (from profile detection), but also rescan root and
+        # merge in any missing logs. This makes the app resilient to partial or
+        # stale saved bindings when users add new files later.
+        bound = [p for p in self._binding_paths("cpm_logs") if p.exists() and p.is_file()]
+        merged: List[Path] = []
+        seen = set()
+        for p in sorted(bound):
+            k = str(p.resolve())
+            if k in seen:
+                continue
+            seen.add(k)
+            merged.append(p.resolve())
+
         root = self.spec.root
-        if not root.exists():
-            return []
-        files = sorted(root.glob("**/*cpm-objects.csv"))
-        return [p for p in files if p.is_file()]
-
-    def _index_one_csv(self, path: Path) -> _CpmSensorIndex:
-        rel = path.relative_to(self.spec.root)
-        sensor_id = self._sensor_id_from_rel(rel)
-        sensor_label = self._sensor_label_from_rel(rel)
-
-        with path.open("rb") as fb:
-            header_bytes = fb.readline()
-            header = header_bytes.decode("utf-8", errors="replace")
-            t0_ms: Optional[int] = None
-
-            windows_raw: List[Dict[str, Any]] = []
-            cur: Optional[Dict[str, Any]] = None
-            last_frame_ms: Optional[int] = None
-
-            while True:
-                pos = fb.tell()
-                line = fb.readline()
-                if not line:
-                    break
-                comma = line.find(b",")
-                if comma <= 0:
+        if root.exists():
+            files = sorted(root.glob("**/*.csv"))
+            for p in files:
+                if not p.is_file():
                     continue
+                if not self._looks_like_cpm_csv(p):
+                    continue
+                k = str(p.resolve())
+                if k in seen:
+                    continue
+                seen.add(k)
+                merged.append(p.resolve())
+        return merged
+
+    def _index_one_csv(self, path: Path) -> List[_CpmSensorIndex]:
+        try:
+            rel = path.relative_to(self.spec.root)
+        except Exception:
+            rel = Path(path.name)
+        base_sensor_id = self._sensor_id_from_rel(rel)
+        base_sensor_label = self._sensor_label_from_rel(rel)
+        try:
+            with path.open("r", encoding=self._binding_encoding(), errors="replace") as f0:
+                header = f0.readline()
+        except Exception:
+            header = ""
+
+        # A CPM file can contain multiple physical sensors (e.g., LiDAR RSUs).
+        # Index them separately for clearer UI and stable playback.
+        per_sensor_ts: Dict[str, Counter] = defaultdict(Counter)
+        sensor_meta: Dict[str, Tuple[str, Optional[str], Optional[str]]] = {}
+        found_any = False
+
+        f = None
+        try:
+            f, r, field_map, _ = self._open_reader_with_map(path)
+            rsu_col = field_map.get("rsu")
+            for row in r:
+                ts_ms = self._as_int_ms(self._row_value(row, field_map, "generationTime_ms"))
+                if ts_ms is None:
+                    continue
+                found_any = True
+                ts_b = self._bucket_ts_ms(int(ts_ms))
+
+                rsu_val: Optional[str] = None
+                if rsu_col:
+                    try:
+                        rs = row.get(rsu_col)
+                        rsu_val = str(rs).strip() if rs is not None else None
+                    except Exception:
+                        rsu_val = None
+                    if rsu_val == "":
+                        rsu_val = None
+
+                if rsu_val:
+                    rsu_norm = re.sub(r"[^a-zA-Z0-9_-]+", "_", rsu_val)
+                    sensor_id = f"{base_sensor_id}__{rsu_norm}"
+                    sensor_label = f"LiDAR {rsu_val}"
+                    per_sensor_ts[sensor_id][ts_b] += 1
+                    if sensor_id not in sensor_meta:
+                        sensor_meta[sensor_id] = (sensor_label, rsu_col, rsu_val)
+                else:
+                    per_sensor_ts[base_sensor_id][ts_b] += 1
+                    if base_sensor_id not in sensor_meta:
+                        sensor_meta[base_sensor_id] = (base_sensor_label, None, None)
+        finally:
+            if f is not None:
                 try:
-                    g = int(line[:comma])
+                    f.close()
                 except Exception:
-                    continue
+                    pass
 
-                if t0_ms is None:
-                    t0_ms = g
+        if not found_any:
+            return []
 
-                is_new_frame = (last_frame_ms != g)
-
-                # Start a new window if:
-                # - we see a large time gap between frames (prevents "teleporting" during playback)
-                # - or the window grows past the cap (keeps interactive performance predictable)
-                if cur is None:
-                    cur = {
-                        "bucket": int(len(windows_raw)),
-                        "offset_start": int(pos),
-                        "first_ts_ms": int(g),
-                        "last_ts_ms": int(g),
-                        "rows": 0,
-                        "frames": 0,
-                    }
-                    windows_raw.append(cur)
-                elif is_new_frame and last_frame_ms is not None:
-                    gap = int(g - last_frame_ms)
-                    dur = int(g - int(cur["first_ts_ms"]))
-                    if gap > self.gap_ms or dur >= self.window_ms:
-                        cur = {
-                            "bucket": int(len(windows_raw)),
-                            "offset_start": int(pos),
-                            "first_ts_ms": int(g),
-                            "last_ts_ms": int(g),
-                            "rows": 0,
-                            "frames": 0,
-                        }
-                        windows_raw.append(cur)
-
-                cur["rows"] += 1
-                if is_new_frame:
-                    cur["frames"] += 1
-                    last_frame_ms = g
-                cur["last_ts_ms"] = int(g)
-
-            if t0_ms is None:
-                t0_ms = 0
-
-            eof = fb.tell()
+        out: List[_CpmSensorIndex] = []
+        for sensor_id, ts_counts in sorted(per_sensor_ts.items(), key=lambda kv: kv[0]):
             windows: List[_CpmWindowIndex] = []
-            for i, w in enumerate(windows_raw):
-                off0 = int(w["offset_start"])
-                off1 = int(windows_raw[i + 1]["offset_start"]) if i + 1 < len(windows_raw) else int(eof)
-                b = int(w["bucket"])
-                start_ms = int(w["first_ts_ms"])
-                end_ms = int(min(int(w["last_ts_ms"]), start_ms + self.window_ms))
+            ts_sorted = sorted(ts_counts.keys())
+            if ts_sorted:
+                bucket = 0
+                cur_first = int(ts_sorted[0])
+                cur_last = int(ts_sorted[0])
+                cur_rows = int(ts_counts[cur_first])
+                cur_frames = 1
+                prev = cur_last
+
+                for ts in ts_sorted[1:]:
+                    g = int(ts)
+                    gap = g - prev
+                    dur = g - cur_first
+                    if gap > self.gap_ms or dur >= self.window_ms:
+                        windows.append(
+                            _CpmWindowIndex(
+                                bucket=bucket,
+                                start_ms=cur_first,
+                                end_ms=cur_last,
+                                first_ts_ms=cur_first,
+                                last_ts_ms=cur_last,
+                                offset_start=0,
+                                offset_end=0,
+                                rows=int(cur_rows),
+                                frames=int(cur_frames),
+                            )
+                        )
+                        bucket += 1
+                        cur_first = g
+                        cur_last = g
+                        cur_rows = int(ts_counts[g])
+                        cur_frames = 1
+                    else:
+                        cur_last = g
+                        cur_rows += int(ts_counts[g])
+                        cur_frames += 1
+                    prev = g
+
                 windows.append(
                     _CpmWindowIndex(
-                        bucket=b,
-                        start_ms=start_ms,
-                        end_ms=end_ms,
-                        first_ts_ms=int(w["first_ts_ms"]),
-                        last_ts_ms=int(w["last_ts_ms"]),
-                        offset_start=off0,
-                        offset_end=off1,
-                        rows=int(w["rows"]),
-                        frames=int(w["frames"]),
+                        bucket=bucket,
+                        start_ms=cur_first,
+                        end_ms=cur_last,
+                        first_ts_ms=cur_first,
+                        last_ts_ms=cur_last,
+                        offset_start=0,
+                        offset_end=0,
+                        rows=int(cur_rows),
+                        frames=int(cur_frames),
                     )
                 )
+                t0_ms = int(ts_sorted[0])
+            else:
+                t0_ms = 0
 
-        return _CpmSensorIndex(
-            sensor_id=sensor_id,
-            sensor_label=sensor_label,
-            path=path,
-            header=header,
-            t0_ms=int(t0_ms),
-            window_ms=self.window_ms,
-            windows=windows,
-        )
+            label, filt_field, filt_value = sensor_meta.get(sensor_id, (base_sensor_label, None, None))
+            out.append(
+                _CpmSensorIndex(
+                    sensor_id=sensor_id,
+                    sensor_label=label,
+                    path=path,
+                    header=header,
+                    row_filter_field=filt_field,
+                    row_filter_value=filt_value,
+                    t0_ms=int(t0_ms),
+                    window_ms=self.window_ms,
+                    windows=windows,
+                )
+            )
+        return out
 
     def _build_index(self) -> None:
         files = self._discover_csv_files()
         for path in files:
-            idx = self._index_one_csv(path)
-            self._sensors[idx.sensor_id] = idx
+            items = self._index_one_csv(path)
+            for idx in items:
+                self._sensors[idx.sensor_id] = idx
 
         # Flatten into global, stable scene ordering.
         flat: List[Tuple[str, int, int]] = []
@@ -1436,7 +3946,15 @@ class CpmObjectsAdapter:
                     "count": len(self._scene_ids_by_sensor[split].get(s.sensor_id, [])),
                 }
             )
-        items.sort(key=lambda it: (-int(it["count"]), str(it["intersect_label"])))
+        # Prefer LiDAR streams first in UI ordering; thermal camera can stay available.
+        def _sensor_rank(label: str) -> int:
+            lab = str(label or "").lower()
+            if lab.startswith("lidar"):
+                return 0
+            if lab.startswith("thermal"):
+                return 1
+            return 2
+        items.sort(key=lambda it: (_sensor_rank(it.get("intersect_label")), -int(it["count"]), str(it["intersect_label"])))
         return items
 
     def list_scenes(
@@ -1528,63 +4046,25 @@ class CpmObjectsAdapter:
     @staticmethod
     def _class_to_type_and_subtype(classification_type: Optional[int]) -> Tuple[str, Optional[str]]:
         """
-        Decode PerceptionSensorData.ObjectType from sensor_interface-v1.2.1.proto.
-
-        We keep `type` aligned with the existing viewer's high-level filters, and
-        put fine-grained labels in `sub_type`.
+        Consider.it CPM class mapping:
+        - 0: VEHICLE
+        - 1: VRU
+        Some legacy exports may still contain broader proto ids; collapse them
+        to the same two-class taxonomy for a consistent viewer experience.
         """
         if classification_type is None:
             return "UNKNOWN", None
 
-        # Vehicle types (0..11)
         if classification_type == 0:
-            return "VEHICLE", "UNKNOWN"
+            return "VEHICLE", "VEHICLE"
         if classification_type == 1:
-            return "VEHICLE", "MOPED"
-        if classification_type == 2:
-            return "VEHICLE", "MOTORCYCLE"
-        if classification_type == 3:
-            return "VEHICLE", "CAR"
-        if classification_type == 4:
-            return "VEHICLE", "BUS"
-        if classification_type == 5:
-            return "VEHICLE", "LIGHT_TRUCK"
-        if classification_type == 6:
-            return "VEHICLE", "HEAVY_TRUCK"
-        if classification_type == 7:
-            return "VEHICLE", "TRAILER"
-        if classification_type == 8:
-            return "VEHICLE", "SPECIAL_VEHICLE"
-        if classification_type == 9:
-            return "VEHICLE", "TRAM"
-        if classification_type == 10:
-            return "VEHICLE", "EMERGENCY_VEHICLE"
-        if classification_type == 11:
-            return "VEHICLE", "AGRICULTURAL"
+            return "VRU", "VRU"
 
-        # Person types (12..18). Map cyclist (15) to BICYCLE for existing filters.
-        if classification_type == 12:
-            return "PEDESTRIAN", "PERSON_UNKNOWN"
-        if classification_type == 13:
-            return "PEDESTRIAN", "PEDESTRIAN"
-        if classification_type == 14:
-            return "PEDESTRIAN", "WHEELCHAIR"
-        if classification_type == 15:
-            return "BICYCLE", "CYCLIST"
-        if classification_type == 16:
-            return "PEDESTRIAN", "STROLLER"
-        if classification_type == 17:
-            return "PEDESTRIAN", "SKATES"
-        if classification_type == 18:
-            return "PEDESTRIAN", "PERSON_GROUP"
-
-        # Animal / other
-        if classification_type == 19:
-            return "ANIMAL", "ANIMAL"
-        if classification_type == 20:
-            return "OTHER", "OTHER_UNKNOWN"
-        if classification_type == 21:
-            return "RSU", "ROADSIDE_UNIT"
+        # Legacy proto ranges, collapsed to the same two classes.
+        if 2 <= classification_type <= 11:
+            return "VEHICLE", "VEHICLE"
+        if 12 <= classification_type <= 21:
+            return "VRU", "VRU"
 
         return "UNKNOWN", None
 
@@ -1607,80 +4087,96 @@ class CpmObjectsAdapter:
         warnings: List[str] = []
         w = ref.window
 
-        # Read just the window region (between stored byte offsets).
-        try:
-            with ref.path.open("rb") as fb:
-                header = self._sensors[ref.sensor_id].header
-                fb.seek(w.offset_start)
-                chunk = fb.read(max(0, w.offset_end - w.offset_start))
-                text = header + chunk.decode("utf-8", errors="replace")
-        except Exception as e:
-            raise RuntimeError(f"failed to read scene window from {ref.path}: {e}")
-
         by_ts: Dict[int, List[Dict[str, Any]]] = defaultdict(list)
         extent = bbox_init()
         rows = 0
         obj_ids = set()
 
-        r = csv.DictReader(io.StringIO(text))
-        for row in r:
-            rows += 1
-            g_ms = safe_float(row.get("generationTime_ms"))
-            if g_ms is None:
-                continue
-            ts_ms = int(g_ms)
+        f = None
+        try:
+            f, r, field_map, _ = self._open_reader_with_map(ref.path)
+            sensor_idx = self._sensors.get(ref.sensor_id)
+            filter_field = sensor_idx.row_filter_field if sensor_idx else None
+            filter_value = sensor_idx.row_filter_value if sensor_idx else None
+            for row in r:
+                if filter_field and filter_value is not None:
+                    rv = row.get(filter_field)
+                    if str(rv).strip() != str(filter_value):
+                        continue
 
-            oid = row.get("objectID")
-            obj_ids.add(oid)
+                ts_ms_raw = self._as_int_ms(self._row_value(row, field_map, "generationTime_ms"))
+                if ts_ms_raw is None:
+                    continue
+                ts_ms = self._bucket_ts_ms(int(ts_ms_raw))
+                if ts_ms is None:
+                    continue
+                if ts_ms < w.start_ms or ts_ms > w.end_ms:
+                    continue
+                rows += 1
 
-            # Dataset frame is local to the sensor:
-            # proto says xDistance=meters north, yDistance=meters east -> convert to (x=east, y=north)
-            y_north = safe_float(row.get("xDistance_m"))
-            x_east = safe_float(row.get("yDistance_m"))
-            x = x_east
-            y = y_north
-            if x is not None and y is not None:
-                bbox_update(extent, x, y)
+                track_id = self._row_value(row, field_map, "trackID")
+                oid_raw = self._row_value(row, field_map, "objectID")
+                oid = track_id if track_id not in (None, "") else oid_raw
+                obj_ids.add(oid)
 
-            vx_north = safe_float(row.get("xSpeed_mps"))
-            vy_east = safe_float(row.get("ySpeed_mps"))
-            v_x = vy_east
-            v_y = vx_north
+                # Dataset frame is local to the sensor:
+                # proto says xDistance=meters north, yDistance=meters east -> convert to (x=east, y=north)
+                y_north = safe_float(self._row_value(row, field_map, "xDistance_m"))
+                x_east = safe_float(self._row_value(row, field_map, "yDistance_m"))
+                x = x_east
+                y = y_north
+                if x is not None and y is not None:
+                    bbox_update(extent, x, y)
 
-            yaw_deg = safe_float(row.get("yawAngle_deg"))
-            theta = None
-            if yaw_deg is not None:
-                # yaw is clockwise from north -> theta is CCW from east (x axis)
-                theta = math.radians(90.0 - float(yaw_deg))
+                vx_north = safe_float(self._row_value(row, field_map, "xSpeed_mps"))
+                vy_east = safe_float(self._row_value(row, field_map, "ySpeed_mps"))
+                v_x = vy_east
+                v_y = vx_north
 
-            cls = row.get("classificationType")
-            cls_i: Optional[int] = None
-            try:
-                if cls not in (None, ""):
-                    cls_i = int(float(cls))
-            except Exception:
-                cls_i = None
+                yaw_deg = safe_float(self._row_value(row, field_map, "yawAngle_deg"))
+                theta = None
+                if yaw_deg is not None:
+                    # yaw is clockwise from north -> theta is CCW from east (x axis)
+                    theta = math.radians(90.0 - float(yaw_deg))
 
-            rec = {
-                "id": oid,
-                "type": None,
-                "sub_type": None,
-                "sub_type_code": cls_i,
-                "tag": ref.sensor_id,
-                "x": x,
-                "y": y,
-                "z": None,
-                "length": safe_float(row.get("objLength_m")),
-                "width": safe_float(row.get("objWidth_m")),
-                "height": safe_float(row.get("objHeight_m")),
-                "theta": theta,
-                "v_x": v_x,
-                "v_y": v_y,
-            }
-            t, st = self._class_to_type_and_subtype(cls_i)
-            rec["type"] = t
-            rec["sub_type"] = st
-            by_ts[ts_ms].append(rec)
+                cls = self._row_value(row, field_map, "classificationType")
+                cls_i: Optional[int] = None
+                try:
+                    if cls not in (None, ""):
+                        cls_i = int(float(cls))
+                except Exception:
+                    cls_i = None
+
+                rec = {
+                    "id": oid,
+                    "track_id": track_id,
+                    "object_id": oid_raw,
+                    "type": None,
+                    "sub_type": None,
+                    "sub_type_code": cls_i,
+                    "tag": ref.sensor_id,
+                    "x": x,
+                    "y": y,
+                    "z": None,
+                    "length": safe_float(self._row_value(row, field_map, "objLength_m")),
+                    "width": safe_float(self._row_value(row, field_map, "objWidth_m")),
+                    "height": safe_float(self._row_value(row, field_map, "objHeight_m")),
+                    "theta": theta,
+                    "v_x": v_x,
+                    "v_y": v_y,
+                }
+                t, st = self._class_to_type_and_subtype(cls_i)
+                rec["type"] = t
+                rec["sub_type"] = st
+                by_ts[ts_ms].append(rec)
+        except Exception as e:
+            raise RuntimeError(f"failed to read scene window from {ref.path}: {e}")
+        finally:
+            if f is not None:
+                try:
+                    f.close()
+                except Exception:
+                    pass
 
         ts_list = sorted(by_ts.keys())
         timestamps = [float(t) / 1000.0 for t in ts_list]
@@ -1689,6 +4185,8 @@ class CpmObjectsAdapter:
         if not bbox_is_valid(extent):
             extent = {"min_x": -10.0, "min_y": -10.0, "max_x": 10.0, "max_y": 10.0}
             warnings.append("extent_missing: could not compute extent from window rows")
+        if rows == 0:
+            warnings.append("scene_window_empty")
 
         frames: List[Dict[str, Any]] = []
         for ts in ts_list:
@@ -1831,9 +4329,65 @@ def load_registry(repo_root: Path) -> List[DatasetSpec]:
             raw_local = {}
 
     raw = _merge_registry(raw_base, raw_local) if raw_local else raw_base
+    datasets_raw = list(raw.get("datasets", []) or [])
+
+    # Append profile-backed dataset entries. This keeps static registry datasets
+    # working as before while allowing per-user local dataset connections.
+    try:
+        prof_entries = load_profile_dataset_entries(repo_root)
+    except Exception:
+        prof_entries = []
+    if prof_entries:
+        by_id: Dict[str, int] = {}
+        families_present: set[str] = set()
+        for i, d in enumerate(datasets_raw):
+            if not isinstance(d, dict):
+                continue
+            iid = str(d.get("id") or "").strip()
+            fam = str(d.get("family") or "").strip()
+            if iid:
+                by_id[iid] = i
+            if fam:
+                families_present.add(fam)
+
+        for entry in prof_entries:
+            if not isinstance(entry, dict) or "id" not in entry:
+                continue
+            iid = str(entry.get("id") or "").strip()
+            fam = str(entry.get("family") or "").strip()
+            if not iid:
+                continue
+
+            idx = by_id.get(iid)
+            if idx is not None:
+                cur = datasets_raw[idx] if isinstance(datasets_raw[idx], dict) else {}
+                merged = dict(cur)
+                # Profile-backed data source should override source-related keys
+                # while preserving the canonical catalog/registry identity fields.
+                for k in ("root", "bindings", "scene_strategy", "profile_id", "scenes", "basemap"):
+                    if k in entry and entry.get(k) not in (None, "", [], {}):
+                        merged[k] = entry.get(k)
+                if not merged.get("family") and fam:
+                    merged["family"] = fam
+                if not merged.get("title") and entry.get("title"):
+                    merged["title"] = entry.get("title")
+                datasets_raw[idx] = merged
+                if fam:
+                    families_present.add(fam)
+                continue
+
+            # Keep one dataset card per family in the app: if the static registry
+            # already has this family, skip extra profile-only ids.
+            if fam and fam in families_present:
+                continue
+
+            datasets_raw.append(entry)
+            by_id[iid] = len(datasets_raw) - 1
+            if fam:
+                families_present.add(fam)
 
     out: List[DatasetSpec] = []
-    for d in raw.get("datasets", []):
+    for d in datasets_raw:
         if not isinstance(d, dict):
             continue
         try:
@@ -1859,6 +4413,8 @@ def load_registry(repo_root: Path) -> List[DatasetSpec]:
                 root=root,
                 profile=_resolve_path(d.get("profile")) if d.get("profile") else None,
                 scenes=_resolve_path(d.get("scenes")) if d.get("scenes") else None,
+                bindings=dict(d.get("bindings")) if isinstance(d.get("bindings"), dict) else None,
+                scene_strategy=dict(d.get("scene_strategy")) if isinstance(d.get("scene_strategy"), dict) else None,
                 geo_origin=geo_origin,
                 geo_origin_by_intersect=geo_by,
                 basemap_tile_url=str(basemap.get("tile_url")) if basemap and basemap.get("tile_url") else None,
@@ -1871,32 +4427,61 @@ def load_registry(repo_root: Path) -> List[DatasetSpec]:
 
 
 class DatasetStore:
+    _SUPPORTED_FAMILIES = {"v2x-traj", "v2x-seq", "ind", "sind", "cpm-objects"}
+
     def __init__(self, repo_root: Path) -> None:
         self.repo_root = repo_root
         self.specs = {s.id: s for s in load_registry(repo_root)}
         self.adapters: Dict[str, Any] = {}
+        self._adapter_errors: Dict[str, str] = {}
+        self._adapter_lock = threading.Lock()
 
-        for spec in self.specs.values():
-            if spec.family == "v2x-traj":
-                self.adapters[spec.id] = V2XTrajAdapter(spec)
-            elif spec.family == "v2x-seq":
-                self.adapters[spec.id] = V2XSeqAdapter(spec)
-            elif spec.family == "cpm-objects":
-                # Consider_it CPM object logs (CSV). No global map; viewed in local sensor frame.
-                self.adapters[spec.id] = CpmObjectsAdapter(spec)
+    @classmethod
+    def _is_supported_family(cls, family: str) -> bool:
+        return str(family or "").strip() in cls._SUPPORTED_FAMILIES
+
+    @staticmethod
+    def _strategy_int(spec: DatasetSpec, key: str) -> Optional[int]:
+        strat = spec.scene_strategy if isinstance(spec.scene_strategy, dict) else {}
+        raw = str(strat.get(key) or "").strip()
+        return int(raw) if raw.isdigit() else None
+
+    def _build_adapter(self, spec: DatasetSpec) -> Any:
+        if spec.family == "v2x-traj":
+            return V2XTrajAdapter(spec)
+        if spec.family == "v2x-seq":
+            return V2XSeqAdapter(spec)
+        if spec.family == "ind":
+            return InDAdapter(spec, window_s=self._strategy_int(spec, "window_s"))
+        if spec.family == "sind":
+            return SinDAdapter(spec)
+        if spec.family == "cpm-objects":
+            # Consider_it CPM object logs (CSV). No global map; viewed in local sensor frame.
+            return CpmObjectsAdapter(
+                spec,
+                window_s=self._strategy_int(spec, "window_s"),
+                gap_s=self._strategy_int(spec, "gap_s"),
+            )
+        raise KeyError(f"unsupported dataset family: {spec.family}")
 
     @staticmethod
     def _dataset_meta(spec: DatasetSpec) -> Dict[str, Any]:
         # Keep this additive: the frontend can ignore these fields safely.
         if spec.family == "v2x-traj":
+            bindings = spec.bindings if isinstance(spec.bindings, dict) else {}
+            map_path = ((bindings.get("maps_dir") or {}).get("path")) if isinstance(bindings.get("maps_dir"), dict) else None
+            tl_path = ((bindings.get("traffic_light") or {}).get("path")) if isinstance(bindings.get("traffic_light"), dict) else None
+            has_map = bool(Path(str(map_path)).expanduser().exists()) if map_path else bool((spec.root / "maps").exists())
+            has_tl = bool(Path(str(tl_path)).expanduser().exists()) if tl_path else bool((spec.root / "traffic-light").exists())
             return {
                 "splits": ["train", "val"],
                 "default_split": "train",
                 "group_label": "Intersection",
-                "has_map": True,
+                "has_map": has_map,
                 "modalities": ["ego", "infra", "vehicle", "traffic_light"],
                 "modality_labels": {"ego": "Ego vehicle", "infra": "Infrastructure", "vehicle": "Other vehicles", "traffic_light": "Traffic lights"},
                 "modality_short_labels": {"ego": "Ego", "infra": "Infra", "vehicle": "Vehicles", "traffic_light": "Lights"},
+                "has_traffic_lights": has_tl,
             }
         if spec.family == "v2x-seq":
             bindings = spec.bindings if isinstance(spec.bindings, dict) else {}
@@ -1943,6 +4528,70 @@ class DatasetStore:
                     bm["origin_by_intersect"] = {k: {"lat": v[0], "lon": v[1]} for k, v in spec.geo_origin_by_intersect.items()}
                 meta["basemap"] = bm
             return meta
+        if spec.family == "ind":
+            bindings = spec.bindings if isinstance(spec.bindings, dict) else {}
+            map_path = ((bindings.get("maps_dir") or {}).get("path")) if isinstance(bindings.get("maps_dir"), dict) else None
+            has_map = False
+            map_roots: List[Path] = []
+            if map_path:
+                p = Path(str(map_path)).expanduser()
+                map_roots.append((p / "lanelets"))
+                map_roots.append(p)
+            map_roots.append(spec.root / "maps" / "lanelets")
+            map_roots.append(spec.root / "maps")
+            for mr in map_roots:
+                try:
+                    if mr.exists() and mr.is_dir() and next(mr.rglob("*.osm"), None) is not None:
+                        has_map = True
+                        break
+                except Exception:
+                    continue
+            return {
+                "splits": ["all"],
+                "default_split": "all",
+                "group_label": "Location",
+                "has_map": has_map,
+                "has_scene_background": True,
+                "has_traffic_lights": False,
+                "modalities": ["infra"],
+                "modality_labels": {"infra": "Road users"},
+                "modality_short_labels": {"infra": "Objects"},
+            }
+        if spec.family == "sind":
+            bindings = spec.bindings if isinstance(spec.bindings, dict) else {}
+            data_dir_raw = ((bindings.get("data_dir") or {}).get("path")) if isinstance(bindings.get("data_dir"), dict) else None
+            data_root = Path(str(data_dir_raw)).expanduser() if data_dir_raw else spec.root
+            has_map = False
+            has_bg = False
+            has_tl = False
+            try:
+                if data_root.exists() and data_root.is_dir():
+                    for p in data_root.rglob("*.osm"):
+                        if p.is_file():
+                            has_map = True
+                            break
+                    for p in data_root.rglob("*.png"):
+                        if p.is_file():
+                            has_bg = True
+                            break
+                    for p in data_root.rglob("*.csv"):
+                        n = p.name.lower()
+                        if "traffic" in n and "meta" not in n and not n.startswith(".~lock"):
+                            has_tl = True
+                            break
+            except Exception:
+                pass
+            return {
+                "splits": ["all"],
+                "default_split": "all",
+                "group_label": "City",
+                "has_map": has_map,
+                "has_scene_background": has_bg,
+                "has_traffic_lights": has_tl,
+                "modalities": ["infra", "traffic_light"],
+                "modality_labels": {"infra": "Road users", "traffic_light": "Traffic lights"},
+                "modality_short_labels": {"infra": "Objects", "traffic_light": "Lights"},
+            }
         return {
             "splits": ["all"],
             "default_split": "all",
@@ -1957,7 +4606,7 @@ class DatasetStore:
         out = []
         for spec in self.specs.values():
             meta = self._dataset_meta(spec)
-            supported = spec.id in self.adapters
+            supported = self._is_supported_family(spec.family)
             item: Dict[str, Any] = {
                 "id": spec.id,
                 "title": spec.title,
@@ -1971,6 +4620,27 @@ class DatasetStore:
         return out
 
     def get_adapter(self, dataset_id: str) -> Any:
-        if dataset_id not in self.adapters:
+        spec = self.specs.get(dataset_id)
+        if spec is None:
             raise KeyError(f"dataset not found or unsupported: {dataset_id}")
-        return self.adapters[dataset_id]
+        if not self._is_supported_family(spec.family):
+            raise KeyError(f"dataset not found or unsupported: {dataset_id}")
+
+        with self._adapter_lock:
+            cached = self.adapters.get(dataset_id)
+            if cached is not None:
+                return cached
+
+            cached_error = self._adapter_errors.get(dataset_id)
+            if cached_error is not None:
+                raise RuntimeError(cached_error)
+
+            try:
+                adapter = self._build_adapter(spec)
+            except Exception as e:
+                msg = f"failed to initialize dataset adapter '{dataset_id}': {e}"
+                self._adapter_errors[dataset_id] = msg
+                raise RuntimeError(msg) from e
+
+            self.adapters[dataset_id] = adapter
+            return adapter

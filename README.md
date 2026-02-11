@@ -190,6 +190,14 @@ Notes:
 - Scene sidebar includes split-level modality availability counts.
 - For V2X-Seq only, you can enable **Include traffic-light-only scenes** in Scene panel.
 
+### inD (`family: ind`)
+
+- Splits: treated as one split (`all`)
+- Grouping: `locationId` -> recording windows
+- Scene unit: fixed time windows (default 60s) per recording
+- Map: no vector HD map (trajectory view only)
+- Object classes mapped to UI types: `car`, `truck_bus`, `pedestrian`, `bicycle`
+
 ### Consider.it CPM Objects (private) (`family: cpm-objects`)
 
 - Splits: treated as a single continuous log (`all`)
@@ -240,6 +248,19 @@ Note: this dataset is private and is not distributed with this repository.
   thermal_camera/
     *.csv
   sensor_interface-v1.2.1.proto     # optional but recommended
+```
+
+### inD
+
+```text
+<root>/
+  data/
+    00_tracks.csv
+    00_tracksMeta.csv
+    00_recordingMeta.csv
+    00_background.png              # optional
+    ...
+  maps/                            # optional
 ```
 
 

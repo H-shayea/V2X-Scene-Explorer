@@ -626,6 +626,438 @@ def _parent_chain(p: Path, max_depth: int = 6) -> List[Path]:
     return out
 
 
+def _score_ind_data_dir(data_dir: Path) -> Dict[str, Any]:
+    if not data_dir.exists() or not data_dir.is_dir():
+        return {
+            "data_dir": str(data_dir),
+            "score": 0.0,
+            "recordings": 0,
+            "header_ok_ratio": 0.0,
+            "triplet_ratio": 0.0,
+            "background_ratio": 0.0,
+        }
+
+    tracks = sorted([p for p in data_dir.glob("*_tracks.csv") if p.is_file()])
+    if not tracks:
+        return {
+            "data_dir": str(data_dir),
+            "score": 0.0,
+            "recordings": 0,
+            "header_ok_ratio": 0.0,
+            "triplet_ratio": 0.0,
+            "background_ratio": 0.0,
+        }
+
+    n_total = len(tracks)
+    n_triplet = 0
+    n_background = 0
+    n_header_ok = 0
+    sample = tracks[: min(8, n_total)]
+
+    for t in tracks:
+        prefix = t.name[: -len("_tracks.csv")]
+        tm = data_dir / f"{prefix}_tracksMeta.csv"
+        rm = data_dir / f"{prefix}_recordingMeta.csv"
+        bg = data_dir / f"{prefix}_background.png"
+        if tm.exists() and rm.exists():
+            n_triplet += 1
+        if bg.exists():
+            n_background += 1
+
+    required_tracks = {"trackid", "frame", "xcenter", "ycenter"}
+    required_tracks_meta = {"trackid", "initialframe", "finalframe", "class"}
+    required_recording_meta = {"recordingid", "locationid", "framerate"}
+
+    for t in sample:
+        prefix = t.name[: -len("_tracks.csv")]
+        tm = data_dir / f"{prefix}_tracksMeta.csv"
+        rm = data_dir / f"{prefix}_recordingMeta.csv"
+        if not tm.exists() or not rm.exists():
+            continue
+        h_t, _, _ = _read_csv_header(t)
+        h_tm, _, _ = _read_csv_header(tm)
+        h_rm, _, _ = _read_csv_header(rm)
+        set_t = {_norm_col(x) for x in h_t}
+        set_tm = {_norm_col(x) for x in h_tm}
+        set_rm = {_norm_col(x) for x in h_rm}
+        if required_tracks.issubset(set_t) and required_tracks_meta.issubset(set_tm) and required_recording_meta.issubset(set_rm):
+            n_header_ok += 1
+
+    triplet_ratio = (float(n_triplet) / float(n_total)) if n_total > 0 else 0.0
+    background_ratio = (float(n_background) / float(n_total)) if n_total > 0 else 0.0
+    header_ok_ratio = (float(n_header_ok) / float(len(sample))) if sample else 0.0
+
+    score = 0.0
+    score += 45.0 * triplet_ratio
+    score += 25.0 * header_ok_ratio
+    score += 10.0 * background_ratio
+    score += min(20.0, float(n_total) * 0.8)
+    score = float(_clamp(score, 0.0, 100.0))
+
+    return {
+        "data_dir": str(data_dir),
+        "score": score,
+        "recordings": int(n_total),
+        "header_ok_ratio": round(header_ok_ratio, 4),
+        "triplet_ratio": round(triplet_ratio, 4),
+        "background_ratio": round(background_ratio, 4),
+    }
+
+
+def _infer_ind_bindings(roots: List[Path]) -> Dict[str, Any]:
+    best_root: Optional[Path] = None
+    best_data: Optional[Path] = None
+    best_maps: Optional[Path] = None
+    best_score = -1.0
+    best_details: Dict[str, Any] = {}
+
+    candidates: List[Path] = []
+    for p in roots:
+        candidates.extend(_parent_chain(p.resolve(), max_depth=4))
+
+    seen = set()
+    uniq: List[Path] = []
+    for c in candidates:
+        k = str(c)
+        if k in seen:
+            continue
+        seen.add(k)
+        uniq.append(c)
+
+    for root in uniq[:80]:
+        data_dir = (root / "data").resolve() if (root / "data").exists() else root.resolve()
+        scored = _score_ind_data_dir(data_dir)
+        s = float(scored.get("score", 0.0))
+        maps_dir = (root / "maps").resolve()
+        if maps_dir.exists() and maps_dir.is_dir():
+            s += 5.0
+        s = float(_clamp(s, 0.0, 100.0))
+        if s > best_score:
+            best_score = s
+            best_root = root.resolve()
+            best_data = data_dir.resolve()
+            best_maps = maps_dir.resolve() if maps_dir.exists() and maps_dir.is_dir() else None
+            best_details = dict(scored)
+
+    return {
+        "root": best_root,
+        "data_dir": best_data,
+        "maps_dir": best_maps,
+        "score": float(_clamp(best_score if best_score >= 0 else 0.0, 0.0, 100.0)),
+        "details": best_details,
+    }
+
+
+def _detect_ind(paths: List[Path], profile_name: str) -> Dict[str, Any]:
+    inferred = _infer_ind_bindings(paths)
+    root = inferred.get("root")
+    data_dir = inferred.get("data_dir")
+    maps_dir = inferred.get("maps_dir")
+    score = float(inferred.get("score") or 0.0)
+
+    if not isinstance(root, Path) or not isinstance(data_dir, Path):
+        return {
+            "dataset_type": "ind",
+            "score": 0.0,
+            "second_best": 0.0,
+            "decision_mode": "manual",
+            "profile": None,
+            "validation": {
+                "status": "schema_mismatch",
+                "errors": [_issue("E_SCHEMA_REQUIRED_COLUMNS", "Could not infer a valid inD root from selected path(s).")],
+                "warnings": [],
+                "last_checked": _now_utc_iso(),
+            },
+        }
+
+    details = inferred.get("details") if isinstance(inferred.get("details"), dict) else {}
+    n_recordings = int(details.get("recordings") or 0)
+    if n_recordings <= 0:
+        return {
+            "dataset_type": "ind",
+            "score": float(_clamp(score * 0.4, 0, 100)),
+            "second_best": 0.0,
+            "decision_mode": "manual",
+            "profile": None,
+            "validation": {
+                "status": "schema_mismatch",
+                "errors": [_issue("E_SCHEMA_REQUIRED_COLUMNS", "No inD recording triplets (*_tracks/_tracksMeta/_recordingMeta.csv) were found.")],
+                "warnings": [],
+                "last_checked": _now_utc_iso(),
+            },
+        }
+
+    decision = "auto" if score >= 75 else ("confirm" if score >= 50 else "manual")
+    bindings: Dict[str, Dict[str, Any]] = {
+        "data_dir": {
+            "kind": "dir",
+            "required": True,
+            "path": str(data_dir),
+            "detected_score": score,
+        }
+    }
+    if isinstance(maps_dir, Path):
+        bindings["maps_dir"] = {"kind": "dir", "required": False, "path": str(maps_dir), "detected_score": 100.0}
+
+    profile = {
+        "schema_version": PROFILE_SCHEMA_VERSION,
+        "name": profile_name or "inD Local",
+        "dataset_type": "ind",
+        "adapter_version": PROFILE_ADAPTER_VERSION,
+        "roots": [str(root)],
+        "bindings": bindings,
+        "scene_strategy": {"mode": "recording_window", "window_s": 60},
+        "detector": {
+            "score": score,
+            "second_best": 0.0,
+            "decision_mode": decision,
+            "checked_at": _now_utc_iso(),
+        },
+    }
+    return {
+        "dataset_type": "ind",
+        "score": score,
+        "second_best": 0.0,
+        "decision_mode": decision,
+        "profile": profile,
+    }
+
+
+def _looks_like_sind_scenario_dir(path: Path) -> bool:
+    if not path.exists() or not path.is_dir():
+        return False
+    veh = path / "Veh_smoothed_tracks.csv"
+    ped = path / "Ped_smoothed_tracks.csv"
+    return veh.exists() or ped.exists()
+
+
+def _score_sind_root(root: Path) -> Dict[str, Any]:
+    if not root.exists() or not root.is_dir():
+        return {
+            "root": str(root),
+            "score": 0.0,
+            "city_count": 0,
+            "scenario_count": 0,
+            "veh_ratio": 0.0,
+            "ped_ratio": 0.0,
+            "tl_ratio": 0.0,
+            "map_city_ratio": 0.0,
+            "background_city_ratio": 0.0,
+            "maps_dir": None,
+        }
+
+    # Support selecting either:
+    # 1) full SinD root (cities as first-level dirs), or
+    # 2) a single city directory (scenarios as first-level dirs).
+    first_level = [p for p in sorted(root.iterdir()) if p.is_dir() and not p.name.startswith(".")]
+    direct_scenarios = [p for p in first_level if _looks_like_sind_scenario_dir(p)]
+    if direct_scenarios:
+        city_dirs = [root]
+    else:
+        city_dirs = []
+        for c in first_level:
+            scen = [p for p in sorted(c.iterdir()) if p.is_dir() and not p.name.startswith(".") and _looks_like_sind_scenario_dir(p)]
+            if scen:
+                city_dirs.append(c)
+
+    if not city_dirs:
+        return {
+            "root": str(root),
+            "score": 0.0,
+            "city_count": 0,
+            "scenario_count": 0,
+            "veh_ratio": 0.0,
+            "ped_ratio": 0.0,
+            "tl_ratio": 0.0,
+            "map_city_ratio": 0.0,
+            "background_city_ratio": 0.0,
+            "maps_dir": None,
+        }
+
+    scenario_count = 0
+    n_veh = 0
+    n_ped = 0
+    n_tl = 0
+    city_with_map = 0
+    city_with_bg = 0
+    map_roots: List[Path] = []
+
+    for city_dir in city_dirs:
+        scenario_dirs = [p for p in sorted(city_dir.iterdir()) if p.is_dir() and not p.name.startswith(".") and _looks_like_sind_scenario_dir(p)]
+        if city_dir == root and direct_scenarios:
+            scenario_dirs = direct_scenarios
+        if not scenario_dirs:
+            continue
+        scenario_count += len(scenario_dirs)
+
+        has_city_map = any(p.is_file() for p in city_dir.glob("*.osm"))
+        has_city_bg = any(p.is_file() for p in city_dir.glob("*.png"))
+        if has_city_map:
+            city_with_map += 1
+            map_roots.append(city_dir)
+        if has_city_bg:
+            city_with_bg += 1
+
+        for scen in scenario_dirs:
+            if (scen / "Veh_smoothed_tracks.csv").exists():
+                n_veh += 1
+            if (scen / "Ped_smoothed_tracks.csv").exists():
+                n_ped += 1
+            tl_files = [p for p in scen.glob("*.csv") if p.is_file() and ("traffic" in p.name.lower()) and ("meta" not in p.name.lower()) and (not p.name.startswith(".~lock"))]
+            if tl_files:
+                n_tl += 1
+
+    if scenario_count <= 0:
+        return {
+            "root": str(root),
+            "score": 0.0,
+            "city_count": int(len(city_dirs)),
+            "scenario_count": 0,
+            "veh_ratio": 0.0,
+            "ped_ratio": 0.0,
+            "tl_ratio": 0.0,
+            "map_city_ratio": 0.0,
+            "background_city_ratio": 0.0,
+            "maps_dir": None,
+        }
+
+    veh_ratio = float(n_veh) / float(scenario_count)
+    ped_ratio = float(n_ped) / float(scenario_count)
+    tl_ratio = float(n_tl) / float(scenario_count)
+    map_city_ratio = float(city_with_map) / float(max(1, len(city_dirs)))
+    bg_city_ratio = float(city_with_bg) / float(max(1, len(city_dirs)))
+
+    score = 0.0
+    score += 35.0 * min(1.0, float(scenario_count) / 16.0)
+    score += 25.0 * veh_ratio
+    score += 18.0 * ped_ratio
+    score += 8.0 * tl_ratio
+    score += 9.0 * map_city_ratio
+    score += 5.0 * bg_city_ratio
+    score = float(_clamp(score, 0.0, 100.0))
+
+    maps_dir: Optional[str] = None
+    if map_roots:
+        # If full-root layout is selected, maps live inside city dirs.
+        # Keep maps_dir as root for adapter-side discovery.
+        maps_dir = str(root.resolve())
+
+    return {
+        "root": str(root.resolve()),
+        "score": score,
+        "city_count": int(len(city_dirs)),
+        "scenario_count": int(scenario_count),
+        "veh_ratio": round(veh_ratio, 4),
+        "ped_ratio": round(ped_ratio, 4),
+        "tl_ratio": round(tl_ratio, 4),
+        "map_city_ratio": round(map_city_ratio, 4),
+        "background_city_ratio": round(bg_city_ratio, 4),
+        "maps_dir": maps_dir,
+    }
+
+
+def _infer_sind_bindings(roots: List[Path]) -> Dict[str, Any]:
+    best_root: Optional[Path] = None
+    best_score = -1.0
+    best_details: Dict[str, Any] = {}
+
+    candidates: List[Path] = []
+    for p in roots:
+        candidates.extend(_parent_chain(p.resolve(), max_depth=4))
+
+    seen = set()
+    uniq: List[Path] = []
+    for c in candidates:
+        k = str(c)
+        if k in seen:
+            continue
+        seen.add(k)
+        uniq.append(c)
+
+    for root in uniq[:80]:
+        scored = _score_sind_root(root)
+        s = float(scored.get("score", 0.0))
+        if s > best_score:
+            best_score = s
+            best_root = root.resolve()
+            best_details = dict(scored)
+
+    maps_dir = best_details.get("maps_dir")
+    maps_path = Path(str(maps_dir)).resolve() if maps_dir else None
+    return {
+        "root": best_root,
+        "data_dir": best_root,
+        "maps_dir": maps_path,
+        "score": float(_clamp(best_score if best_score >= 0 else 0.0, 0.0, 100.0)),
+        "details": best_details,
+    }
+
+
+def _detect_sind(paths: List[Path], profile_name: str) -> Dict[str, Any]:
+    inferred = _infer_sind_bindings(paths)
+    root = inferred.get("root")
+    data_dir = inferred.get("data_dir")
+    maps_dir = inferred.get("maps_dir")
+    score = float(inferred.get("score") or 0.0)
+    details = inferred.get("details") if isinstance(inferred.get("details"), dict) else {}
+    scenario_count = int(details.get("scenario_count") or 0)
+
+    if not isinstance(root, Path) or not isinstance(data_dir, Path) or scenario_count <= 0:
+        return {
+            "dataset_type": "sind",
+            "score": float(_clamp(score * 0.4, 0, 100)),
+            "second_best": 0.0,
+            "decision_mode": "manual",
+            "profile": None,
+            "validation": {
+                "status": "schema_mismatch",
+                "errors": [_issue("E_SCHEMA_REQUIRED_COLUMNS", "Could not infer a valid SinD root with scenario folders.")],
+                "warnings": [],
+                "last_checked": _now_utc_iso(),
+            },
+        }
+
+    decision = "auto" if score >= 75 else ("confirm" if score >= 50 else "manual")
+    bindings: Dict[str, Dict[str, Any]] = {
+        "data_dir": {
+            "kind": "dir",
+            "required": True,
+            "path": str(data_dir),
+            "detected_score": score,
+        }
+    }
+    if isinstance(maps_dir, Path):
+        bindings["maps_dir"] = {
+            "kind": "dir",
+            "required": False,
+            "path": str(maps_dir),
+            "detected_score": float(details.get("map_city_ratio") or 0.0) * 100.0,
+        }
+
+    profile = {
+        "schema_version": PROFILE_SCHEMA_VERSION,
+        "name": profile_name or "SinD Local",
+        "dataset_type": "sind",
+        "adapter_version": PROFILE_ADAPTER_VERSION,
+        "roots": [str(root)],
+        "bindings": bindings,
+        "scene_strategy": {"mode": "scenario_scene"},
+        "detector": {
+            "score": score,
+            "second_best": 0.0,
+            "decision_mode": decision,
+            "checked_at": _now_utc_iso(),
+        },
+    }
+    return {
+        "dataset_type": "sind",
+        "score": score,
+        "second_best": 0.0,
+        "decision_mode": decision,
+        "profile": profile,
+    }
+
+
 def _detect_v2x(paths: List[Path], profile_name: str) -> Dict[str, Any]:
     # Prefer scoring likely index files (by name/path), but allow a fallback mode
     # where we detect V2X from directory layout only (no scenes CSV provided).
@@ -954,6 +1386,10 @@ def _normalize_dataset_type(raw: Any) -> str:
         return "v2x_seq"
     if s in ("consider-it-cpm", "consider_it_cpm", "cpm", "cpm-objects", "considerit"):
         return "consider_it_cpm"
+    if s in ("ind", "in-d", "ind_dataset"):
+        return "ind"
+    if s in ("sind", "sin-d", "sin_d", "sind_dataset"):
+        return "sind"
     return ""
 
 
@@ -981,12 +1417,18 @@ def detect_profile(repo_root: Path, payload: Dict[str, Any]) -> Dict[str, Any]:
         picked = _detect_v2x_seq(paths, profile_name)
     elif type_hint == "consider_it_cpm":
         picked = _detect_cpm(paths, profile_name)
+    elif type_hint == "ind":
+        picked = _detect_ind(paths, profile_name)
+    elif type_hint == "sind":
+        picked = _detect_sind(paths, profile_name)
     else:
         cpm = _detect_cpm(paths, profile_name)
         v2x = _detect_v2x(paths, profile_name)
         v2x_seq = _detect_v2x_seq(paths, profile_name)
+        ind = _detect_ind(paths, profile_name)
+        sind = _detect_sind(paths, profile_name)
         ranked = sorted(
-            [cpm, v2x, v2x_seq],
+            [cpm, v2x, v2x_seq, ind, sind],
             key=lambda x: float(x.get("score", 0.0)),
             reverse=True,
         )
@@ -1229,6 +1671,125 @@ def validate_profile(repo_root: Path, profile_in: Dict[str, Any]) -> Dict[str, A
             "has_traffic_lights": bool(tl_dir and Path(tl_dir).exists()),
             "splits": ["train", "val"],
             "group_label": "Intersection",
+        }
+
+    elif dataset_type == "ind":
+        mode = str(scene_strategy.get("mode") or "recording_window")
+        window_s = int(scene_strategy.get("window_s") or 60)
+        scene_strategy = {"mode": mode, "window_s": max(10, min(600, window_s))}
+
+        data_dir = get_binding_path("data_dir", required=True, kind="dir")
+        maps_dir = get_binding_path("maps_dir", required=False, kind="dir")
+
+        if not data_dir and roots:
+            inferred = _infer_ind_bindings(roots)
+            inf_data = inferred.get("data_dir")
+            inf_maps = inferred.get("maps_dir")
+            if isinstance(inf_data, Path):
+                bindings["data_dir"] = {
+                    "kind": "dir",
+                    "required": True,
+                    "path": str(inf_data),
+                    "detected_score": float(inferred.get("score") or 0.0),
+                }
+                data_dir = str(inf_data)
+            if isinstance(inf_maps, Path) and "maps_dir" not in bindings:
+                bindings["maps_dir"] = {
+                    "kind": "dir",
+                    "required": False,
+                    "path": str(inf_maps),
+                    "detected_score": 100.0,
+                }
+                maps_dir = str(inf_maps)
+
+        if not data_dir:
+            errors.append(_issue("E_ROLE_REQUIRED_MISSING", "Missing required binding for data_dir.", role="data_dir"))
+        else:
+            dp = Path(data_dir)
+            if not dp.exists():
+                errors.append(_issue("E_PATH_MISSING", "Path does not exist for data_dir.", role="data_dir", path=data_dir))
+            elif not dp.is_dir():
+                errors.append(_issue("E_PATH_UNREADABLE", "Expected a directory for data_dir.", role="data_dir", path=data_dir))
+            else:
+                scored = _score_ind_data_dir(dp)
+                recordings = int(scored.get("recordings") or 0)
+                if recordings <= 0:
+                    errors.append(_issue("E_SCHEMA_REQUIRED_COLUMNS", "No inD recording files were found in data_dir.", role="data_dir", path=data_dir))
+                if float(scored.get("triplet_ratio") or 0.0) < 1.0 and recordings > 0:
+                    warnings.append(_issue("W_LOW_CONFIDENCE_DETECTION", "Some recordings are missing *_tracksMeta or *_recordingMeta files.", role="data_dir", path=data_dir))
+                if float(scored.get("header_ok_ratio") or 0.0) < 0.6 and recordings > 0:
+                    warnings.append(_issue("W_LOW_CONFIDENCE_DETECTION", "inD CSV headers look unusual; verify dataset layout.", role="data_dir", path=data_dir))
+
+        if maps_dir and (not Path(maps_dir).exists() or not Path(maps_dir).is_dir()):
+            warnings.append(_issue("W_OPTIONAL_ROLE_MISSING", "Map directory is missing.", role="maps_dir", path=maps_dir))
+
+        capabilities = {
+            "has_map": False,
+            "has_traffic_lights": False,
+            "splits": ["all"],
+            "group_label": "Location",
+        }
+
+    elif dataset_type == "sind":
+        scene_strategy = {"mode": "scenario_scene"}
+
+        data_dir = get_binding_path("data_dir", required=True, kind="dir")
+        maps_dir = get_binding_path("maps_dir", required=False, kind="dir")
+
+        if not data_dir and roots:
+            inferred = _infer_sind_bindings(roots)
+            inf_data = inferred.get("data_dir")
+            inf_maps = inferred.get("maps_dir")
+            details = inferred.get("details") if isinstance(inferred.get("details"), dict) else {}
+            if isinstance(inf_data, Path):
+                bindings["data_dir"] = {
+                    "kind": "dir",
+                    "required": True,
+                    "path": str(inf_data),
+                    "detected_score": float(inferred.get("score") or 0.0),
+                }
+                data_dir = str(inf_data)
+            if isinstance(inf_maps, Path) and "maps_dir" not in bindings:
+                bindings["maps_dir"] = {
+                    "kind": "dir",
+                    "required": False,
+                    "path": str(inf_maps),
+                    "detected_score": float(details.get("map_city_ratio") or 0.0) * 100.0,
+                }
+                maps_dir = str(inf_maps)
+
+        score_info: Dict[str, Any] = {}
+        if not data_dir:
+            errors.append(_issue("E_ROLE_REQUIRED_MISSING", "Missing required binding for data_dir.", role="data_dir"))
+        else:
+            dp = Path(data_dir)
+            if not dp.exists():
+                errors.append(_issue("E_PATH_MISSING", "Path does not exist for data_dir.", role="data_dir", path=data_dir))
+            elif not dp.is_dir():
+                errors.append(_issue("E_PATH_UNREADABLE", "Expected a directory for data_dir.", role="data_dir", path=data_dir))
+            else:
+                score_info = _score_sind_root(dp)
+                scenario_count = int(score_info.get("scenario_count") or 0)
+                city_count = int(score_info.get("city_count") or 0)
+                if scenario_count <= 0:
+                    errors.append(_issue("E_SCHEMA_REQUIRED_COLUMNS", "No SinD scenario folders were found in data_dir.", role="data_dir", path=data_dir))
+                if city_count <= 0:
+                    warnings.append(_issue("W_LOW_CONFIDENCE_DETECTION", "No SinD city structure was detected.", role="data_dir", path=data_dir))
+                if float(score_info.get("veh_ratio") or 0.0) < 0.6:
+                    warnings.append(_issue("W_LOW_CONFIDENCE_DETECTION", "Many scenarios are missing Veh_smoothed_tracks.csv.", role="data_dir", path=data_dir))
+                if float(score_info.get("ped_ratio") or 0.0) < 0.6:
+                    warnings.append(_issue("W_LOW_CONFIDENCE_DETECTION", "Many scenarios are missing Ped_smoothed_tracks.csv.", role="data_dir", path=data_dir))
+                if float(score_info.get("map_city_ratio") or 0.0) <= 0.0:
+                    warnings.append(_issue("W_OPTIONAL_ROLE_MISSING", "No city-level OSM map files were detected.", role="maps_dir", path=data_dir))
+
+        if maps_dir and (not Path(maps_dir).exists() or not Path(maps_dir).is_dir()):
+            warnings.append(_issue("W_OPTIONAL_ROLE_MISSING", "Map directory is missing.", role="maps_dir", path=maps_dir))
+
+        capabilities = {
+            "has_map": bool(float(score_info.get("map_city_ratio") or 0.0) > 0.0),
+            "has_traffic_lights": bool(float(score_info.get("tl_ratio") or 0.0) > 0.0),
+            "splits": ["all"],
+            "group_label": "City",
         }
 
     elif dataset_type == "consider_it_cpm":
@@ -1565,6 +2126,10 @@ class ProfileStore:
                     entry["scenes"] = str(scenes_path)
             elif dataset_type == "v2x_seq":
                 entry["family"] = "v2x-seq"
+            elif dataset_type == "ind":
+                entry["family"] = "ind"
+            elif dataset_type == "sind":
+                entry["family"] = "sind"
             elif dataset_type == "consider_it_cpm":
                 entry["family"] = "cpm-objects"
                 basemap = p.get("basemap") if isinstance(p.get("basemap"), dict) else None

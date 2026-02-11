@@ -73,7 +73,7 @@
         { "label": "Paper (arXiv:1911.07602)", "url": "https://arxiv.org/abs/1911.07602" },
         { "label": "Dataset website", "url": "https://www.ind-dataset.com/" }
       ],
-      "app": { "supported": false, "family": null }
+      "app": { "supported": true, "family": "ind" }
     },
     {
       "id": "sind",
@@ -88,13 +88,13 @@
         "has_map": true,
         "has_traffic_lights": true,
         "coordinate_frame": "global (map)",
-        "scene_unit": "recording"
+        "scene_unit": "city -> scenario"
       },
       "links": [
         { "label": "Paper (arXiv:2209.02297)", "url": "https://arxiv.org/abs/2209.02297" },
         { "label": "Project code / sample data", "url": "https://github.com/SOTIF-AVLab/SinD" }
       ],
-      "app": { "supported": false, "family": null }
+      "app": { "supported": true, "family": "sind" }
     },
     {
       "id": "int2",
