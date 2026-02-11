@@ -286,16 +286,33 @@ class V2XTrajAdapter:
         c = self._intersections.get(split, Counter())
         return [{"intersect_id": k, "intersect_label": intersection_label(k), "count": v} for k, v in c.most_common()]
 
+    def _scene_included_in_list(self, s: SceneSummary, include_tl_only: bool) -> bool:
+        # Base behavior: include every indexed scene.
+        return True
+
+    @staticmethod
+    def _availability_from_scenes(scenes: List[SceneSummary]) -> Dict[str, Any]:
+        by_modality: Counter = Counter()
+        for s in scenes:
+            for m in (s.by_modality or {}).keys():
+                by_modality[str(m)] += 1
+        return {
+            "scene_count": len(scenes),
+            "by_modality": dict(by_modality),
+        }
+
     def list_scenes(
         self,
         split: str,
         intersect_id: Optional[str] = None,
         limit: int = 200,
         offset: int = 0,
+        include_tl_only: bool = False,
     ) -> Dict[str, Any]:
         scenes = list(self._scene_index.get(split, {}).values())
         if intersect_id:
             scenes = [s for s in scenes if s.intersect_id == intersect_id]
+        scenes = [s for s in scenes if self._scene_included_in_list(s, include_tl_only=include_tl_only)]
         scenes.sort(key=lambda s: self._scene_sort_key(s.scene_id))
         total = len(scenes)
         slice_ = scenes[offset : offset + limit]
@@ -313,7 +330,14 @@ class V2XTrajAdapter:
                 }
             )
 
-        return {"total": total, "limit": limit, "offset": offset, "items": items}
+        return {
+            "total": total,
+            "limit": limit,
+            "offset": offset,
+            "items": items,
+            "availability": self._availability_from_scenes(scenes),
+            "include_tl_only": bool(include_tl_only),
+        }
 
     def locate_scene(self, split: str, scene_id: str) -> Dict[str, Any]:
         scene_id = str(scene_id)
@@ -977,20 +1001,16 @@ class V2XSeqAdapter(V2XTrajAdapter):
                                 "unique_agents": None,
                             }
 
-            # Keep only scenes with at least one trajectory modality.
-            drop_ids = [
-                sid
-                for sid, s in scenes.items()
-                if ("ego" not in s.by_modality and "infra" not in s.by_modality and "vehicle" not in s.by_modality)
-            ]
-            for sid in drop_ids:
-                scenes.pop(sid, None)
-                self._scene_files[split].pop(sid, None)
-
         for split, scenes in self._scene_index.items():
             for s in scenes.values():
                 if s.intersect_id:
                     self._intersections[split][s.intersect_id] += 1
+
+    def _scene_included_in_list(self, s: SceneSummary, include_tl_only: bool) -> bool:
+        if include_tl_only:
+            return True
+        mods = set((s.by_modality or {}).keys())
+        return bool({"ego", "infra", "vehicle"} & mods)
 
     def _scene_file(self, modality: str, split: str, scene_id: str) -> Path:
         p = self._scene_files.get(split, {}).get(scene_id, {}).get(modality)
@@ -1425,6 +1445,7 @@ class CpmObjectsAdapter:
         intersect_id: Optional[str] = None,
         limit: int = 200,
         offset: int = 0,
+        include_tl_only: bool = False,
     ) -> Dict[str, Any]:
         split = "all"
         if intersect_id:
@@ -1469,7 +1490,17 @@ class CpmObjectsAdapter:
                 }
             )
 
-        return {"total": total, "limit": limit, "offset": offset, "items": items}
+        return {
+            "total": total,
+            "limit": limit,
+            "offset": offset,
+            "items": items,
+            "availability": {
+                "scene_count": total,
+                "by_modality": {"infra": total},
+            },
+            "include_tl_only": bool(include_tl_only),
+        }
 
     def locate_scene(self, split: str, scene_id: str) -> Dict[str, Any]:
         split = "all"

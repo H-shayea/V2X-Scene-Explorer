@@ -391,9 +391,16 @@ class AppHandler(BaseHTTPRequestHandler):
             if len(parts) == 4 and parts[3] == "scenes":
                 split = (qs.get("split", ["train"])[0] or "train").strip()
                 intersect_id = (qs.get("intersect_id", [None])[0] or None)
+                include_tl_only = (qs.get("include_tl_only", ["0"])[0] or "0").strip() in ("1", "true", "yes", "on")
                 limit = clamp_int((qs.get("limit", ["200"])[0] or "200"), default=200, min_v=1, max_v=5000)
                 offset = clamp_int((qs.get("offset", ["0"])[0] or "0"), default=0, min_v=0, max_v=10**9)
-                payload = adapter.list_scenes(split, intersect_id=intersect_id, limit=limit, offset=offset)
+                payload = adapter.list_scenes(
+                    split,
+                    intersect_id=intersect_id,
+                    limit=limit,
+                    offset=offset,
+                    include_tl_only=include_tl_only,
+                )
                 payload["split"] = split
                 payload["intersect_id"] = intersect_id
                 self._send_json(200, payload)

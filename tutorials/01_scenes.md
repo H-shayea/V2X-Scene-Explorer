@@ -16,7 +16,7 @@ Even if a dataset is a continuous recording, the viewer needs manageable chunks 
 - Scene navigation is useful (next/prev scene, jump to a scene ID).
 - Caching is practical (we can keep one scene bundle in memory).
 
-## Two dataset families, two definitions of "scene"
+## Three dataset families, three definitions of "scene"
 
 ### 1) V2X-Traj (`family: v2x-traj`)
 
@@ -36,7 +36,24 @@ Where it is implemented:
 
 Important point: for V2X-Traj we do *not* invent scenes. We use the dataset's scene ids and metadata.
 
-### 2) Consider.it CPM Objects (`family: cpm-objects`)
+### 2) V2X-Seq (`family: v2x-seq`)
+
+For V2X-Seq, we treat each CSV clip as one scene:
+
+- Scene id = CSV file stem
+- Split = parent folder (`train` / `val`)
+- Grouping = intersection id when available in CSV rows
+
+Compared to V2X-Traj, V2X-Seq local copies can be inconsistent in folder naming.
+So the loader uses CSV schema to classify data roles (trajectory vs traffic-light), not
+only the folder name.
+
+Where it is implemented:
+
+- Backend adapter:
+  - `apps/server/datasets.py` -> `V2XSeqAdapter`
+
+### 3) Consider.it CPM Objects (`family: cpm-objects`)
 
 For Consider.it CPM Objects, the raw data is a continuous log stored as CSV files.
 There is no scene boundary provided. So we define scenes ourselves.
@@ -132,6 +149,10 @@ Windowing gives a better interactive experience.
   - Split: `Train` / `Validation`
   - Group: `Intersection`
   - Scene: dataset-provided `scene_id`
+- For V2X-Seq:
+  - Split: `Train` / `Validation`
+  - Group: `Intersection`
+  - Scene: one CSV clip
 - For CPM Objects:
   - Split: always `All`
   - Group: `Sensor` (CSV file)
@@ -148,4 +169,3 @@ If you want longer or shorter CPM scenes, change:
 - `CpmObjectsAdapter.DEFAULT_GAP_S` (gap threshold)
 
 Then restart the server and observe how the number of scenes changes per sensor.
-

@@ -447,6 +447,8 @@ const state = {
   sceneOffset: 0,
   sceneLimit: 400,
   sceneTotal: 0,
+  sceneAvailability: null,
+  includeTlOnlyScenes: false,
   bundle: null,
   frame: 0,
   playing: false,
@@ -521,6 +523,7 @@ function defaultDatasetSettings() {
     sceneId: "",
     sceneOffset: 0,
     sceneLimit: 400,
+    includeTlOnlyScenes: false,
     speed: 1,
     showVelocity: false,
     showHeading: false,
@@ -550,6 +553,7 @@ function captureDatasetSettings() {
     sceneId: state.sceneId || "",
     sceneOffset: Number(state.sceneOffset || 0),
     sceneLimit: Number(state.sceneLimit || 400),
+    includeTlOnlyScenes: !!state.includeTlOnlyScenes,
     speed: Number(state.speed || 1),
     showVelocity: !!state.showVelocity,
     showHeading: !!state.showHeading,
@@ -604,6 +608,9 @@ function restoreDatasetSettings(ds) {
   state.sceneOffset = Number.isFinite(Number(s.sceneOffset)) ? Number(s.sceneOffset) : 0;
   // Scene list paging is an internal performance detail; keep it stable.
   state.sceneLimit = 400;
+  state.includeTlOnlyScenes = !!s.includeTlOnlyScenes;
+  const fam = String((currentDatasetMeta() || {}).family || "").toLowerCase();
+  if (fam !== "v2x-seq") state.includeTlOnlyScenes = false;
 
   state.speed = Number.isFinite(Number(s.speed)) ? Number(s.speed) : 1;
   state.showVelocity = !!s.showVelocity;
@@ -770,6 +777,7 @@ function syncControlsFromState() {
   setCheck("trailAll", state.trailAll);
   setCheck("trailFull", state.trailFull);
   setCheck("holdTL", state.holdTL);
+  setCheck("sceneTlOnly", state.includeTlOnlyScenes);
   setCheck("showBasemap", state.basemapEnabled);
 
   setCheck("debugOverlay", state.debugOverlay);
@@ -1061,8 +1069,17 @@ function applyDatasetUi() {
 
   const holdWrap = $("holdTLWrap");
   if (holdWrap) holdWrap.hidden = !available.has("traffic_light");
+  const sceneTlOnlyWrap = $("sceneTlOnlyWrap");
+  if (sceneTlOnlyWrap) {
+    const fam = String(meta.family || "").toLowerCase();
+    sceneTlOnlyWrap.hidden = fam !== "v2x-seq";
+  }
+  if (String(meta.family || "").toLowerCase() !== "v2x-seq") {
+    state.includeTlOnlyScenes = false;
+  }
   state.sceneModalities = null;
   updateSceneModalityControls(null);
+  updateSplitAvailabilityHint(state.sceneAvailability);
   updateSourcePanel();
 }
 
@@ -1905,10 +1922,20 @@ function render() {
     };
 
     if (state.trailFull) {
-      const start = Math.max(0, k - 1);
-      drawSegment(start, pts.length, 0.32, 2.0, [10, 8], true);
+      // Full-path baseline so "past + future" is always clearly visible.
+      drawSegment(0, pts.length, 0.42, 2.2, null, true);
+
+      // Future part from current frame onward (dashed).
+      const futureStart = Math.max(0, k - 1);
+      drawSegment(futureStart, pts.length, 0.62, 2.4, [12, 8], false);
+
+      // Past part up to the current frame (solid emphasis).
+      drawSegment(0, k, 0.92, 3.0, null, true);
+      return;
     }
-    drawSegment(0, k, 0.88, 2.8, null, true);
+
+    // Past-only mode.
+    drawSegment(0, k, 0.92, 3.0, null, true);
   };
 
   // Trajectories (selected or all objects in the current frame)
@@ -2094,6 +2121,39 @@ function bestDurationSec(byModality) {
     if (best == null || d > best) best = d;
   }
   return best;
+}
+
+function formatInt(n) {
+  const v = Number(n);
+  if (!Number.isFinite(v)) return "0";
+  return Math.max(0, Math.round(v)).toLocaleString();
+}
+
+function updateSplitAvailabilityHint(availability) {
+  const el = $("splitAvailabilityHint");
+  if (!el) return;
+
+  const avail = availability && typeof availability === "object" ? availability : null;
+  const byModality = avail && avail.by_modality && typeof avail.by_modality === "object" ? avail.by_modality : null;
+  if (!byModality) {
+    el.textContent = "";
+    return;
+  }
+
+  const modalOrder = Array.isArray(state.modalities) ? state.modalities.map(String) : [];
+  const parts = [];
+  for (const m of modalOrder) {
+    const c = Number(byModality[m] || 0);
+    const label = modalityShortLabel(m);
+    parts.push(`${label}: ${formatInt(c)}`);
+  }
+
+  const total = Number(avail.scene_count || 0);
+  const hdr = `Split availability (${formatInt(total)} scenes)`;
+  const suffix = (state.includeTlOnlyScenes && String(currentDatasetMeta()?.family || "").toLowerCase() === "v2x-seq")
+    ? " · TL-only included"
+    : "";
+  el.textContent = parts.length ? `${hdr}: ${parts.join(" · ")}${suffix}` : `${hdr}${suffix}`;
 }
 
 function updateSceneHint(total, shown, mismatch) {
@@ -3618,6 +3678,7 @@ function clearExplorerSceneState(message) {
   state.sceneIds = [];
   state.sceneId = null;
   state.sceneTotal = 0;
+  state.sceneAvailability = null;
   state.sceneOffset = 0;
   state.intersectId = "";
   state.selectedKey = null;
@@ -3669,6 +3730,7 @@ function clearExplorerSceneState(message) {
   if (transLabel) transLabel.textContent = "";
 
   updateSceneHint(0, 0, 0);
+  updateSplitAvailabilityHint(null);
   setPlaybackEnabled(false);
   updateSceneModalityControls(null);
   updateStatusBox(msg);
@@ -3782,6 +3844,7 @@ async function loadScenes() {
     offset: String(state.sceneOffset || 0),
   });
   if (inter) qs.set("intersect_id", inter);
+  if (state.includeTlOnlyScenes) qs.set("include_tl_only", "1");
   const data = await fetchJson(`/api/datasets/${encodeURIComponent(ds)}/scenes?${qs.toString()}`);
   if (reqId !== req.scenes) return;
 
@@ -3789,6 +3852,7 @@ async function loadScenes() {
   sel.innerHTML = "";
   state.sceneIds = [];
   state.sceneTotal = Number(data.total || 0);
+  state.sceneAvailability = (data.availability && typeof data.availability === "object") ? data.availability : null;
   let mismatch = 0;
   for (const it of data.items || []) {
     const opt = document.createElement("option");
@@ -3808,6 +3872,7 @@ async function loadScenes() {
   }
 
   updateSceneHint(data.total, (data.items || []).length, mismatch);
+  updateSplitAvailabilityHint(state.sceneAvailability);
 
   const existing = state.sceneId;
   const keep = existing && (data.items || []).some((it) => String(it.scene_id) === String(existing));
@@ -4004,6 +4069,16 @@ function wireUi() {
     state.sceneId = e.target.value;
     await loadSceneBundle();
   });
+
+  const sceneTlOnly = $("sceneTlOnly");
+  if (sceneTlOnly) {
+    sceneTlOnly.addEventListener("change", async (e) => {
+      state.includeTlOnlyScenes = !!e.target.checked;
+      state.sceneOffset = 0;
+      await loadScenes();
+      await loadSceneBundle();
+    });
+  }
 
   const goScene = async (delta) => {
     const sel = $("sceneSelect");
