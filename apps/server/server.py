@@ -564,7 +564,14 @@ class AppHandler(BaseHTTPRequestHandler):
                 return
 
             dataset_id = parts[2]
-            adapter = self.store.get_adapter(dataset_id)
+            try:
+                adapter = self.store.get_adapter(dataset_id)
+            except KeyError as e:
+                self._send_error_json(404, "not_found", str(e))
+                return
+            except RuntimeError as e:
+                self._send_error_json(503, "dataset_unavailable", str(e))
+                return
 
             # /api/datasets/<id>/intersections?split=train
             if len(parts) == 4 and parts[3] == "intersections":
@@ -621,6 +628,29 @@ class AppHandler(BaseHTTPRequestHandler):
                     map_clip=map_clip,
                 )
                 self._send_json(200, bundle)
+                return
+
+            # /api/datasets/<id>/scene/<split>/<scene_id>/background
+            if len(parts) == 7 and parts[3] == "scene" and parts[6] == "background":
+                split = parts[4]
+                scene_id = parts[5]
+                getter = getattr(adapter, "get_scene_background", None)
+                if getter is None or not callable(getter):
+                    self._send_error_json(404, "not_found", "scene background not available for this dataset")
+                    return
+                bg_path = getter(split, scene_id)
+                if bg_path is None:
+                    self._send_error_json(404, "not_found", "scene background not found")
+                    return
+                p = Path(str(bg_path)).expanduser().resolve()
+                if not p.exists() or not p.is_file():
+                    self._send_error_json(404, "not_found", "scene background file is missing")
+                    return
+                body = p.read_bytes()
+                ctype, _ = mimetypes.guess_type(str(p))
+                if not ctype:
+                    ctype = "application/octet-stream"
+                self._send(200, body, ctype, extra_headers={"Cache-Control": "public, max-age=3600"})
                 return
 
             self._send_error_json(404, "not_found")

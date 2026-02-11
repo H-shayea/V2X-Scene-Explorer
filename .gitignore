@@ -35,6 +35,7 @@ dataset/Consider-It/
 dataset/raw_ConsiderIt/
 dataset/V2X-Seq-TFD/
 dataset/inD/
+dataset/SIND/
 
 # Local dataset overrides (private paths / basemap origins)
 dataset/registry.local.json

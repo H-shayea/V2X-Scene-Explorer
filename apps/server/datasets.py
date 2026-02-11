@@ -6,6 +6,8 @@ import json
 import math
 import os
 import re
+import threading
+import xml.etree.ElementTree as ET
 from collections import Counter, OrderedDict, defaultdict
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
@@ -149,6 +151,32 @@ def bbox_intersects(a: Dict[str, float], b: Dict[str, float]) -> bool:
     return not (a["max_x"] < b["min_x"] or a["min_x"] > b["max_x"] or a["max_y"] < b["min_y"] or a["min_y"] > b["max_y"])
 
 
+def read_png_size(path: Path) -> Optional[Tuple[int, int]]:
+    """
+    Read PNG width/height from IHDR chunk without external deps.
+    """
+    try:
+        with path.open("rb") as f:
+            raw = f.read(24)
+    except Exception:
+        return None
+    if len(raw) < 24:
+        return None
+    # PNG signature + IHDR length/type.
+    if raw[:8] != b"\x89PNG\r\n\x1a\n":
+        return None
+    if raw[12:16] != b"IHDR":
+        return None
+    try:
+        w = int.from_bytes(raw[16:20], "big", signed=False)
+        h = int.from_bytes(raw[20:24], "big", signed=False)
+    except Exception:
+        return None
+    if w <= 0 or h <= 0:
+        return None
+    return (w, h)
+
+
 @dataclass(frozen=True)
 class DatasetSpec:
     id: str
@@ -178,6 +206,71 @@ class SceneSummary:
     intersect_id: Optional[str]
     intersect_label: Optional[str]
     by_modality: Dict[str, Dict[str, Any]]
+
+
+@dataclass
+class _IndTrackMeta:
+    track_id: int
+    initial_frame: int
+    final_frame: int
+    width: Optional[float]
+    length: Optional[float]
+    cls: str
+
+
+@dataclass
+class _IndRecordingIndex:
+    recording_id: str
+    recording_id_num: int
+    location_id: str
+    location_label: str
+    frame_rate: float
+    duration_s: float
+    lat_location: Optional[float]
+    lon_location: Optional[float]
+    x_utm_origin: Optional[float]
+    y_utm_origin: Optional[float]
+    tracks_path: Path
+    tracks_meta_path: Path
+    recording_meta_path: Path
+    background_path: Optional[Path]
+    ortho_px_to_meter: float
+    tracks_meta: Dict[int, _IndTrackMeta]
+    tracks_meta_list: List[_IndTrackMeta]
+    max_frame: int
+    offsets_by_track: Optional[Dict[int, Tuple[int, int]]] = None
+    csv_columns: Optional[Dict[str, int]] = None
+
+
+@dataclass
+class _IndSceneRef:
+    scene_id: str
+    split: str
+    recording_id: str
+    location_id: str
+    location_label: str
+    window_i: int
+    frame_start: int
+    frame_end: int
+    min_ts: float
+    max_ts: float
+    rows: int
+    unique_agents: int
+
+
+@dataclass
+class _SindScenarioRef:
+    scene_id: str
+    split: str
+    city_id: str
+    city_label: str
+    scenario_id: str
+    scenario_label: str
+    veh_path: Optional[Path]
+    ped_path: Optional[Path]
+    tl_path: Optional[Path]
+    map_path: Optional[Path]
+    background_path: Optional[Path]
 
 
 def _split_from_table_name(name: str) -> str:
@@ -1334,6 +1427,2042 @@ class V2XSeqAdapter(V2XTrajAdapter):
         return out
 
 
+class InDAdapter:
+    """
+    Adapter for inD (drone) trajectories.
+
+    Scene model:
+    - split is always "all"
+    - group/intersection is inD locationId
+    - scene is a fixed-duration time window inside one recording
+    """
+
+    DEFAULT_WINDOW_S = 60
+    _SPLIT = "all"
+    _DEFAULT_BACKGROUND_SCALE_DOWN = 12.0
+
+    def __init__(self, spec: DatasetSpec, window_s: int | None = None) -> None:
+        self.spec = spec
+        self._bindings = spec.bindings if isinstance(spec.bindings, dict) else {}
+        strategy = spec.scene_strategy if isinstance(spec.scene_strategy, dict) else {}
+        strategy_window = strategy.get("window_s")
+        self.window_s = int(window_s or strategy_window or self.DEFAULT_WINDOW_S)
+        self.window_s = max(10, min(600, self.window_s))
+        self.background_scale_down = safe_float(strategy.get("background_scale_down"))
+        if self.background_scale_down is None or not (self.background_scale_down > 0):
+            self.background_scale_down = self._DEFAULT_BACKGROUND_SCALE_DOWN
+        self._lanelet_maps_by_location = self._discover_lanelet_maps()
+        self._lanelet_map_cache: Dict[Tuple[str, float, float, int], Dict[str, Any]] = {}
+
+        self._recordings: Dict[str, _IndRecordingIndex] = {}
+        self._scenes: Dict[str, _IndSceneRef] = {}
+        self._scene_ids_sorted: Dict[str, List[str]] = {self._SPLIT: []}
+        self._scene_ids_by_location: Dict[str, Dict[str, List[str]]] = {self._SPLIT: {}}
+        self._scene_index: Dict[str, Dict[str, int]] = {self._SPLIT: {}}
+        self._scene_index_by_location: Dict[str, Dict[str, Dict[str, int]]] = {self._SPLIT: {}}
+
+        self._build_index()
+        if not self._scenes:
+            raise ValueError("inD adapter could not discover any scenes")
+
+    def _binding_obj(self, role: str) -> Dict[str, Any]:
+        v = self._bindings.get(role) if isinstance(self._bindings, dict) else None
+        return v if isinstance(v, dict) else {}
+
+    def _binding_dir(self, role: str) -> Optional[Path]:
+        obj = self._binding_obj(role)
+        raw = obj.get("path")
+        if raw is None and isinstance(self._bindings.get(role), str):
+            raw = self._bindings.get(role)
+        if not raw:
+            return None
+        try:
+            p = Path(str(raw)).expanduser().resolve()
+        except Exception:
+            return None
+        if p.exists() and p.is_dir():
+            return p
+        return p
+
+    @staticmethod
+    def _location_label(location_id: str) -> str:
+        s = str(location_id or "").strip()
+        if s.isdigit():
+            return f"Location {int(s):02d}"
+        return f"Location {s or '?'}"
+
+    @staticmethod
+    def _as_int(raw: Any) -> Optional[int]:
+        v = safe_float(raw)
+        if v is None:
+            return None
+        try:
+            return int(v)
+        except Exception:
+            return None
+
+    @staticmethod
+    def _as_num_str(path: Path) -> Optional[Tuple[str, int]]:
+        m = re.match(r"^(\d+)_tracks\.csv$", path.name)
+        if not m:
+            return None
+        num_s = m.group(1)
+        try:
+            num = int(num_s)
+        except Exception:
+            return None
+        return num_s, num
+
+    def _discover_data_dir(self) -> Optional[Path]:
+        bound = self._binding_dir("data_dir")
+        if bound and bound.exists() and bound.is_dir():
+            return bound
+        root_data = (self.spec.root / "data").resolve()
+        if root_data.exists() and root_data.is_dir():
+            return root_data
+        if self.spec.root.exists() and self.spec.root.is_dir():
+            return self.spec.root
+        return None
+
+    def _discover_maps_dir(self) -> Optional[Path]:
+        bound = self._binding_dir("maps_dir")
+        candidates: List[Path] = []
+        if bound is not None:
+            candidates.append((bound / "lanelets").resolve())
+            candidates.append(bound.resolve())
+        candidates.append((self.spec.root / "maps" / "lanelets").resolve())
+        candidates.append((self.spec.root / "maps").resolve())
+        for p in candidates:
+            if p.exists() and p.is_dir():
+                return p
+        return None
+
+    def _discover_lanelet_maps(self) -> Dict[str, Dict[str, Path]]:
+        root = self._discover_maps_dir()
+        if root is None or not root.exists() or not root.is_dir():
+            return {}
+        files = sorted([p.resolve() for p in root.rglob("*.osm") if p.is_file()])
+        out: Dict[str, Dict[str, Path]] = {}
+        for p in files:
+            stem = p.stem.lower()
+            m = re.search(r"location\s*([0-9]+)", stem)
+            if not m:
+                continue
+            loc_id = str(int(m.group(1)))
+            bucket = out.setdefault(loc_id, {})
+            key = "construction" if "construction" in stem else "default"
+            if key not in bucket:
+                bucket[key] = p
+        return out
+
+    def _lanelet_map_path_for_recording(self, rec: _IndRecordingIndex) -> Optional[Path]:
+        loc = str(rec.location_id or "").strip()
+        if not loc:
+            return None
+        bucket = self._lanelet_maps_by_location.get(loc, {})
+        if not bucket:
+            return None
+        # inD note: location 1 uses a dedicated construction map for recordings 11..17.
+        if loc == "1" and rec.recording_id_num in {11, 12, 13, 14, 15, 16, 17}:
+            p = bucket.get("construction")
+            if p is not None:
+                return p
+        return bucket.get("default") or bucket.get("construction")
+
+    @staticmethod
+    def _utm_zone_from_lon(lon: float) -> int:
+        z = int((float(lon) + 180.0) / 6.0) + 1
+        return max(1, min(60, z))
+
+    @staticmethod
+    def _lat_lon_to_utm(lat: float, lon: float, zone: int) -> Tuple[float, float]:
+        # WGS84 -> UTM forward projection (no external dependency).
+        a = 6378137.0
+        f = 1.0 / 298.257223563
+        e2 = f * (2.0 - f)
+        ep2 = e2 / (1.0 - e2)
+        k0 = 0.9996
+
+        phi = math.radians(float(lat))
+        lam = math.radians(float(lon))
+        lam0 = math.radians((int(zone) - 1) * 6 - 180 + 3)
+
+        sin_phi = math.sin(phi)
+        cos_phi = math.cos(phi)
+        tan_phi = math.tan(phi)
+        n = a / math.sqrt(1.0 - e2 * sin_phi * sin_phi)
+        t = tan_phi * tan_phi
+        c = ep2 * cos_phi * cos_phi
+        a_ = cos_phi * (lam - lam0)
+
+        m = a * (
+            (1.0 - e2 / 4.0 - 3.0 * e2 * e2 / 64.0 - 5.0 * e2 * e2 * e2 / 256.0) * phi
+            - (3.0 * e2 / 8.0 + 3.0 * e2 * e2 / 32.0 + 45.0 * e2 * e2 * e2 / 1024.0) * math.sin(2.0 * phi)
+            + (15.0 * e2 * e2 / 256.0 + 45.0 * e2 * e2 * e2 / 1024.0) * math.sin(4.0 * phi)
+            - (35.0 * e2 * e2 * e2 / 3072.0) * math.sin(6.0 * phi)
+        )
+
+        easting = k0 * n * (
+            a_
+            + (1.0 - t + c) * (a_ ** 3) / 6.0
+            + (5.0 - 18.0 * t + t * t + 72.0 * c - 58.0 * ep2) * (a_ ** 5) / 120.0
+        ) + 500000.0
+
+        northing = k0 * (
+            m
+            + n * tan_phi * (
+                (a_ ** 2) / 2.0
+                + (5.0 - t + 9.0 * c + 4.0 * c * c) * (a_ ** 4) / 24.0
+                + (61.0 - 58.0 * t + t * t + 600.0 * c - 330.0 * ep2) * (a_ ** 6) / 720.0
+            )
+        )
+        if float(lat) < 0.0:
+            northing += 10000000.0
+        return easting, northing
+
+    def _lanelet_local_xy(self, rec: _IndRecordingIndex, lat: float, lon: float) -> Optional[Tuple[float, float]]:
+        x0 = rec.x_utm_origin
+        y0 = rec.y_utm_origin
+        if x0 is None or y0 is None:
+            return None
+        zone_hint = self._utm_zone_from_lon(rec.lon_location if rec.lon_location is not None else lon)
+        try:
+            x_utm, y_utm = self._lat_lon_to_utm(lat, lon, zone=zone_hint)
+        except Exception:
+            return None
+        return (float(x_utm) - float(x0), float(y_utm) - float(y0))
+
+    @staticmethod
+    def _resample_polyline(points: List[Tuple[float, float]], n_out: int) -> List[Tuple[float, float]]:
+        if n_out <= 1:
+            return points[:1]
+        if len(points) <= 1:
+            return points[:]
+        if len(points) == n_out:
+            return points[:]
+        out: List[Tuple[float, float]] = []
+        span = float(len(points) - 1)
+        for i in range(n_out):
+            t = span * (float(i) / float(n_out - 1))
+            j0 = int(math.floor(t))
+            j1 = min(len(points) - 1, j0 + 1)
+            a = t - float(j0)
+            x0, y0 = points[j0]
+            x1, y1 = points[j1]
+            out.append(((1.0 - a) * x0 + a * x1, (1.0 - a) * y0 + a * y1))
+        return out
+
+    @staticmethod
+    def _downsample_polyline(points: List[Tuple[float, float]], step: int) -> List[Tuple[float, float]]:
+        s = max(1, int(step))
+        if s <= 1 or len(points) <= max(12, s * 2):
+            return points
+        idxs = list(range(0, len(points), s))
+        last = len(points) - 1
+        if idxs[-1] != last:
+            idxs.append(last)
+        out: List[Tuple[float, float]] = [points[i] for i in idxs]
+        if len(out) < 2 and len(points) >= 2:
+            out = [points[0], points[-1]]
+        return out
+
+    @staticmethod
+    def _polyline_bbox(points: List[Tuple[float, float]]) -> Optional[Dict[str, float]]:
+        if not points:
+            return None
+        b = bbox_init()
+        for x, y in points:
+            bbox_update(b, x, y)
+        return b if bbox_is_valid(b) else None
+
+    def _load_lanelet_map_parsed(self, rec: _IndRecordingIndex, points_step: int) -> Optional[Dict[str, Any]]:
+        map_path = self._lanelet_map_path_for_recording(rec)
+        if map_path is None or not map_path.exists() or not map_path.is_file():
+            return None
+        if rec.x_utm_origin is None or rec.y_utm_origin is None:
+            return None
+
+        step = max(1, int(points_step))
+        key = (str(map_path), round(float(rec.x_utm_origin), 3), round(float(rec.y_utm_origin), 3), step)
+        cached = self._lanelet_map_cache.get(key)
+        if cached is not None:
+            return cached
+
+        tree = ET.parse(map_path)
+        root = tree.getroot()
+
+        nodes: Dict[str, Tuple[float, float]] = {}
+        for n in root.findall("node"):
+            nid = str(n.attrib.get("id") or "").strip()
+            lat = safe_float(n.attrib.get("lat"))
+            lon = safe_float(n.attrib.get("lon"))
+            if not nid or lat is None or lon is None:
+                continue
+            nodes[nid] = (float(lat), float(lon))
+
+        ways: Dict[str, List[str]] = {}
+        for w in root.findall("way"):
+            wid = str(w.attrib.get("id") or "").strip()
+            if not wid:
+                continue
+            refs = [str(nd.attrib.get("ref") or "").strip() for nd in w.findall("nd")]
+            ways[wid] = [r for r in refs if r]
+
+        def _way_points(wid: Optional[str]) -> List[Tuple[float, float]]:
+            if wid is None:
+                return []
+            refs = ways.get(wid, [])
+            out_pts: List[Tuple[float, float]] = []
+            for rid in refs:
+                ll = nodes.get(rid)
+                if ll is None:
+                    continue
+                xy = self._lanelet_local_xy(rec, ll[0], ll[1])
+                if xy is None:
+                    continue
+                x, y = xy
+                if out_pts and abs(x - out_pts[-1][0]) < 1e-9 and abs(y - out_pts[-1][1]) < 1e-9:
+                    continue
+                out_pts.append((x, y))
+            return out_pts
+
+        lanes: List[Dict[str, Any]] = []
+        map_bbox = bbox_init()
+        for rel in root.findall("relation"):
+            tags = {str(t.attrib.get("k") or ""): str(t.attrib.get("v") or "") for t in rel.findall("tag")}
+            if tags.get("type") != "lanelet":
+                continue
+
+            left_id: Optional[str] = None
+            right_id: Optional[str] = None
+            for m in rel.findall("member"):
+                if str(m.attrib.get("type") or "") != "way":
+                    continue
+                role = str(m.attrib.get("role") or "")
+                ref = str(m.attrib.get("ref") or "").strip()
+                if not ref:
+                    continue
+                if role == "left":
+                    left_id = ref
+                elif role == "right":
+                    right_id = ref
+
+            left = _way_points(left_id)
+            right = _way_points(right_id)
+
+            center: List[Tuple[float, float]] = []
+            if len(left) >= 2 and len(right) >= 2:
+                d_same = (left[0][0] - right[0][0]) ** 2 + (left[0][1] - right[0][1]) ** 2
+                d_same += (left[-1][0] - right[-1][0]) ** 2 + (left[-1][1] - right[-1][1]) ** 2
+                d_rev = (left[0][0] - right[-1][0]) ** 2 + (left[0][1] - right[-1][1]) ** 2
+                d_rev += (left[-1][0] - right[0][0]) ** 2 + (left[-1][1] - right[0][1]) ** 2
+                if d_rev < d_same:
+                    right = list(reversed(right))
+                n = max(len(left), len(right))
+                l2 = self._resample_polyline(left, n)
+                r2 = self._resample_polyline(right, n)
+                center = [((lp[0] + rp[0]) * 0.5, (lp[1] + rp[1]) * 0.5) for lp, rp in zip(l2, r2)]
+            elif len(left) >= 2:
+                center = left
+            elif len(right) >= 2:
+                center = right
+
+            center = self._downsample_polyline(center, step)
+            if len(center) < 2:
+                continue
+
+            b = self._polyline_bbox(center)
+            if b is None:
+                continue
+            bbox_update_from_bbox(map_bbox, b)
+            lanes.append(
+                {
+                    "id": str(rel.attrib.get("id") or f"lane_{len(lanes)+1}"),
+                    "lane_type": tags.get("subtype") or "road",
+                    "turn_direction": None,
+                    "is_intersection": bool((tags.get("subtype") or "").lower() in ("intersection",)),
+                    "has_traffic_control": False,
+                    "centerline": center,
+                    "bbox": b,
+                }
+            )
+
+        parsed = {
+            "map_id": map_path.stem,
+            "map_file": map_path.name,
+            "counts": {"LANE": len(lanes), "STOPLINE": 0, "CROSSWALK": 0, "JUNCTION": 0},
+            "lanes": lanes,
+            "stoplines": [],
+            "crosswalks": [],
+            "junctions": [],
+            "bbox": map_bbox if bbox_is_valid(map_bbox) else None,
+        }
+        self._lanelet_map_cache[key] = parsed
+        return parsed
+
+    def _clip_lanelet_map(
+        self,
+        parsed_map: Dict[str, Any],
+        extent: Dict[str, float],
+        max_lanes: int,
+        focus_xy: Optional[Tuple[float, float]] = None,
+    ) -> Dict[str, Any]:
+        lanes: List[Dict[str, Any]] = []
+        for lane in parsed_map.get("lanes", []) or []:
+            b = lane.get("bbox") if isinstance(lane, dict) else None
+            if not isinstance(b, dict):
+                continue
+            try:
+                if bbox_intersects(b, extent):
+                    lanes.append(lane)
+            except Exception:
+                continue
+        lanes_truncated = False
+        if max_lanes and len(lanes) > max_lanes:
+            if focus_xy:
+                cx, cy = focus_xy
+            else:
+                cx = (extent["min_x"] + extent["max_x"]) * 0.5
+                cy = (extent["min_y"] + extent["max_y"]) * 0.5
+
+            def _dist2(l: Dict[str, Any]) -> float:
+                b = l.get("bbox") or {}
+                mx = (float(b.get("min_x", 0.0)) + float(b.get("max_x", 0.0))) * 0.5
+                my = (float(b.get("min_y", 0.0)) + float(b.get("max_y", 0.0))) * 0.5
+                dx = mx - cx
+                dy = my - cy
+                return dx * dx + dy * dy
+
+            lanes.sort(key=_dist2)
+            lanes = lanes[: int(max_lanes)]
+            lanes_truncated = True
+
+        return {
+            "map_id": parsed_map.get("map_id"),
+            "map_file": parsed_map.get("map_file"),
+            "lanes_truncated": lanes_truncated,
+            "lanes": [
+                {
+                    "id": l.get("id"),
+                    "lane_type": l.get("lane_type"),
+                    "turn_direction": l.get("turn_direction"),
+                    "is_intersection": l.get("is_intersection"),
+                    "has_traffic_control": l.get("has_traffic_control"),
+                    "centerline": l.get("centerline") or [],
+                }
+                for l in lanes
+            ],
+            "stoplines": [],
+            "crosswalks": [],
+            "junctions": [],
+        }
+
+    def _read_recording_meta(self, path: Path) -> Dict[str, Any]:
+        try:
+            with path.open("r", newline="") as f:
+                row = next(csv.DictReader(f), None)
+        except Exception:
+            row = None
+        return row if isinstance(row, dict) else {}
+
+    def _read_tracks_meta(self, path: Path) -> Tuple[Dict[int, _IndTrackMeta], List[_IndTrackMeta], int]:
+        out: Dict[int, _IndTrackMeta] = {}
+        seq: List[_IndTrackMeta] = []
+        max_frame = -1
+        try:
+            with path.open("r", newline="") as f:
+                r = csv.DictReader(f)
+                for row in r:
+                    tid = self._as_int(row.get("trackId"))
+                    if tid is None:
+                        continue
+                    i0 = self._as_int(row.get("initialFrame"))
+                    i1 = self._as_int(row.get("finalFrame"))
+                    if i0 is None or i1 is None:
+                        continue
+                    tm = _IndTrackMeta(
+                        track_id=tid,
+                        initial_frame=int(i0),
+                        final_frame=int(i1),
+                        width=safe_float(row.get("width")),
+                        length=safe_float(row.get("length")),
+                        cls=str(row.get("class") or "").strip().lower(),
+                    )
+                    out[tid] = tm
+                    seq.append(tm)
+                    if tm.final_frame > max_frame:
+                        max_frame = tm.final_frame
+        except Exception:
+            pass
+        seq.sort(key=lambda x: x.track_id)
+        return out, seq, int(max_frame)
+
+    def _discover_recordings(self) -> List[_IndRecordingIndex]:
+        data_dir = self._discover_data_dir()
+        if data_dir is None or not data_dir.exists() or not data_dir.is_dir():
+            return []
+
+        tracks_files = sorted([p.resolve() for p in data_dir.glob("*_tracks.csv") if p.is_file()])
+        out: List[_IndRecordingIndex] = []
+
+        for tracks_path in tracks_files:
+            parsed = self._as_num_str(tracks_path)
+            if parsed is None:
+                continue
+            rec_s, rec_num = parsed
+            tracks_meta_path = (data_dir / f"{rec_s}_tracksMeta.csv").resolve()
+            recording_meta_path = (data_dir / f"{rec_s}_recordingMeta.csv").resolve()
+            if not tracks_meta_path.exists() or not recording_meta_path.exists():
+                continue
+
+            rec_meta = self._read_recording_meta(recording_meta_path)
+            frame_rate = safe_float(rec_meta.get("frameRate")) or 25.0
+            if not (frame_rate > 0):
+                frame_rate = 25.0
+            duration_s = safe_float(rec_meta.get("duration")) or 0.0
+            location_id = str(rec_meta.get("locationId") or "").strip() or "0"
+            location_label = self._location_label(location_id)
+            lat_location = safe_float(rec_meta.get("latLocation"))
+            lon_location = safe_float(rec_meta.get("lonLocation"))
+            x_utm_origin = safe_float(rec_meta.get("xUtmOrigin"))
+            y_utm_origin = safe_float(rec_meta.get("yUtmOrigin"))
+            ortho_px_to_meter = safe_float(rec_meta.get("orthoPxToMeter"))
+            if ortho_px_to_meter is None or not (ortho_px_to_meter > 0):
+                ortho_px_to_meter = 1.0
+
+            tmeta, tmeta_list, max_frame = self._read_tracks_meta(tracks_meta_path)
+            if max_frame < 0 and duration_s > 0:
+                max_frame = max(0, int(round(duration_s * frame_rate)) - 1)
+            if max_frame < 0:
+                continue
+
+            bg = (data_dir / f"{rec_s}_background.png").resolve()
+            bg_path = bg if bg.exists() and bg.is_file() else None
+
+            out.append(
+                _IndRecordingIndex(
+                    recording_id=rec_s,
+                    recording_id_num=rec_num,
+                    location_id=location_id,
+                    location_label=location_label,
+                    frame_rate=float(frame_rate),
+                    duration_s=float(duration_s),
+                    lat_location=lat_location,
+                    lon_location=lon_location,
+                    x_utm_origin=x_utm_origin,
+                    y_utm_origin=y_utm_origin,
+                    tracks_path=tracks_path,
+                    tracks_meta_path=tracks_meta_path,
+                    recording_meta_path=recording_meta_path,
+                    background_path=bg_path,
+                    ortho_px_to_meter=float(ortho_px_to_meter),
+                    tracks_meta=tmeta,
+                    tracks_meta_list=tmeta_list,
+                    max_frame=int(max_frame),
+                )
+            )
+
+        out.sort(key=lambda x: x.recording_id_num)
+        return out
+
+    def _window_stats(self, rec: _IndRecordingIndex, frame_start: int, frame_end: int) -> Tuple[int, int]:
+        rows = 0
+        unique_agents = 0
+        for tm in rec.tracks_meta_list:
+            lo = max(frame_start, tm.initial_frame)
+            hi = min(frame_end, tm.final_frame)
+            if hi < lo:
+                continue
+            unique_agents += 1
+            rows += (hi - lo + 1)
+        return rows, unique_agents
+
+    def _build_index(self) -> None:
+        split = self._SPLIT
+        by_location: Dict[str, List[str]] = defaultdict(list)
+        scene_n = 1
+        for rec in self._discover_recordings():
+            self._recordings[rec.recording_id] = rec
+            window_frames = max(1, int(round(float(self.window_s) * float(rec.frame_rate))))
+            max_frame = int(rec.max_frame)
+
+            if max_frame < 0:
+                continue
+
+            start = 0
+            wi = 0
+            while start <= max_frame:
+                end = min(max_frame, start + window_frames - 1)
+                scene_id = str(scene_n)
+                scene_n += 1
+                rows, unique_agents = self._window_stats(rec, start, end)
+                min_ts = float(start) / float(rec.frame_rate)
+                max_ts = float(end) / float(rec.frame_rate)
+
+                ref = _IndSceneRef(
+                    scene_id=scene_id,
+                    split=split,
+                    recording_id=rec.recording_id,
+                    location_id=rec.location_id,
+                    location_label=rec.location_label,
+                    window_i=wi,
+                    frame_start=int(start),
+                    frame_end=int(end),
+                    min_ts=min_ts,
+                    max_ts=max_ts,
+                    rows=int(rows),
+                    unique_agents=int(unique_agents),
+                )
+                self._scenes[scene_id] = ref
+                self._scene_ids_sorted[split].append(scene_id)
+                by_location[rec.location_id].append(scene_id)
+
+                wi += 1
+                start = end + 1
+
+        self._scene_ids_by_location[split] = dict(by_location)
+        self._scene_index[split] = {sid: i for i, sid in enumerate(self._scene_ids_sorted[split])}
+        self._scene_index_by_location[split] = {
+            lid: {sid: i for i, sid in enumerate(ids)}
+            for lid, ids in self._scene_ids_by_location[split].items()
+        }
+
+    def list_intersections(self, split: str) -> List[Dict[str, Any]]:
+        split = self._SPLIT
+        items = []
+        by_loc = self._scene_ids_by_location.get(split, {})
+        for loc_id, ids in by_loc.items():
+            items.append(
+                {
+                    "intersect_id": str(loc_id),
+                    "intersect_label": self._location_label(loc_id),
+                    "count": int(len(ids)),
+                }
+            )
+
+        def _loc_key(it: Dict[str, Any]) -> Tuple[int, str]:
+            s = str(it.get("intersect_id") or "")
+            return (int(s), s) if s.isdigit() else (10**9, s)
+
+        items.sort(key=_loc_key)
+        return items
+
+    def _list_scene_ids(self, intersect_id: Optional[str]) -> List[str]:
+        split = self._SPLIT
+        if intersect_id:
+            return list(self._scene_ids_by_location.get(split, {}).get(str(intersect_id), []))
+        return list(self._scene_ids_sorted.get(split, []))
+
+    @staticmethod
+    def _scene_label(ref: _IndSceneRef) -> str:
+        dur = max(0.0, float(ref.max_ts) - float(ref.min_ts))
+        return f"Recording {ref.recording_id} · Window {ref.window_i + 1} · {dur:.1f}s"
+
+    def list_scenes(
+        self,
+        split: str,
+        intersect_id: Optional[str] = None,
+        limit: int = 200,
+        offset: int = 0,
+        include_tl_only: bool = False,
+    ) -> Dict[str, Any]:
+        split = self._SPLIT
+        ids = self._list_scene_ids(intersect_id=intersect_id)
+        total = len(ids)
+        slice_ids = ids[offset : offset + limit]
+
+        items = []
+        for sid in slice_ids:
+            ref = self._scenes[sid]
+            duration_s = max(0.0, ref.max_ts - ref.min_ts)
+            items.append(
+                {
+                    "scene_id": ref.scene_id,
+                    "scene_label": self._scene_label(ref),
+                    "recording_id": ref.recording_id,
+                    "window_index": int(ref.window_i),
+                    "split": split,
+                    "city": None,
+                    "intersect_id": ref.location_id,
+                    "intersect_label": ref.location_label,
+                    "by_modality": {
+                        "infra": {
+                            "rows": int(ref.rows),
+                            "min_ts": float(ref.min_ts),
+                            "max_ts": float(ref.max_ts),
+                            "unique_ts": int(max(0, ref.frame_end - ref.frame_start + 1)),
+                            "duration_s": duration_s,
+                            "unique_agents": int(ref.unique_agents),
+                        }
+                    },
+                }
+            )
+
+        return {
+            "total": total,
+            "limit": int(limit),
+            "offset": int(offset),
+            "items": items,
+            "availability": {"scene_count": total, "by_modality": {"infra": total}},
+            "include_tl_only": bool(include_tl_only),
+        }
+
+    def locate_scene(self, split: str, scene_id: str) -> Dict[str, Any]:
+        split = self._SPLIT
+        sid = str(scene_id or "")
+        ref = self._scenes.get(sid)
+        if ref is None:
+            return {"split": split, "scene_id": sid, "found": False}
+
+        idx_all = self._scene_index.get(split, {}).get(sid)
+        idx_loc = self._scene_index_by_location.get(split, {}).get(ref.location_id, {}).get(sid)
+        total_loc = len(self._scene_ids_by_location.get(split, {}).get(ref.location_id, []))
+
+        return {
+            "split": split,
+            "scene_id": sid,
+            "found": True,
+            "city": None,
+            "intersect_id": ref.location_id,
+            "intersect_label": ref.location_label,
+            "recording_id": ref.recording_id,
+            "window_index": int(ref.window_i),
+            "index_all": idx_all,
+            "total_all": len(self._scene_ids_sorted.get(split, [])),
+            "index_in_intersection": idx_loc,
+            "total_in_intersection": total_loc,
+        }
+
+    @staticmethod
+    def _class_to_type_and_subtype(raw_cls: str) -> Tuple[str, Optional[str]]:
+        c = str(raw_cls or "").strip().lower()
+        if c in ("car", "truck_bus", "truck", "bus", "van", "motorcycle"):
+            return "VEHICLE", c.upper()
+        if c in ("pedestrian",):
+            return "PEDESTRIAN", "PEDESTRIAN"
+        if c in ("bicycle",):
+            return "BICYCLE", "BICYCLE"
+        if c:
+            return "OTHER", c.upper()
+        return "UNKNOWN", None
+
+    @staticmethod
+    def _csv_index_map(header_line: str) -> Dict[str, int]:
+        try:
+            header = next(csv.reader([header_line]))
+        except Exception:
+            header = [x.strip() for x in str(header_line or "").strip().split(",")]
+        return {str(name): i for i, name in enumerate(header)}
+
+    def _ensure_offsets(self, rec: _IndRecordingIndex) -> None:
+        if rec.offsets_by_track is not None and rec.csv_columns is not None:
+            return
+
+        offsets: Dict[int, Tuple[int, int]] = {}
+        columns: Dict[str, int] = {}
+        with rec.tracks_path.open("r", encoding="utf-8", errors="replace", newline="") as f:
+            header_line = f.readline()
+            if not header_line:
+                rec.offsets_by_track = {}
+                rec.csv_columns = {}
+                return
+            idx_by_name = self._csv_index_map(header_line)
+
+            def idx(name: str) -> int:
+                v = idx_by_name.get(name)
+                return int(v) if v is not None else -1
+
+            columns = {
+                "trackId": idx("trackId"),
+                "frame": idx("frame"),
+                "xCenter": idx("xCenter"),
+                "yCenter": idx("yCenter"),
+                "heading": idx("heading"),
+                "width": idx("width"),
+                "length": idx("length"),
+                "xVelocity": idx("xVelocity"),
+                "yVelocity": idx("yVelocity"),
+            }
+
+            if columns["trackId"] < 0 or columns["frame"] < 0:
+                rec.offsets_by_track = {}
+                rec.csv_columns = columns
+                return
+
+            cur_track: Optional[int] = None
+            cur_start = f.tell()
+            while True:
+                pos = f.tell()
+                line = f.readline()
+                if not line:
+                    break
+                parts = line.rstrip("\r\n").split(",")
+                i_tid = columns["trackId"]
+                if i_tid >= len(parts):
+                    continue
+                tid = self._as_int(parts[i_tid])
+                if tid is None:
+                    continue
+
+                if cur_track is None:
+                    cur_track = int(tid)
+                    cur_start = pos
+                elif tid != cur_track:
+                    offsets[int(cur_track)] = (int(cur_start), int(pos))
+                    cur_track = int(tid)
+                    cur_start = pos
+
+            end_pos = f.tell()
+            if cur_track is not None:
+                offsets[int(cur_track)] = (int(cur_start), int(end_pos))
+
+        rec.offsets_by_track = offsets
+        rec.csv_columns = columns
+
+    @staticmethod
+    def _col(parts: List[str], cols: Dict[str, int], key: str) -> Optional[str]:
+        i = int(cols.get(key, -1))
+        if i < 0 or i >= len(parts):
+            return None
+        return parts[i]
+
+    def _active_tracks(self, rec: _IndRecordingIndex, frame_start: int, frame_end: int) -> List[_IndTrackMeta]:
+        out: List[_IndTrackMeta] = []
+        for tm in rec.tracks_meta_list:
+            if tm.final_frame < frame_start or tm.initial_frame > frame_end:
+                continue
+            out.append(tm)
+        return out
+
+    def _background_meta_for_recording(self, rec: _IndRecordingIndex) -> Optional[Dict[str, Any]]:
+        if rec.background_path is None or not rec.background_path.exists() or not rec.background_path.is_file():
+            return None
+        size = read_png_size(rec.background_path)
+        if not size:
+            return None
+        width_px, height_px = size
+        meters_per_px = float(rec.ortho_px_to_meter) * float(self.background_scale_down)
+        if not (meters_per_px > 0):
+            return None
+        return {
+            "kind": "scene_image",
+            "path": str(rec.background_path),
+            "size_px": {"width": int(width_px), "height": int(height_px)},
+            "meters_per_px": float(meters_per_px),
+            # inD helper uses xCenterVis = x/ortho and yCenterVis = -y/ortho;
+            # displayed image is down-scaled by `background_scale_down`.
+            "extent": {
+                "min_x": 0.0,
+                "max_x": float(width_px) * meters_per_px,
+                "min_y": -float(height_px) * meters_per_px,
+                "max_y": 0.0,
+            },
+        }
+
+    def get_scene_background(self, split: str, scene_id: str) -> Optional[Path]:
+        split = self._SPLIT
+        sid = str(scene_id or "")
+        ref = self._scenes.get(sid)
+        if ref is None:
+            return None
+        rec = self._recordings.get(ref.recording_id)
+        if rec is None:
+            return None
+        bg = rec.background_path
+        if bg is None or not bg.exists() or not bg.is_file():
+            return None
+        return bg
+
+    def load_scene_bundle(
+        self,
+        split: str,
+        scene_id: str,
+        include_map: bool = True,
+        map_padding: float = 60.0,
+        map_points_step: int = 5,
+        max_lanes: int = 4000,
+        map_clip: str = "intersection",
+    ) -> Dict[str, Any]:
+        split = self._SPLIT
+        sid = str(scene_id or "")
+        ref = self._scenes.get(sid)
+        if ref is None:
+            raise KeyError(f"scene not found: {sid}")
+        rec = self._recordings.get(ref.recording_id)
+        if rec is None:
+            raise KeyError(f"recording not found for scene: {sid}")
+
+        self._ensure_offsets(rec)
+        cols = rec.csv_columns or {}
+        offsets = rec.offsets_by_track or {}
+
+        warnings: List[str] = []
+        by_frame: Dict[int, List[Dict[str, Any]]] = defaultdict(list)
+        extent = bbox_init()
+        rows = 0
+        obj_ids: set[str] = set()
+
+        active_tracks = self._active_tracks(rec, ref.frame_start, ref.frame_end)
+        if not active_tracks:
+            warnings.append("scene_window_empty")
+
+        with rec.tracks_path.open("r", encoding="utf-8", errors="replace", newline="") as f:
+            # Iterate by track segments, not by full file scan.
+            for tm in active_tracks:
+                off = offsets.get(tm.track_id)
+                if not off:
+                    continue
+                start_off, end_off = off
+                f.seek(start_off)
+                while f.tell() < end_off:
+                    line = f.readline()
+                    if not line:
+                        break
+                    parts = line.rstrip("\r\n").split(",")
+
+                    frame_i = self._as_int(self._col(parts, cols, "frame"))
+                    if frame_i is None:
+                        continue
+                    frame = int(frame_i)
+                    if frame < ref.frame_start or frame > ref.frame_end:
+                        continue
+
+                    x = safe_float(self._col(parts, cols, "xCenter"))
+                    y = safe_float(self._col(parts, cols, "yCenter"))
+                    if x is not None and y is not None:
+                        bbox_update(extent, x, y)
+
+                    heading = safe_float(self._col(parts, cols, "heading"))
+                    theta = math.radians(float(heading)) if heading is not None else None
+
+                    width = safe_float(self._col(parts, cols, "width"))
+                    length = safe_float(self._col(parts, cols, "length"))
+                    if width is None:
+                        width = tm.width
+                    if length is None:
+                        length = tm.length
+
+                    v_x = safe_float(self._col(parts, cols, "xVelocity"))
+                    v_y = safe_float(self._col(parts, cols, "yVelocity"))
+                    t, st = self._class_to_type_and_subtype(tm.cls)
+
+                    obj_id = str(tm.track_id)
+                    rec_out = {
+                        "id": obj_id,
+                        "track_id": obj_id,
+                        "object_id": obj_id,
+                        "type": t,
+                        "sub_type": st,
+                        "sub_type_code": None,
+                        "tag": f"recording-{rec.recording_id}",
+                        "x": x,
+                        "y": y,
+                        "z": None,
+                        "length": length,
+                        "width": width,
+                        "height": None,
+                        "theta": theta,
+                        "v_x": v_x,
+                        "v_y": v_y,
+                    }
+                    by_frame[frame].append(rec_out)
+                    obj_ids.add(obj_id)
+                    rows += 1
+
+        frame_keys = sorted(by_frame.keys())
+        timestamps = [float(fr) / float(rec.frame_rate) for fr in frame_keys]
+        t0 = timestamps[0] if timestamps else 0.0
+
+        if not bbox_is_valid(extent):
+            extent = {"min_x": -10.0, "min_y": -10.0, "max_x": 10.0, "max_y": 10.0}
+            warnings.append("extent_missing")
+        if rows <= 0:
+            warnings.append("scene_window_empty")
+
+        frames: List[Dict[str, Any]] = []
+        for fr in frame_keys:
+            frames.append({"infra": by_frame.get(fr, [])})
+
+        modality_stats = {
+            "ego": {"rows": 0, "unique_ts": 0, "min_ts": None, "max_ts": None},
+            "vehicle": {"rows": 0, "unique_ts": 0, "min_ts": None, "max_ts": None},
+            "traffic_light": {"rows": 0, "unique_ts": 0, "min_ts": None, "max_ts": None},
+            "infra": {
+                "rows": int(rows),
+                "unique_ts": int(len(frame_keys)),
+                "min_ts": timestamps[0] if timestamps else None,
+                "max_ts": timestamps[-1] if timestamps else None,
+                "unique_agents": int(len(obj_ids)),
+            },
+        }
+
+        background = self._background_meta_for_recording(rec)
+        if background is not None:
+            background["url"] = f"/api/datasets/{self.spec.id}/scene/{split}/{sid}/background"
+            background["recording_id"] = rec.recording_id
+
+        map_out: Optional[Dict[str, Any]] = None
+        map_id: Optional[str] = None
+        if include_map:
+            try:
+                parsed_map = self._load_lanelet_map_parsed(rec, points_step=map_points_step)
+                if parsed_map is None:
+                    warnings.append("map_missing")
+                elif parsed_map.get("bbox") is not None:
+                    if map_clip == "scene":
+                        clip_extent = bbox_pad(extent, map_padding)
+                    else:
+                        clip_extent = parsed_map["bbox"]
+                    focus_xy = (
+                        (extent["min_x"] + extent["max_x"]) * 0.5,
+                        (extent["min_y"] + extent["max_y"]) * 0.5,
+                    )
+                    map_out = self._clip_lanelet_map(parsed_map, clip_extent, max_lanes=max_lanes, focus_xy=focus_xy)
+                    map_out["clip_mode"] = str(map_clip or "intersection")
+                    map_out["clip_extent"] = clip_extent
+                    map_out["points_step"] = int(max(1, map_points_step))
+                    map_out["counts"] = dict(parsed_map.get("counts") or {})
+                    map_out["bbox"] = parsed_map.get("bbox")
+                    map_id = str(parsed_map.get("map_id") or "")
+                    if map_id == "":
+                        map_id = None
+                else:
+                    warnings.append("map_empty")
+            except Exception as e:
+                warnings.append(f"map_load_failed:{e}")
+
+        window_count = 0
+        for x in self._scenes.values():
+            if x.recording_id == ref.recording_id:
+                window_count += 1
+
+        return {
+            "dataset_id": self.spec.id,
+            "split": split,
+            "scene_id": sid,
+            "scene_label": self._scene_label(ref),
+            "city": None,
+            "intersect_id": ref.location_id,
+            "intersect_label": ref.location_label,
+            "recording_id": rec.recording_id,
+            "recording_label": f"Recording {rec.recording_id}",
+            "window_index": int(ref.window_i),
+            "window_count": int(window_count),
+            "intersect_by_modality": {"infra": ref.location_id},
+            "map_id": map_id,
+            "t0": t0,
+            "timestamps": timestamps,
+            "extent": extent,
+            "map": map_out,
+            "background": background,
+            "modality_stats": modality_stats,
+            "frames": frames,
+            "warnings": warnings,
+        }
+
+
+class SinDAdapter:
+    """
+    Adapter for SinD (signalized intersection drone dataset).
+
+    Scene model:
+    - split is always "all"
+    - group/intersection is city
+    - scene is one scenario folder
+    """
+
+    _SPLIT = "all"
+
+    def __init__(self, spec: DatasetSpec) -> None:
+        self.spec = spec
+        self._bindings = spec.bindings if isinstance(spec.bindings, dict) else {}
+        self._scenes: Dict[str, _SindScenarioRef] = {}
+        self._scene_ids_sorted: Dict[str, List[str]] = {self._SPLIT: []}
+        self._scene_ids_by_city: Dict[str, Dict[str, List[str]]] = {self._SPLIT: {}}
+        self._scene_index: Dict[str, Dict[str, int]] = {self._SPLIT: {}}
+        self._scene_index_by_city: Dict[str, Dict[str, Dict[str, int]]] = {self._SPLIT: {}}
+        self._lanelet_map_cache: Dict[Tuple[str, int], Dict[str, Any]] = {}
+        self._build_index()
+        if not self._scenes:
+            raise ValueError("SinD adapter could not discover any scenes")
+
+    def _binding_obj(self, role: str) -> Dict[str, Any]:
+        v = self._bindings.get(role) if isinstance(self._bindings, dict) else None
+        return v if isinstance(v, dict) else {}
+
+    def _binding_dir(self, role: str) -> Optional[Path]:
+        obj = self._binding_obj(role)
+        raw = obj.get("path")
+        if raw is None and isinstance(self._bindings.get(role), str):
+            raw = self._bindings.get(role)
+        if not raw:
+            return None
+        try:
+            p = Path(str(raw)).expanduser().resolve()
+        except Exception:
+            return None
+        if p.exists() and p.is_dir():
+            return p
+        return p
+
+    def _discover_data_dir(self) -> Optional[Path]:
+        bound = self._binding_dir("data_dir")
+        if bound and bound.exists() and bound.is_dir():
+            return bound
+        if self.spec.root.exists() and self.spec.root.is_dir():
+            return self.spec.root.resolve()
+        return None
+
+    @staticmethod
+    def _city_label(city_id: str) -> str:
+        s = str(city_id or "").strip()
+        if not s:
+            return "City ?"
+        return s.replace("_", " ")
+
+    @staticmethod
+    def _scenario_sort_key(name: str) -> Tuple[int, str]:
+        m = re.search(r"(\d+)", str(name or ""))
+        if m:
+            try:
+                return int(m.group(1)), str(name)
+            except Exception:
+                pass
+        return (10**9), str(name)
+
+    @staticmethod
+    def _is_scenario_dir(path: Path) -> bool:
+        if not path.exists() or not path.is_dir():
+            return False
+        return (path / "Veh_smoothed_tracks.csv").exists() or (path / "Ped_smoothed_tracks.csv").exists()
+
+    def _discover_city_blocks(self) -> List[Tuple[str, Path, List[Path], Optional[Path], Optional[Path]]]:
+        data_dir = self._discover_data_dir()
+        if data_dir is None or not data_dir.exists() or not data_dir.is_dir():
+            return []
+
+        first_level = [p for p in sorted(data_dir.iterdir()) if p.is_dir() and not p.name.startswith(".")]
+        direct_scenarios = [p for p in first_level if self._is_scenario_dir(p)]
+
+        blocks: List[Tuple[str, Path, List[Path], Optional[Path], Optional[Path]]] = []
+        if direct_scenarios:
+            city_id = str(data_dir.name or "city").strip()
+            city_dir = data_dir
+            map_file = next(iter(sorted([p for p in city_dir.glob("*.osm") if p.is_file()])), None)
+            bg_file = next(iter(sorted([p for p in city_dir.glob("*.png") if p.is_file()])), None)
+            blocks.append((city_id, city_dir, sorted(direct_scenarios, key=lambda x: self._scenario_sort_key(x.name)), map_file, bg_file))
+            return blocks
+
+        for city_dir in first_level:
+            scenarios = [p for p in sorted(city_dir.iterdir()) if p.is_dir() and not p.name.startswith(".") and self._is_scenario_dir(p)]
+            if not scenarios:
+                continue
+            city_id = str(city_dir.name).strip()
+            map_file = next(iter(sorted([p for p in city_dir.glob("*.osm") if p.is_file()])), None)
+            bg_file = next(iter(sorted([p for p in city_dir.glob("*.png") if p.is_file()])), None)
+            blocks.append((city_id, city_dir, sorted(scenarios, key=lambda x: self._scenario_sort_key(x.name)), map_file, bg_file))
+
+        blocks.sort(key=lambda x: str(x[0]).lower())
+        return blocks
+
+    def _build_index(self) -> None:
+        split = self._SPLIT
+        by_city: Dict[str, List[str]] = defaultdict(list)
+        sid_n = 1
+        for city_id, city_dir, scenarios, map_file, bg_file in self._discover_city_blocks():
+            _ = city_dir
+            city_label = self._city_label(city_id)
+            for scen in scenarios:
+                sid = str(sid_n)
+                sid_n += 1
+                ref = _SindScenarioRef(
+                    scene_id=sid,
+                    split=split,
+                    city_id=city_id,
+                    city_label=city_label,
+                    scenario_id=scen.name,
+                    scenario_label=scen.name.replace("_", " "),
+                    veh_path=(scen / "Veh_smoothed_tracks.csv").resolve() if (scen / "Veh_smoothed_tracks.csv").exists() else None,
+                    ped_path=(scen / "Ped_smoothed_tracks.csv").resolve() if (scen / "Ped_smoothed_tracks.csv").exists() else None,
+                    tl_path=self._discover_traffic_light_file(scen),
+                    map_path=map_file.resolve() if isinstance(map_file, Path) and map_file.exists() else None,
+                    background_path=bg_file.resolve() if isinstance(bg_file, Path) and bg_file.exists() else None,
+                )
+                self._scenes[sid] = ref
+                self._scene_ids_sorted[split].append(sid)
+                by_city[city_id].append(sid)
+
+        self._scene_ids_by_city[split] = dict(by_city)
+        self._scene_index[split] = {sid: i for i, sid in enumerate(self._scene_ids_sorted[split])}
+        self._scene_index_by_city[split] = {
+            cid: {sid: i for i, sid in enumerate(ids)}
+            for cid, ids in self._scene_ids_by_city[split].items()
+        }
+
+    @staticmethod
+    def _discover_traffic_light_file(scene_dir: Path) -> Optional[Path]:
+        csvs = [p for p in scene_dir.glob("*.csv") if p.is_file()]
+        ranked: List[Tuple[int, Path]] = []
+        for p in csvs:
+            n = p.name.lower()
+            if "traffic" not in n or "meta" in n or n.startswith(".~lock"):
+                continue
+            score = 0
+            if "trafficlight" in n:
+                score += 2
+            if "traffic_lights" in n:
+                score += 1
+            ranked.append((score, p.resolve()))
+        if not ranked:
+            return None
+        ranked.sort(key=lambda x: (-x[0], str(x[1]).lower()))
+        return ranked[0][1]
+
+    def list_intersections(self, split: str) -> List[Dict[str, Any]]:
+        split = self._SPLIT
+        out = []
+        for cid, ids in self._scene_ids_by_city.get(split, {}).items():
+            out.append(
+                {
+                    "intersect_id": str(cid),
+                    "intersect_label": self._city_label(cid),
+                    "count": int(len(ids)),
+                }
+            )
+        out.sort(key=lambda x: str(x.get("intersect_label") or "").lower())
+        return out
+
+    def _list_scene_ids(self, intersect_id: Optional[str]) -> List[str]:
+        split = self._SPLIT
+        if intersect_id:
+            return list(self._scene_ids_by_city.get(split, {}).get(str(intersect_id), []))
+        return list(self._scene_ids_sorted.get(split, []))
+
+    @staticmethod
+    def _scene_label(ref: _SindScenarioRef) -> str:
+        return f"{ref.scenario_label} · {ref.city_label}"
+
+    def list_scenes(
+        self,
+        split: str,
+        intersect_id: Optional[str] = None,
+        limit: int = 200,
+        offset: int = 0,
+        include_tl_only: bool = False,
+    ) -> Dict[str, Any]:
+        split = self._SPLIT
+        ids = self._list_scene_ids(intersect_id=intersect_id)
+        if include_tl_only:
+            ids = [sid for sid in ids if self._scenes.get(sid) and self._scenes[sid].tl_path is not None]
+        total = len(ids)
+        slice_ids = ids[offset : offset + limit]
+
+        items: List[Dict[str, Any]] = []
+        n_tl = 0
+        for sid in slice_ids:
+            ref = self._scenes[sid]
+            has_tl = ref.tl_path is not None and ref.tl_path.exists()
+            if has_tl:
+                n_tl += 1
+            items.append(
+                {
+                    "scene_id": ref.scene_id,
+                    "scene_label": self._scene_label(ref),
+                    "recording_id": ref.scenario_id,
+                    "window_index": 0,
+                    "split": split,
+                    "city": ref.city_id,
+                    "intersect_id": ref.city_id,
+                    "intersect_label": ref.city_label,
+                    "by_modality": {
+                        "infra": {
+                            "rows": 0,
+                            "min_ts": None,
+                            "max_ts": None,
+                            "unique_ts": 0,
+                            "duration_s": None,
+                            "unique_agents": 0,
+                        },
+                        "traffic_light": {
+                            "rows": 0,
+                            "min_ts": None,
+                            "max_ts": None,
+                            "unique_ts": 0,
+                        } if has_tl else {"rows": 0, "min_ts": None, "max_ts": None, "unique_ts": 0},
+                    },
+                }
+            )
+
+        return {
+            "total": total,
+            "limit": int(limit),
+            "offset": int(offset),
+            "items": items,
+            "availability": {
+                "scene_count": total,
+                "by_modality": {
+                    "infra": total,
+                    "traffic_light": n_tl if slice_ids else len([sid for sid in ids if self._scenes[sid].tl_path is not None]),
+                },
+            },
+            "include_tl_only": bool(include_tl_only),
+        }
+
+    def locate_scene(self, split: str, scene_id: str) -> Dict[str, Any]:
+        split = self._SPLIT
+        sid = str(scene_id or "")
+        ref = self._scenes.get(sid)
+        if ref is None:
+            return {"split": split, "scene_id": sid, "found": False}
+        idx_all = self._scene_index.get(split, {}).get(sid)
+        idx_city = self._scene_index_by_city.get(split, {}).get(ref.city_id, {}).get(sid)
+        total_city = len(self._scene_ids_by_city.get(split, {}).get(ref.city_id, []))
+        return {
+            "split": split,
+            "scene_id": sid,
+            "found": True,
+            "city": ref.city_id,
+            "intersect_id": ref.city_id,
+            "intersect_label": ref.city_label,
+            "recording_id": ref.scenario_id,
+            "window_index": 0,
+            "index_all": idx_all,
+            "total_all": len(self._scene_ids_sorted.get(split, [])),
+            "index_in_intersection": idx_city,
+            "total_in_intersection": total_city,
+        }
+
+    @staticmethod
+    def _as_int(raw: Any) -> Optional[int]:
+        v = safe_float(raw)
+        if v is None:
+            return None
+        try:
+            return int(v)
+        except Exception:
+            return None
+
+    @staticmethod
+    def _ts_key_from_ms(raw: Any) -> Optional[int]:
+        v = safe_float(raw)
+        if v is None:
+            return None
+        return int(round(float(v) / 100.0))
+
+    @staticmethod
+    def _ts_from_key(ts_key: int) -> float:
+        return float(ts_key) / 10.0
+
+    @staticmethod
+    def _class_to_type_and_subtype(raw_cls: str) -> Tuple[str, Optional[str]]:
+        c = str(raw_cls or "").strip().lower()
+        if c in ("car", "truck", "bus", "van", "motorcycle", "tricycle"):
+            return "VEHICLE", c.upper()
+        if c in ("pedestrian", "person"):
+            return "PEDESTRIAN", "PEDESTRIAN"
+        if c in ("bicycle", "cyclist"):
+            return "BICYCLE", "BICYCLE"
+        if c in ("animal",):
+            return "ANIMAL", "ANIMAL"
+        if c:
+            return "OTHER", c.upper()
+        return "UNKNOWN", None
+
+    def _read_tracks_csv(
+        self,
+        path: Path,
+        source_tag: str,
+    ) -> Tuple[Dict[int, List[Dict[str, Any]]], Dict[str, float], int, set[str]]:
+        by_ts: Dict[int, List[Dict[str, Any]]] = defaultdict(list)
+        extent = bbox_init()
+        rows = 0
+        unique_ids: set[str] = set()
+
+        if not path.exists() or not path.is_file():
+            return {}, extent, 0, unique_ids
+
+        with path.open("r", encoding="utf-8", errors="replace", newline="") as f:
+            r = csv.DictReader(f)
+            for row in r:
+                ts_key = self._ts_key_from_ms(row.get("timestamp_ms"))
+                if ts_key is None:
+                    fr = self._as_int(row.get("frame_id"))
+                    if fr is not None:
+                        ts_key = int(fr)
+                if ts_key is None:
+                    continue
+
+                x = safe_float(row.get("x"))
+                y = safe_float(row.get("y"))
+                if x is not None and y is not None:
+                    bbox_update(extent, x, y)
+
+                track_raw = row.get("track_id")
+                if track_raw is None or str(track_raw).strip() == "":
+                    track_raw = row.get("id")
+                track_id = str(track_raw or f"row{rows+1}")
+                obj_id = f"{source_tag}:{track_id}"
+
+                cls_raw = str(row.get("agent_type") or "").strip()
+                if not cls_raw:
+                    cls_raw = "pedestrian" if source_tag == "ped" else "vehicle"
+                obj_type, sub_type = self._class_to_type_and_subtype(cls_raw)
+                theta = safe_float(row.get("heading_rad"))
+                if theta is None:
+                    theta = safe_float(row.get("yaw_rad"))
+
+                rec = {
+                    "id": obj_id,
+                    "track_id": track_id,
+                    "object_id": track_id,
+                    "type": obj_type,
+                    "sub_type": sub_type,
+                    "sub_type_code": None,
+                    "tag": source_tag,
+                    "x": x,
+                    "y": y,
+                    "z": None,
+                    "length": safe_float(row.get("length")),
+                    "width": safe_float(row.get("width")),
+                    "height": None,
+                    "theta": theta,
+                    "v_x": safe_float(row.get("vx")),
+                    "v_y": safe_float(row.get("vy")),
+                }
+                by_ts[ts_key].append(rec)
+                unique_ids.add(obj_id)
+                rows += 1
+
+        return by_ts, extent, rows, unique_ids
+
+    @staticmethod
+    def _normalize_col_name(raw: str) -> str:
+        return re.sub(r"[^a-z0-9]+", "", str(raw or "").strip().lower())
+
+    def _tl_timestamp_column(self, fieldnames: List[str]) -> Optional[str]:
+        if not fieldnames:
+            return None
+        norm = {self._normalize_col_name(x): x for x in fieldnames}
+        for key in ("timestampms", "timestamp", "timems", "time"):
+            if key in norm:
+                return norm[key]
+        for x in fieldnames:
+            n = self._normalize_col_name(x)
+            if "timestamp" in n:
+                return x
+        return None
+
+    def _tl_state_columns(self, path: Optional[Path]) -> List[str]:
+        if path is None or not path.exists() or not path.is_file():
+            return []
+        try:
+            with path.open("r", encoding="utf-8", errors="replace", newline="") as f:
+                r = csv.DictReader(f)
+                fieldnames = [str(x or "").strip() for x in (r.fieldnames or []) if str(x or "").strip()]
+        except Exception:
+            return []
+        out = []
+        for col in fieldnames:
+            n = self._normalize_col_name(col)
+            if "trafficlight" in n or ("traffic" in n and "light" in n):
+                out.append(col)
+        return out
+
+    @staticmethod
+    def _tl_color_from_value(raw: Any) -> Optional[str]:
+        s = str(raw or "").strip()
+        if s == "":
+            return None
+        low = s.lower()
+        if "red" in low:
+            return "RED"
+        if "yellow" in low:
+            return "YELLOW"
+        if "green" in low:
+            return "GREEN"
+        try:
+            v = int(float(low))
+        except Exception:
+            return None
+        if v == 0:
+            return "RED"
+        if v == 1:
+            return "YELLOW"
+        if v in (2, 3):
+            return "GREEN"
+        return None
+
+    def _read_traffic_lights_csv(
+        self,
+        path: Optional[Path],
+        anchors: List[Tuple[float, float]],
+    ) -> Tuple[Dict[int, List[Dict[str, Any]]], Dict[str, float], int]:
+        by_ts: Dict[int, List[Dict[str, Any]]] = defaultdict(list)
+        extent = bbox_init()
+        rows = 0
+        if path is None or not path.exists() or not path.is_file():
+            return {}, extent, 0
+
+        with path.open("r", encoding="utf-8", errors="replace", newline="") as f:
+            r = csv.DictReader(f)
+            fieldnames = [str(x or "").strip() for x in (r.fieldnames or []) if str(x or "").strip()]
+            ts_col = self._tl_timestamp_column(fieldnames)
+            state_cols = self._tl_state_columns(path)
+            if ts_col is None or not state_cols:
+                return {}, extent, 0
+            if not anchors:
+                anchors = [(0.0, 0.0)]
+
+            for row in r:
+                ts_key = self._ts_key_from_ms(row.get(ts_col))
+                if ts_key is None:
+                    fr = self._as_int(row.get("RawFrameID"))
+                    if fr is not None:
+                        ts_key = int(fr)
+                if ts_key is None:
+                    continue
+
+                for i, col in enumerate(state_cols):
+                    color = self._tl_color_from_value(row.get(col))
+                    if color is None:
+                        continue
+                    x, y = anchors[i % len(anchors)]
+                    bbox_update(extent, x, y)
+                    rec = {
+                        "id": f"{i+1}:{col}",
+                        "x": x,
+                        "y": y,
+                        "direction": None,
+                        "lane_id": col,
+                        "color_1": color,
+                        "remain_1": None,
+                        "color_2": None,
+                        "remain_2": None,
+                        "color_3": None,
+                        "remain_3": None,
+                    }
+                    by_ts[ts_key].append(rec)
+                    rows += 1
+
+        return by_ts, extent, rows
+
+    @staticmethod
+    def _latlon_to_local_xy(lat: float, lon: float) -> Tuple[float, float]:
+        # SinD lanelet maps encode near-origin lat/lon values in a local projection-like frame.
+        # Equirectangular scaling is sufficient for this small field of view.
+        x = float(lon) * 111319.49079327357
+        y = float(lat) * 110574.0
+        return x, y
+
+    @staticmethod
+    def _resample_polyline(points: List[Tuple[float, float]], n_out: int) -> List[Tuple[float, float]]:
+        if n_out <= 1:
+            return points[:1]
+        if len(points) <= 1:
+            return points[:]
+        if len(points) == n_out:
+            return points[:]
+        out: List[Tuple[float, float]] = []
+        span = float(len(points) - 1)
+        for i in range(n_out):
+            t = span * (float(i) / float(n_out - 1))
+            j0 = int(math.floor(t))
+            j1 = min(len(points) - 1, j0 + 1)
+            a = t - float(j0)
+            x0, y0 = points[j0]
+            x1, y1 = points[j1]
+            out.append(((1.0 - a) * x0 + a * x1, (1.0 - a) * y0 + a * y1))
+        return out
+
+    @staticmethod
+    def _downsample_polyline(points: List[Tuple[float, float]], step: int) -> List[Tuple[float, float]]:
+        s = max(1, int(step))
+        if s <= 1 or len(points) <= max(12, s * 2):
+            return points
+        idxs = list(range(0, len(points), s))
+        last = len(points) - 1
+        if idxs[-1] != last:
+            idxs.append(last)
+        out = [points[i] for i in idxs]
+        if len(out) < 2 and len(points) >= 2:
+            out = [points[0], points[-1]]
+        return out
+
+    @staticmethod
+    def _polyline_bbox(points: List[Tuple[float, float]]) -> Optional[Dict[str, float]]:
+        if not points:
+            return None
+        b = bbox_init()
+        for x, y in points:
+            bbox_update(b, x, y)
+        return b if bbox_is_valid(b) else None
+
+    @staticmethod
+    def _polygon_bbox(points: List[Tuple[float, float]]) -> Optional[Dict[str, float]]:
+        return SinDAdapter._polyline_bbox(points)
+
+    def _load_lanelet_map_parsed(self, map_path: Path, points_step: int) -> Optional[Dict[str, Any]]:
+        if map_path is None or not map_path.exists() or not map_path.is_file():
+            return None
+        step = max(1, int(points_step))
+        key = (str(map_path.resolve()), step)
+        cached = self._lanelet_map_cache.get(key)
+        if cached is not None:
+            return cached
+
+        tree = ET.parse(map_path)
+        root = tree.getroot()
+
+        nodes: Dict[str, Tuple[float, float]] = {}
+        for n in root.findall("node"):
+            nid = str(n.attrib.get("id") or "").strip()
+            lat = safe_float(n.attrib.get("lat"))
+            lon = safe_float(n.attrib.get("lon"))
+            if not nid or lat is None or lon is None:
+                continue
+            nodes[nid] = self._latlon_to_local_xy(float(lat), float(lon))
+
+        ways: Dict[str, List[str]] = {}
+        way_tags: Dict[str, Dict[str, str]] = {}
+        for w in root.findall("way"):
+            wid = str(w.attrib.get("id") or "").strip()
+            if not wid:
+                continue
+            refs = [str(nd.attrib.get("ref") or "").strip() for nd in w.findall("nd")]
+            ways[wid] = [r for r in refs if r]
+            tags = {str(t.attrib.get("k") or ""): str(t.attrib.get("v") or "") for t in w.findall("tag")}
+            way_tags[wid] = tags
+
+        def _way_points(wid: Optional[str]) -> List[Tuple[float, float]]:
+            if wid is None:
+                return []
+            refs = ways.get(wid, [])
+            pts: List[Tuple[float, float]] = []
+            for rid in refs:
+                xy = nodes.get(rid)
+                if xy is None:
+                    continue
+                if pts and abs(xy[0] - pts[-1][0]) < 1e-9 and abs(xy[1] - pts[-1][1]) < 1e-9:
+                    continue
+                pts.append(xy)
+            return pts
+
+        lanes: List[Dict[str, Any]] = []
+        stoplines: List[Dict[str, Any]] = []
+        crosswalks: List[Dict[str, Any]] = []
+        junctions: List[Dict[str, Any]] = []
+        map_bbox = bbox_init()
+
+        for rel in root.findall("relation"):
+            tags = {str(t.attrib.get("k") or ""): str(t.attrib.get("v") or "") for t in rel.findall("tag")}
+            if tags.get("type") != "lanelet":
+                continue
+
+            left_id: Optional[str] = None
+            right_id: Optional[str] = None
+            for m in rel.findall("member"):
+                if str(m.attrib.get("type") or "") != "way":
+                    continue
+                role = str(m.attrib.get("role") or "")
+                ref = str(m.attrib.get("ref") or "").strip()
+                if not ref:
+                    continue
+                if role == "left":
+                    left_id = ref
+                elif role == "right":
+                    right_id = ref
+
+            left = _way_points(left_id)
+            right = _way_points(right_id)
+            center: List[Tuple[float, float]] = []
+            if len(left) >= 2 and len(right) >= 2:
+                d_same = (left[0][0] - right[0][0]) ** 2 + (left[0][1] - right[0][1]) ** 2
+                d_same += (left[-1][0] - right[-1][0]) ** 2 + (left[-1][1] - right[-1][1]) ** 2
+                d_rev = (left[0][0] - right[-1][0]) ** 2 + (left[0][1] - right[-1][1]) ** 2
+                d_rev += (left[-1][0] - right[0][0]) ** 2 + (left[-1][1] - right[0][1]) ** 2
+                if d_rev < d_same:
+                    right = list(reversed(right))
+                n = max(len(left), len(right))
+                l2 = self._resample_polyline(left, n)
+                r2 = self._resample_polyline(right, n)
+                center = [((lp[0] + rp[0]) * 0.5, (lp[1] + rp[1]) * 0.5) for lp, rp in zip(l2, r2)]
+            elif len(left) >= 2:
+                center = left
+            elif len(right) >= 2:
+                center = right
+
+            center = self._downsample_polyline(center, step)
+            if len(center) < 2:
+                continue
+            b = self._polyline_bbox(center)
+            if b is None:
+                continue
+            bbox_update_from_bbox(map_bbox, b)
+            subtype = str(tags.get("subtype") or tags.get("location") or "road")
+            st_low = subtype.lower()
+            lanes.append(
+                {
+                    "id": str(rel.attrib.get("id") or f"lane_{len(lanes)+1}"),
+                    "lane_type": subtype,
+                    "turn_direction": None,
+                    "is_intersection": bool(("intersection" in st_low) or ("junction" in st_low)),
+                    "has_traffic_control": False,
+                    "centerline": center,
+                    "bbox": b,
+                }
+            )
+
+        for wid, tags in way_tags.items():
+            typ = str(tags.get("type") or "").strip().lower()
+            pts = self._downsample_polyline(_way_points(wid), step)
+            if len(pts) < 2:
+                continue
+            b = self._polyline_bbox(pts)
+            if b is None:
+                continue
+            if typ == "stop_line":
+                bbox_update_from_bbox(map_bbox, b)
+                stoplines.append({"id": wid, "centerline": pts, "bbox": b})
+            elif typ == "zebra":
+                poly = pts[:]
+                if len(poly) >= 3 and (poly[0][0] != poly[-1][0] or poly[0][1] != poly[-1][1]):
+                    poly.append(poly[0])
+                pb = self._polygon_bbox(poly)
+                if pb is None:
+                    continue
+                bbox_update_from_bbox(map_bbox, pb)
+                crosswalks.append({"id": wid, "polygon": poly, "bbox": pb})
+
+        parsed = {
+            "map_id": map_path.stem,
+            "map_file": map_path.name,
+            "counts": {
+                "LANE": len(lanes),
+                "STOPLINE": len(stoplines),
+                "CROSSWALK": len(crosswalks),
+                "JUNCTION": len(junctions),
+            },
+            "lanes": lanes,
+            "stoplines": stoplines,
+            "crosswalks": crosswalks,
+            "junctions": junctions,
+            "bbox": map_bbox if bbox_is_valid(map_bbox) else None,
+        }
+        self._lanelet_map_cache[key] = parsed
+        return parsed
+
+    def _clip_lanelet_map(
+        self,
+        parsed_map: Dict[str, Any],
+        extent: Dict[str, float],
+        max_lanes: int,
+        focus_xy: Optional[Tuple[float, float]] = None,
+    ) -> Dict[str, Any]:
+        def _clip_items(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+            out: List[Dict[str, Any]] = []
+            for it in items:
+                b = it.get("bbox")
+                if not isinstance(b, dict):
+                    continue
+                try:
+                    if bbox_intersects(b, extent):
+                        out.append(it)
+                except Exception:
+                    continue
+            return out
+
+        lanes = _clip_items(parsed_map.get("lanes", []) or [])
+        stoplines = _clip_items(parsed_map.get("stoplines", []) or [])
+        crosswalks = _clip_items(parsed_map.get("crosswalks", []) or [])
+        junctions = _clip_items(parsed_map.get("junctions", []) or [])
+
+        lanes_truncated = False
+        if max_lanes and len(lanes) > max_lanes:
+            if focus_xy:
+                cx, cy = focus_xy
+            else:
+                cx = (extent["min_x"] + extent["max_x"]) * 0.5
+                cy = (extent["min_y"] + extent["max_y"]) * 0.5
+
+            def _dist2(l: Dict[str, Any]) -> float:
+                b = l.get("bbox") or {}
+                mx = (float(b.get("min_x", 0.0)) + float(b.get("max_x", 0.0))) * 0.5
+                my = (float(b.get("min_y", 0.0)) + float(b.get("max_y", 0.0))) * 0.5
+                dx = mx - cx
+                dy = my - cy
+                return dx * dx + dy * dy
+
+            lanes.sort(key=_dist2)
+            lanes = lanes[: int(max_lanes)]
+            lanes_truncated = True
+
+        return {
+            "map_id": parsed_map.get("map_id"),
+            "map_file": parsed_map.get("map_file"),
+            "lanes_truncated": lanes_truncated,
+            "lanes": [
+                {
+                    "id": l.get("id"),
+                    "lane_type": l.get("lane_type"),
+                    "turn_direction": l.get("turn_direction"),
+                    "is_intersection": l.get("is_intersection"),
+                    "has_traffic_control": l.get("has_traffic_control"),
+                    "centerline": l.get("centerline") or [],
+                }
+                for l in lanes
+            ],
+            "stoplines": [{"id": x.get("id"), "centerline": x.get("centerline") or []} for x in stoplines],
+            "crosswalks": [{"id": x.get("id"), "polygon": x.get("polygon") or []} for x in crosswalks],
+            "junctions": [{"id": x.get("id"), "polygon": x.get("polygon") or []} for x in junctions],
+        }
+
+    @staticmethod
+    def _polyline_midpoint(pts: List[Tuple[float, float]]) -> Optional[Tuple[float, float]]:
+        if not pts:
+            return None
+        i = int(max(0, (len(pts) - 1) // 2))
+        x, y = pts[i]
+        return float(x), float(y)
+
+    def _traffic_light_anchors(
+        self,
+        parsed_map: Optional[Dict[str, Any]],
+        extent_hint: Optional[Dict[str, float]],
+        n: int,
+    ) -> List[Tuple[float, float]]:
+        pts: List[Tuple[float, float]] = []
+        if parsed_map:
+            for s in parsed_map.get("stoplines", []) or []:
+                mid = self._polyline_midpoint(s.get("centerline") or [])
+                if mid is not None:
+                    pts.append(mid)
+            if not pts:
+                for ln in parsed_map.get("lanes", []) or []:
+                    mid = self._polyline_midpoint(ln.get("centerline") or [])
+                    if mid is not None:
+                        pts.append(mid)
+                        if len(pts) >= 12:
+                            break
+
+        if not pts and extent_hint and bbox_is_valid(extent_hint):
+            cx = (extent_hint["min_x"] + extent_hint["max_x"]) * 0.5
+            cy = (extent_hint["min_y"] + extent_hint["max_y"]) * 0.5
+            w = max(8.0, abs(extent_hint["max_x"] - extent_hint["min_x"]))
+            h = max(8.0, abs(extent_hint["max_y"] - extent_hint["min_y"]))
+            r = 0.32 * min(w, h)
+            for i in range(max(4, n)):
+                a = (2.0 * math.pi * float(i)) / float(max(4, n))
+                pts.append((cx + r * math.cos(a), cy + r * math.sin(a)))
+
+        if not pts:
+            pts = [(0.0, 0.0)]
+
+        uniq: List[Tuple[float, float]] = []
+        seen = set()
+        for x, y in pts:
+            key = (round(float(x), 3), round(float(y), 3))
+            if key in seen:
+                continue
+            seen.add(key)
+            uniq.append((float(x), float(y)))
+        if not uniq:
+            uniq = [(0.0, 0.0)]
+
+        if n <= 0:
+            return uniq
+        out = list(uniq)
+        i = 0
+        while len(out) < n:
+            out.append(uniq[i % len(uniq)])
+            i += 1
+        return out[:n]
+
+    def _background_meta_for_scene(
+        self,
+        ref: _SindScenarioRef,
+        map_bbox: Optional[Dict[str, float]],
+    ) -> Optional[Dict[str, Any]]:
+        bg = ref.background_path
+        if bg is None or not bg.exists() or not bg.is_file():
+            return None
+        size = read_png_size(bg)
+        if not size:
+            return None
+        if map_bbox is None or not bbox_is_valid(map_bbox):
+            return None
+        w_px, h_px = size
+        if w_px <= 0 or h_px <= 0:
+            return None
+        width_m = max(1e-6, float(map_bbox["max_x"]) - float(map_bbox["min_x"]))
+        height_m = max(1e-6, float(map_bbox["max_y"]) - float(map_bbox["min_y"]))
+        meters_per_px = 0.5 * (width_m / float(w_px) + height_m / float(h_px))
+        return {
+            "kind": "scene_image",
+            "path": str(bg),
+            "size_px": {"width": int(w_px), "height": int(h_px)},
+            "meters_per_px": float(meters_per_px),
+            "extent": {
+                "min_x": float(map_bbox["min_x"]),
+                "max_x": float(map_bbox["max_x"]),
+                "min_y": float(map_bbox["min_y"]),
+                "max_y": float(map_bbox["max_y"]),
+            },
+        }
+
+    def get_scene_background(self, split: str, scene_id: str) -> Optional[Path]:
+        split = self._SPLIT
+        sid = str(scene_id or "")
+        ref = self._scenes.get(sid)
+        if ref is None:
+            return None
+        bg = ref.background_path
+        if bg is None or not bg.exists() or not bg.is_file():
+            return None
+        return bg
+
+    def load_scene_bundle(
+        self,
+        split: str,
+        scene_id: str,
+        include_map: bool = True,
+        map_padding: float = 60.0,
+        map_points_step: int = 5,
+        max_lanes: int = 4000,
+        map_clip: str = "intersection",
+    ) -> Dict[str, Any]:
+        split = self._SPLIT
+        sid = str(scene_id or "")
+        ref = self._scenes.get(sid)
+        if ref is None:
+            raise KeyError(f"scene not found: {sid}")
+
+        warnings: List[str] = []
+        infra_by_ts: Dict[int, List[Dict[str, Any]]] = defaultdict(list)
+        tl_by_ts: Dict[int, List[Dict[str, Any]]] = defaultdict(list)
+        extent = bbox_init()
+        rows_infra = 0
+        unique_agents: set[str] = set()
+
+        for src_tag, path in (("veh", ref.veh_path), ("ped", ref.ped_path)):
+            if path is None:
+                continue
+            by_ts, ext, rows, ids = self._read_tracks_csv(path, source_tag=src_tag)
+            for k, arr in by_ts.items():
+                infra_by_ts[k].extend(arr)
+            if bbox_is_valid(ext):
+                bbox_update_from_bbox(extent, ext)
+            rows_infra += int(rows)
+            unique_agents.update(ids)
+
+        parsed_map: Optional[Dict[str, Any]] = None
+        map_out: Optional[Dict[str, Any]] = None
+        map_id: Optional[str] = None
+        if ref.map_path is not None:
+            try:
+                parsed_map = self._load_lanelet_map_parsed(ref.map_path, points_step=map_points_step)
+            except Exception as e:
+                warnings.append(f"map_load_failed:{e}")
+
+        tl_rows = 0
+        if ref.tl_path is not None:
+            tl_cols = self._tl_state_columns(ref.tl_path)
+            anchors = self._traffic_light_anchors(parsed_map, extent if bbox_is_valid(extent) else None, len(tl_cols))
+            tl_loaded, tl_extent, tl_rows = self._read_traffic_lights_csv(ref.tl_path, anchors=anchors)
+            for k, arr in tl_loaded.items():
+                tl_by_ts[k].extend(arr)
+            if bbox_is_valid(tl_extent):
+                bbox_update_from_bbox(extent, tl_extent)
+
+        if not bbox_is_valid(extent):
+            if parsed_map and parsed_map.get("bbox") and bbox_is_valid(parsed_map["bbox"]):
+                extent = dict(parsed_map["bbox"])
+                warnings.append("extent_from_map_bbox")
+            else:
+                extent = {"min_x": -10.0, "min_y": -10.0, "max_x": 10.0, "max_y": 10.0}
+                warnings.append("extent_missing")
+
+        if include_map:
+            if parsed_map is None:
+                warnings.append("map_missing")
+            elif parsed_map.get("bbox") is not None:
+                if map_clip == "scene":
+                    clip_extent = bbox_pad(extent, map_padding)
+                else:
+                    clip_extent = parsed_map["bbox"]
+                focus_xy = (
+                    (extent["min_x"] + extent["max_x"]) * 0.5,
+                    (extent["min_y"] + extent["max_y"]) * 0.5,
+                )
+                map_out = self._clip_lanelet_map(parsed_map, clip_extent, max_lanes=max_lanes, focus_xy=focus_xy)
+                map_out["clip_mode"] = str(map_clip or "intersection")
+                map_out["clip_extent"] = clip_extent
+                map_out["points_step"] = int(max(1, map_points_step))
+                map_out["counts"] = dict(parsed_map.get("counts") or {})
+                map_out["bbox"] = parsed_map.get("bbox")
+                map_id = str(parsed_map.get("map_id") or "") or None
+            else:
+                warnings.append("map_empty")
+
+        all_keys = sorted(set(infra_by_ts.keys()) | set(tl_by_ts.keys()))
+        timestamps = [self._ts_from_key(k) for k in all_keys]
+        t0 = timestamps[0] if timestamps else 0.0
+        frames = [{"infra": infra_by_ts.get(k, []), "traffic_light": tl_by_ts.get(k, [])} for k in all_keys]
+
+        if rows_infra <= 0:
+            warnings.append("scene_window_empty")
+        if ref.tl_path is not None and tl_rows <= 0:
+            warnings.append("traffic_light_empty")
+
+        modality_stats = {
+            "ego": {"rows": 0, "unique_ts": 0, "min_ts": None, "max_ts": None},
+            "vehicle": {"rows": 0, "unique_ts": 0, "min_ts": None, "max_ts": None},
+            "infra": {
+                "rows": int(rows_infra),
+                "unique_ts": int(len(infra_by_ts)),
+                "min_ts": min((self._ts_from_key(k) for k in infra_by_ts.keys()), default=None),
+                "max_ts": max((self._ts_from_key(k) for k in infra_by_ts.keys()), default=None),
+                "unique_agents": int(len(unique_agents)),
+            },
+            "traffic_light": {
+                "rows": int(tl_rows),
+                "unique_ts": int(len(tl_by_ts)),
+                "min_ts": min((self._ts_from_key(k) for k in tl_by_ts.keys()), default=None),
+                "max_ts": max((self._ts_from_key(k) for k in tl_by_ts.keys()), default=None),
+            },
+        }
+
+        background = self._background_meta_for_scene(ref, parsed_map.get("bbox") if parsed_map else None)
+        if background is not None:
+            background["url"] = f"/api/datasets/{self.spec.id}/scene/{split}/{sid}/background"
+
+        return {
+            "dataset_id": self.spec.id,
+            "split": split,
+            "scene_id": sid,
+            "scene_label": self._scene_label(ref),
+            "city": ref.city_id,
+            "intersect_id": ref.city_id,
+            "intersect_label": ref.city_label,
+            "recording_id": ref.scenario_id,
+            "recording_label": ref.scenario_label,
+            "window_index": 0,
+            "window_count": 1,
+            "intersect_by_modality": {
+                "infra": ref.city_id,
+                "traffic_light": ref.city_id,
+            },
+            "map_id": map_id,
+            "t0": t0,
+            "timestamps": timestamps,
+            "extent": extent,
+            "map": map_out,
+            "background": background,
+            "modality_stats": modality_stats,
+            "frames": frames,
+            "warnings": warnings,
+        }
+
+
 @dataclass
 class _CpmWindowIndex:
     bucket: int
@@ -2298,22 +4427,42 @@ def load_registry(repo_root: Path) -> List[DatasetSpec]:
 
 
 class DatasetStore:
+    _SUPPORTED_FAMILIES = {"v2x-traj", "v2x-seq", "ind", "sind", "cpm-objects"}
+
     def __init__(self, repo_root: Path) -> None:
         self.repo_root = repo_root
         self.specs = {s.id: s for s in load_registry(repo_root)}
         self.adapters: Dict[str, Any] = {}
+        self._adapter_errors: Dict[str, str] = {}
+        self._adapter_lock = threading.Lock()
 
-        for spec in self.specs.values():
-            if spec.family == "v2x-traj":
-                self.adapters[spec.id] = V2XTrajAdapter(spec)
-            elif spec.family == "v2x-seq":
-                self.adapters[spec.id] = V2XSeqAdapter(spec)
-            elif spec.family == "cpm-objects":
-                # Consider_it CPM object logs (CSV). No global map; viewed in local sensor frame.
-                strat = spec.scene_strategy if isinstance(spec.scene_strategy, dict) else {}
-                window_s = int(strat.get("window_s")) if str(strat.get("window_s") or "").strip().isdigit() else None
-                gap_s = int(strat.get("gap_s")) if str(strat.get("gap_s") or "").strip().isdigit() else None
-                self.adapters[spec.id] = CpmObjectsAdapter(spec, window_s=window_s, gap_s=gap_s)
+    @classmethod
+    def _is_supported_family(cls, family: str) -> bool:
+        return str(family or "").strip() in cls._SUPPORTED_FAMILIES
+
+    @staticmethod
+    def _strategy_int(spec: DatasetSpec, key: str) -> Optional[int]:
+        strat = spec.scene_strategy if isinstance(spec.scene_strategy, dict) else {}
+        raw = str(strat.get(key) or "").strip()
+        return int(raw) if raw.isdigit() else None
+
+    def _build_adapter(self, spec: DatasetSpec) -> Any:
+        if spec.family == "v2x-traj":
+            return V2XTrajAdapter(spec)
+        if spec.family == "v2x-seq":
+            return V2XSeqAdapter(spec)
+        if spec.family == "ind":
+            return InDAdapter(spec, window_s=self._strategy_int(spec, "window_s"))
+        if spec.family == "sind":
+            return SinDAdapter(spec)
+        if spec.family == "cpm-objects":
+            # Consider_it CPM object logs (CSV). No global map; viewed in local sensor frame.
+            return CpmObjectsAdapter(
+                spec,
+                window_s=self._strategy_int(spec, "window_s"),
+                gap_s=self._strategy_int(spec, "gap_s"),
+            )
+        raise KeyError(f"unsupported dataset family: {spec.family}")
 
     @staticmethod
     def _dataset_meta(spec: DatasetSpec) -> Dict[str, Any]:
@@ -2379,6 +4528,70 @@ class DatasetStore:
                     bm["origin_by_intersect"] = {k: {"lat": v[0], "lon": v[1]} for k, v in spec.geo_origin_by_intersect.items()}
                 meta["basemap"] = bm
             return meta
+        if spec.family == "ind":
+            bindings = spec.bindings if isinstance(spec.bindings, dict) else {}
+            map_path = ((bindings.get("maps_dir") or {}).get("path")) if isinstance(bindings.get("maps_dir"), dict) else None
+            has_map = False
+            map_roots: List[Path] = []
+            if map_path:
+                p = Path(str(map_path)).expanduser()
+                map_roots.append((p / "lanelets"))
+                map_roots.append(p)
+            map_roots.append(spec.root / "maps" / "lanelets")
+            map_roots.append(spec.root / "maps")
+            for mr in map_roots:
+                try:
+                    if mr.exists() and mr.is_dir() and next(mr.rglob("*.osm"), None) is not None:
+                        has_map = True
+                        break
+                except Exception:
+                    continue
+            return {
+                "splits": ["all"],
+                "default_split": "all",
+                "group_label": "Location",
+                "has_map": has_map,
+                "has_scene_background": True,
+                "has_traffic_lights": False,
+                "modalities": ["infra"],
+                "modality_labels": {"infra": "Road users"},
+                "modality_short_labels": {"infra": "Objects"},
+            }
+        if spec.family == "sind":
+            bindings = spec.bindings if isinstance(spec.bindings, dict) else {}
+            data_dir_raw = ((bindings.get("data_dir") or {}).get("path")) if isinstance(bindings.get("data_dir"), dict) else None
+            data_root = Path(str(data_dir_raw)).expanduser() if data_dir_raw else spec.root
+            has_map = False
+            has_bg = False
+            has_tl = False
+            try:
+                if data_root.exists() and data_root.is_dir():
+                    for p in data_root.rglob("*.osm"):
+                        if p.is_file():
+                            has_map = True
+                            break
+                    for p in data_root.rglob("*.png"):
+                        if p.is_file():
+                            has_bg = True
+                            break
+                    for p in data_root.rglob("*.csv"):
+                        n = p.name.lower()
+                        if "traffic" in n and "meta" not in n and not n.startswith(".~lock"):
+                            has_tl = True
+                            break
+            except Exception:
+                pass
+            return {
+                "splits": ["all"],
+                "default_split": "all",
+                "group_label": "City",
+                "has_map": has_map,
+                "has_scene_background": has_bg,
+                "has_traffic_lights": has_tl,
+                "modalities": ["infra", "traffic_light"],
+                "modality_labels": {"infra": "Road users", "traffic_light": "Traffic lights"},
+                "modality_short_labels": {"infra": "Objects", "traffic_light": "Lights"},
+            }
         return {
             "splits": ["all"],
             "default_split": "all",
@@ -2393,7 +4606,7 @@ class DatasetStore:
         out = []
         for spec in self.specs.values():
             meta = self._dataset_meta(spec)
-            supported = spec.id in self.adapters
+            supported = self._is_supported_family(spec.family)
             item: Dict[str, Any] = {
                 "id": spec.id,
                 "title": spec.title,
@@ -2407,6 +4620,27 @@ class DatasetStore:
         return out
 
     def get_adapter(self, dataset_id: str) -> Any:
-        if dataset_id not in self.adapters:
+        spec = self.specs.get(dataset_id)
+        if spec is None:
             raise KeyError(f"dataset not found or unsupported: {dataset_id}")
-        return self.adapters[dataset_id]
+        if not self._is_supported_family(spec.family):
+            raise KeyError(f"dataset not found or unsupported: {dataset_id}")
+
+        with self._adapter_lock:
+            cached = self.adapters.get(dataset_id)
+            if cached is not None:
+                return cached
+
+            cached_error = self._adapter_errors.get(dataset_id)
+            if cached_error is not None:
+                raise RuntimeError(cached_error)
+
+            try:
+                adapter = self._build_adapter(spec)
+            except Exception as e:
+                msg = f"failed to initialize dataset adapter '{dataset_id}': {e}"
+                self._adapter_errors[dataset_id] = msg
+                raise RuntimeError(msg) from e
+
+            self.adapters[dataset_id] = adapter
+            return adapter

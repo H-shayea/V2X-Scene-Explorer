@@ -152,9 +152,9 @@
         </div>
 
         <div class="panel__section" id="sceneNavSection">
-          <div class="panel__title">Scene</div>
-          <div id="sceneHint" class="hint hint--block"></div>
-          <div id="splitAvailabilityHint" class="hint hint--block"></div>
+          <div class="panel__title">Scene Browser</div>
+          <div id="sceneHint" class="sceneBrowser"></div>
+          <div id="splitAvailabilityHint" class="sceneBrowser"></div>
           <label class="check small" id="sceneTlOnlyWrap" hidden>
             <input type="checkbox" id="sceneTlOnly" />
             Include traffic-light-only scenes
@@ -186,63 +186,73 @@
           <label class="check" id="layerTLWrap"><input type="checkbox" id="layerTL" checked /> <span id="layerTLText">Traffic lights</span></label>
         </div>
 
-	        <div class="panel__section">
-	          <div class="panel__title">Object Types</div>
-	          <label class="check" id="typeVehicleWrap"><input type="checkbox" id="typeVehicle" checked /> <span id="typeVehicleText">Vehicle</span></label>
-	          <label class="check" id="typeVruWrap"><input type="checkbox" id="typeVru" checked /> <span id="typeVruText">VRU</span></label>
-	          <label class="check" id="typePedWrap"><input type="checkbox" id="typePed" checked /> <span id="typePedText">Pedestrian</span></label>
-	          <label class="check" id="typeBikeWrap"><input type="checkbox" id="typeBike" checked /> <span id="typeBikeText">Bicycle</span></label>
-	          <label class="check" id="typeOtherWrap"><input type="checkbox" id="typeOther" checked /> <span id="typeOtherText">Other</span></label>
-	          <label class="check" id="typeAnimalWrap"><input type="checkbox" id="typeAnimal" checked /> <span id="typeAnimalText">Animal</span></label>
-	          <label class="check" id="typeRsuWrap"><input type="checkbox" id="typeRsu" checked /> <span id="typeRsuText">Roadside unit</span></label>
-	          <label class="check" id="typeUnknownWrap"><input type="checkbox" id="typeUnknown" checked /> <span id="typeUnknownText">Unknown</span></label>
-	        </div>
-
 	        <div class="panel__section" id="subTypeSection">
-	          <div class="panel__title">Subtypes</div>
-	          <div class="row">
-	            <button id="subTypeAllBtn" class="btn btn--ghost btn--sm" type="button">All</button>
-	            <button id="subTypeNoneBtn" class="btn btn--ghost btn--sm" type="button">None</button>
+	          <div class="panel__title">Agent Types</div>
+	          <div class="inlineActions">
+	            <button id="subTypeAllBtn" class="textLinkBtn" type="button">All</button>
+	            <button id="subTypeNoneBtn" class="textLinkBtn" type="button">None</button>
 	          </div>
-	          <div id="subTypeFilters" class="filtersGrid"></div>
+	          <div id="subTypeFilters" class="agentTypeList"></div>
 	        </div>
 
 	        <div class="panel__section">
 	          <div class="panel__title">Playback</div>
-	          <div class="row">
-	            <button id="playBtn" class="btn">Play</button>
-            <button id="stepBtn" class="btn btn--ghost">Next frame</button>
-          </div>
-	          <label class="field">
-	            <span>Speed</span>
-	            <select id="speedSelect">
-	              <option value="0.25">0.25x</option>
-	              <option value="0.5">0.5x</option>
-	              <option value="1" selected>1x</option>
-	              <option value="2">2x</option>
-	              <option value="4">4x</option>
-	            </select>
-	          </label>
-	          <label class="check small"><input type="checkbox" id="showVelocity" /> Show velocity arrows</label>
-	          <label class="check small"><input type="checkbox" id="showHeading" /> Show heading arrows</label>
-	          <label class="check small"><input type="checkbox" id="showTrail" checked /> Show trajectories</label>
-	          <label class="check small"><input type="checkbox" id="trailAll" /> Apply to all objects (current frame)</label>
-	          <label class="check small"><input type="checkbox" id="trailFull" checked /> Full trajectory (past + future)</label>
-	          <label class="check small" id="holdTLWrap"><input type="checkbox" id="holdTL" checked /> Hold traffic lights between updates</label>
+	          <div class="playbackRow">
+	            <button id="playBtn" class="btn btn--ghost btn--sm">Play</button>
+	            <button id="stepBtn" class="btn btn--ghost btn--sm">Next frame</button>
+	            <label class="field field--inline">
+	              <span>Speed</span>
+	              <select id="speedSelect">
+	                <option value="0.25">0.25x</option>
+	                <option value="0.5">0.5x</option>
+	                <option value="1" selected>1x</option>
+	                <option value="2">2x</option>
+	                <option value="4">4x</option>
+	              </select>
+	            </label>
+	          </div>
+	          <details class="panelFold">
+	            <summary class="panelFold__summary">Trajectory Settings</summary>
+		            <label class="check small"><input type="checkbox" id="showVelocity" /> Show velocity arrows</label>
+		            <label class="check small"><input type="checkbox" id="showHeading" /> Show heading arrows</label>
+		            <div class="field">
+		              <span>Trajectory range</span>
+                  <label class="check small"><input type="radio" name="trajectoryRange" id="trajectoryRangePast" value="past" /> Past only</label>
+                  <label class="check small"><input type="radio" name="trajectoryRange" id="trajectoryRangeFull" value="full" checked /> Past + future</label>
+		            </div>
+	          </details>
+		          <label class="check small" id="holdTLWrap"><input type="checkbox" id="holdTL" checked /> Hold traffic lights between updates</label>
 	        </div>
 
-        <div class="panel__section" id="mapSection">
+        <div class="panel__section panel__section--major" id="mapSection">
           <div class="panel__title" id="mapTitle">Map</div>
 	          <div class="row">
-	            <button id="fitSceneBtn" class="btn btn--ghost">Fit trajectories</button>
-	            <button id="fitMapBtn" class="btn btn--ghost">Fit Map</button>
+	            <button id="fitSceneBtn" class="btn btn--ghost btn--sm">Fit trajectories</button>
+	            <button id="fitMapBtn" class="btn btn--ghost btn--sm">Fit map</button>
 	          </div>
+            <div id="sceneViewControls">
+              <div id="mapSourceControls" hidden>
+                <label class="field">
+                  <span>Map source</span>
+                  <select id="mapSourceSelect">
+                    <option value="lanelet2">Lanelet2 vector map</option>
+                    <option value="orthophoto">Orthophoto image</option>
+                    <option value="none">None</option>
+                  </select>
+                </label>
+                <div id="mapSourceStatus" class="hint"></div>
+              </div>
+              <label class="check small" id="showMapWrap"><input type="checkbox" id="showMap" checked /> Show vector map</label>
+              <label class="check small" id="showSceneBgWrap"><input type="checkbox" id="showSceneBg" /> Show scene background image</label>
+              <div id="sceneBgStatus" class="hint" hidden></div>
+            </div>
             <div id="basemapControls" hidden>
               <div class="panel__subhead">Basemap</div>
               <label class="check small"><input type="checkbox" id="showBasemap" /> Show basemap (OpenStreetMap)</label>
               <div id="basemapStatus" class="hint" hidden></div>
             </div>
-	          <div id="mapOnlyControls">
+	          <details id="mapOnlyControls" class="panelFold">
+	            <summary class="panelFold__summary">Advanced map controls</summary>
 	            <label class="field">
 	              <span>Scope</span>
 	              <select id="mapClipSelect">
@@ -286,16 +296,25 @@
 	            <label class="check small"><input type="checkbox" id="mapCrosswalks" checked /> Crosswalks</label>
 	            <label class="check small"><input type="checkbox" id="mapJunctions" checked /> Junction areas</label>
 	            <label class="check small"><input type="checkbox" id="focusMask" checked /> Dim outside trajectories (intersection view)</label>
-	          </div>
+	          </details>
 	          <label class="check small"><input type="checkbox" id="sceneBox" checked /> Show trajectory extent</label>
-	          <label class="check small"><input type="checkbox" id="debugOverlay" /> Debug overlay (extents)</label>
 	        </div>
 
-        <div class="panel__section">
-          <div class="panel__title">Scene Details</div>
+        <details class="panel__section panel__section--major panelFold panelFold--section" id="sceneDetailsSection" open>
+          <summary class="panel__title panelFold__summary panelFold__summary--title">Scene Profile</summary>
           <div id="statusBox" class="statusBox">Select a scene…</div>
-          <pre id="sceneInfo" class="codebox">Select a scene…</pre>
-        </div>
+          <details class="advancedMetaFold">
+            <summary class="panelFold__summary">Advanced Metadata</summary>
+            <details class="rawMetaFold">
+              <summary class="rawMetaToggle">Show raw metadata <span aria-hidden="true">▼</span></summary>
+              <div class="rawMetaActions">
+                <button id="copySceneMetaBtn" class="textLinkBtn" type="button">Copy raw metadata</button>
+              </div>
+              <label class="check small"><input type="checkbox" id="debugOverlay" /> Debug overlay (extents)</label>
+              <pre id="sceneInfo" class="codebox codebox--light">Select a scene…</pre>
+            </details>
+          </details>
+        </details>
       </aside>
 
       <section class="stage">
@@ -346,6 +365,8 @@
                   <option value="auto" selected>Auto detect</option>
                   <option value="v2x_traj">V2X-Traj style</option>
                   <option value="v2x_seq">V2X-Seq style</option>
+                  <option value="ind">inD style</option>
+                  <option value="sind">SinD style</option>
                   <option value="consider_it_cpm">Consider.it CPM style</option>
                 </select>
               </label>

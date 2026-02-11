@@ -350,6 +350,30 @@ function drawBasemap(ctx, view, cssW, cssH, dpr) {
   state.basemapFrameStats = stats;
 }
 
+function drawSceneBackground(ctx, view, cssW, cssH, dpr, bundle) {
+  if (!state.sceneBgEnabled) return;
+  const bg = currentSceneBackground(bundle);
+  if (!bg) return;
+  const tile = getTileImage(bg.url);
+  if (!tile || tile.status !== "loaded") return;
+
+  const ext = bg.extent;
+  const x0y0 = viewWorldToCanvas(view, cssW, cssH, Number(ext.min_x), Number(ext.max_y));
+  const x1y1 = viewWorldToCanvas(view, cssW, cssH, Number(ext.max_x), Number(ext.min_y));
+  const x0 = Math.min(x0y0[0], x1y1[0]);
+  const y0 = Math.min(x0y0[1], x1y1[1]);
+  const w = Math.abs(x1y1[0] - x0y0[0]);
+  const h = Math.abs(x1y1[1] - x0y0[1]);
+  if (!(w > 1 && h > 1)) return;
+
+  ctx.save();
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.globalAlpha = 0.92;
+  ctx.imageSmoothingEnabled = true;
+  ctx.drawImage(tile.img, x0, y0, w, h);
+  ctx.restore();
+}
+
 function buildPathFromPolyline(path, pts, close = false) {
   if (!pts || pts.length < 2) return;
   path.moveTo(pts[0][0], pts[0][1]);
@@ -381,6 +405,7 @@ const COLORS = {
     VRU: "#dc2626",
 
     CAR: "#2563eb",
+    TRUCK_BUS: "#f97316",
     BUS: "#a855f7",
     VAN: "#14b8a6",
     TRUCK: "#f97316",
@@ -429,6 +454,9 @@ const state = {
   defaultSplit: "train",
   groupLabel: "Intersection",
   hasMap: true,
+  hasSceneBackground: false,
+  showMap: true,
+  sceneBgEnabled: false,
   basemapMeta: null,
   basemapEnabled: false,
   basemapZoom: null,
@@ -456,16 +484,15 @@ const state = {
   speed: 1,
   showVelocity: false,
   showHeading: false,
-  showTrail: true,
-  trailFull: true,
-  trailAll: false,
-  trailCache: null,
-  trailAllCache: null,
+  trajectoryRange: "full", // "past" | "full"
+  pathCache: null,
+  pathAllCache: null,
   holdTL: true,
   mapPointsStep: 3,
   mapPadding: 120,
   mapClip: "scene",
   mapMaxLanes: 5000,
+  mapSource: "lanelet2", // none | lanelet2 | orthophoto
   layers: { ego: true, infra: true, vehicle: true, traffic_light: true },
   mapLayers: { lanes: true, stoplines: true, crosswalks: true, junctions: true },
   types: { VEHICLE: true, VRU: true, PEDESTRIAN: true, BICYCLE: true, OTHER: true, ANIMAL: true, RSU: true, UNKNOWN: true },
@@ -506,6 +533,7 @@ const req = { intersections: 0, scenes: 0, bundle: 0 };
 
 const LS_LAST_DATASET = "trajExplorer.lastDatasetId";
 const LS_DATASET_SETTINGS = "trajExplorer.datasetSettingsById.v1";
+const SS_SOURCE_BY_TYPE = "trajExplorer.sourceByType.v1";
 
 function safeJsonParse(s) {
   try {
@@ -527,10 +555,10 @@ function defaultDatasetSettings() {
     speed: 1,
     showVelocity: false,
     showHeading: false,
-    showTrail: true,
-    trailFull: true,
-    trailAll: false,
+    trajectoryRange: "full",
     holdTL: true,
+    showMap: true,
+    sceneBgEnabled: false,
     basemapEnabled: false,
     basemapZoom: null,
     layers: { ego: true, infra: true, vehicle: true, traffic_light: true },
@@ -539,6 +567,7 @@ function defaultDatasetSettings() {
     mapPointsStep: 3,
     mapPadding: 120,
     mapMaxLanes: 5000,
+    mapSource: "lanelet2",
     mapLayers: { lanes: true, stoplines: true, crosswalks: true, junctions: true },
     debugOverlay: false,
     sceneBox: true,
@@ -557,10 +586,10 @@ function captureDatasetSettings() {
     speed: Number(state.speed || 1),
     showVelocity: !!state.showVelocity,
     showHeading: !!state.showHeading,
-    showTrail: !!state.showTrail,
-    trailFull: !!state.trailFull,
-    trailAll: !!state.trailAll,
+    trajectoryRange: state.trajectoryRange === "past" ? "past" : "full",
     holdTL: !!state.holdTL,
+    showMap: !!state.showMap,
+    sceneBgEnabled: !!state.sceneBgEnabled,
     basemapEnabled: !!state.basemapEnabled,
     basemapZoom: (state.basemapZoom != null && Number.isFinite(Number(state.basemapZoom))) ? Number(state.basemapZoom) : null,
     layers: { ...(state.layers || {}) },
@@ -569,6 +598,7 @@ function captureDatasetSettings() {
     mapPointsStep: Number(state.mapPointsStep || 3),
     mapPadding: Number(state.mapPadding || 120),
     mapMaxLanes: Number(state.mapMaxLanes || 5000),
+    mapSource: state.mapSource || "lanelet2",
     mapLayers: { ...(state.mapLayers || {}) },
     debugOverlay: !!state.debugOverlay,
     sceneBox: !!state.sceneBox,
@@ -586,6 +616,20 @@ function loadPersistedDatasetSettings() {
   const raw = safeJsonParse(localStorage.getItem(LS_DATASET_SETTINGS));
   if (!raw || typeof raw !== "object") return;
   state.datasetSettingsById = raw;
+}
+
+function persistSourceByType() {
+  try {
+    sessionStorage.setItem(SS_SOURCE_BY_TYPE, JSON.stringify(state.sourceByType || {}));
+  } catch (_) {}
+}
+
+function loadPersistedSourceByType() {
+  try {
+    const raw = safeJsonParse(sessionStorage.getItem(SS_SOURCE_BY_TYPE));
+    if (!raw || typeof raw !== "object") return;
+    state.sourceByType = raw;
+  } catch (_) {}
 }
 
 function saveCurrentDatasetSettings() {
@@ -615,15 +659,33 @@ function restoreDatasetSettings(ds) {
   state.speed = Number.isFinite(Number(s.speed)) ? Number(s.speed) : 1;
   state.showVelocity = !!s.showVelocity;
   state.showHeading = !!s.showHeading;
-  state.showTrail = (s.showTrail !== undefined) ? !!s.showTrail : true;
-  state.trailFull = (s.trailFull !== undefined) ? !!s.trailFull : true;
-  state.trailAll = !!s.trailAll;
+  const legacyShowTrail = (s.showTrail !== undefined) ? !!s.showTrail : undefined;
+  const legacyTrailFull = (s.trailFull !== undefined) ? !!s.trailFull : undefined;
+  const legacyShowPastPaths = (s.showPastPaths !== undefined) ? !!s.showPastPaths : legacyShowTrail;
+  const legacyIncludeFuture = (s.pathIncludeFuture !== undefined) ? !!s.pathIncludeFuture : legacyTrailFull;
+  if (s.trajectoryRange === "past" || s.trajectoryRange === "full") {
+    state.trajectoryRange = s.trajectoryRange;
+  } else {
+    // Older settings may have had "trajectories off"; map that to "past" now that the feature is always on.
+    if (legacyShowPastPaths === false) state.trajectoryRange = "past";
+    else state.trajectoryRange = legacyIncludeFuture === false ? "past" : "full";
+  }
   state.holdTL = (s.holdTL !== undefined) ? !!s.holdTL : true;
   const meta = currentDatasetMeta() || {};
+  const hasMap = meta.has_map !== undefined ? !!meta.has_map : true;
+  const hasSceneBg = !!meta.has_scene_background;
+  state.showMap = (s.showMap !== undefined) ? !!s.showMap : hasMap;
+  if (!hasMap) state.showMap = false;
+  state.sceneBgEnabled = (s.sceneBgEnabled !== undefined) ? !!s.sceneBgEnabled : hasSceneBg;
+  if (!hasSceneBg) state.sceneBgEnabled = false;
   const hasBasemap = !!(meta.basemap && typeof meta.basemap === "object");
   const defaultBasemapOn = (meta.family === "cpm-objects") && hasBasemap;
   state.basemapEnabled = (s.basemapEnabled !== undefined) ? !!s.basemapEnabled : defaultBasemapOn;
   state.basemapZoom = Number.isFinite(Number(s.basemapZoom)) ? Number(s.basemapZoom) : null;
+
+  if (supportsMapSourceSelector(meta)) {
+    applyMapSourceSelection(s.mapSource, { silent: true });
+  }
 
   state.layers = { ...defaults.layers, ...(s.layers || {}) };
   state.types = { ...defaults.types, ...(s.types || {}) };
@@ -632,6 +694,7 @@ function restoreDatasetSettings(ds) {
   state.mapPointsStep = Number.isFinite(Number(s.mapPointsStep)) ? Number(s.mapPointsStep) : defaults.mapPointsStep;
   state.mapPadding = Number.isFinite(Number(s.mapPadding)) ? Number(s.mapPadding) : defaults.mapPadding;
   state.mapMaxLanes = Number.isFinite(Number(s.mapMaxLanes)) ? Number(s.mapMaxLanes) : defaults.mapMaxLanes;
+  state.mapSource = (s.mapSource === "none" || s.mapSource === "orthophoto") ? s.mapSource : "lanelet2";
   state.mapLayers = { ...defaults.mapLayers, ...(s.mapLayers || {}) };
 
   state.debugOverlay = !!s.debugOverlay;
@@ -773,12 +836,14 @@ function syncControlsFromState() {
 
   setCheck("showVelocity", state.showVelocity);
   setCheck("showHeading", state.showHeading);
-  setCheck("showTrail", state.showTrail);
-  setCheck("trailAll", state.trailAll);
-  setCheck("trailFull", state.trailFull);
+  setCheck("trajectoryRangePast", state.trajectoryRange === "past");
+  setCheck("trajectoryRangeFull", state.trajectoryRange !== "past");
   setCheck("holdTL", state.holdTL);
   setCheck("sceneTlOnly", state.includeTlOnlyScenes);
+  setCheck("showMap", state.showMap);
+  setCheck("showSceneBg", state.sceneBgEnabled);
   setCheck("showBasemap", state.basemapEnabled);
+  setSelectValue("mapSourceSelect", state.mapSource || "lanelet2");
 
   setCheck("debugOverlay", state.debugOverlay);
   setCheck("sceneBox", state.sceneBox);
@@ -820,6 +885,98 @@ function syncControlsFromState() {
   setCheck("mapJunctions", state.mapLayers.junctions);
 }
 
+function supportsMapSourceSelector(meta = currentDatasetMeta()) {
+  const m = (meta && typeof meta === "object") ? meta : {};
+  const fam = String(m.family || "").toLowerCase();
+  return (fam === "ind" || fam === "sind") && !!m.has_map && !!m.has_scene_background;
+}
+
+function normalizeMapSource(raw) {
+  const s = String(raw || "").trim().toLowerCase();
+  if (s === "none") return "none";
+  if (s === "orthophoto") return "orthophoto";
+  return "lanelet2";
+}
+
+function applyMapSourceSelection(rawSource, { silent = false } = {}) {
+  const source = normalizeMapSource(rawSource);
+  state.mapSource = source;
+  if (source === "none") {
+    state.showMap = false;
+    state.sceneBgEnabled = false;
+    state.basemapEnabled = false;
+  } else if (source === "orthophoto") {
+    state.showMap = false;
+    state.sceneBgEnabled = true;
+    state.basemapEnabled = false;
+  } else {
+    state.showMap = true;
+    state.sceneBgEnabled = false;
+  }
+  if (!silent) {
+    syncControlsFromState();
+    syncMapSourceUi(state.bundle);
+    render();
+  }
+}
+
+function activeMapSourceLabel(bundle = state.bundle) {
+  const meta = currentDatasetMeta() || {};
+  if (supportsMapSourceSelector(meta)) {
+    if (state.mapSource === "orthophoto") return "Orthophoto";
+    if (state.mapSource === "none") return "None";
+    return "Lanelet2";
+  }
+  const hasBg = !!currentSceneBackground(bundle);
+  if (state.showMap && hasBg && state.sceneBgEnabled) return "Vector map + image";
+  if (state.showMap) return "Vector map";
+  if (hasBg && state.sceneBgEnabled) return "Scene image";
+  if (state.basemapEnabled && currentBasemapConfig()) return "Basemap";
+  return "None";
+}
+
+function syncMapSourceUi(bundle = state.bundle) {
+  const meta = currentDatasetMeta() || {};
+  const isSelectable = supportsMapSourceSelector(meta);
+  const controls = $("mapSourceControls");
+  const select = $("mapSourceSelect");
+  const status = $("mapSourceStatus");
+  const showMapWrap = $("showMapWrap");
+  const showSceneBgWrap = $("showSceneBgWrap");
+
+  if (controls) controls.hidden = !isSelectable;
+  if (showMapWrap) showMapWrap.hidden = isSelectable ? true : !state.hasMap;
+  if (showSceneBgWrap) showSceneBgWrap.hidden = isSelectable ? true : !state.hasSceneBackground;
+
+  if (!isSelectable) {
+    if (status) {
+      status.hidden = true;
+      status.textContent = "";
+    }
+    return;
+  }
+
+  const bgReady = !!currentSceneBackground(bundle);
+  if (select) {
+    select.disabled = false;
+    if (state.mapSource === "orthophoto" && !bgReady) {
+      state.mapSource = "lanelet2";
+      state.showMap = true;
+      state.sceneBgEnabled = false;
+    }
+    select.value = normalizeMapSource(state.mapSource);
+    const optOrth = Array.from(select.options || []).find((o) => o.value === "orthophoto");
+    if (optOrth) {
+      optOrth.disabled = !bgReady;
+      optOrth.textContent = bgReady ? "Orthophoto image" : "Orthophoto image (unavailable in this scene)";
+    }
+  }
+  if (status) {
+    status.hidden = false;
+    status.textContent = `Active: ${activeMapSourceLabel(bundle)}`;
+  }
+}
+
 function syncBasemapStatusUi() {
   const el = $("basemapStatus");
   if (!el) return;
@@ -850,6 +1007,61 @@ function syncBasemapStatusUi() {
   }
 }
 
+function currentSceneBackground(bundle = state.bundle) {
+  if (!bundle || typeof bundle !== "object") return null;
+  const bg = bundle.background;
+  if (!bg || typeof bg !== "object") return null;
+  if (!bg.url || !bg.extent) return null;
+  const ext = bg.extent;
+  const coords = ["min_x", "min_y", "max_x", "max_y"];
+  for (const k of coords) {
+    if (!Number.isFinite(Number(ext[k]))) return null;
+  }
+  return bg;
+}
+
+function syncSceneBackgroundUi(bundle = state.bundle) {
+  const wrap = $("showSceneBgWrap");
+  const status = $("sceneBgStatus");
+  const checkbox = $("showSceneBg");
+  if (supportsMapSourceSelector(currentDatasetMeta())) {
+    if (wrap) wrap.hidden = true;
+    if (checkbox) checkbox.disabled = true;
+    if (status) {
+      status.hidden = true;
+      status.textContent = "";
+    }
+    return;
+  }
+  const hasFeature = !!state.hasSceneBackground;
+  const bg = currentSceneBackground(bundle);
+  if (wrap) wrap.hidden = !hasFeature;
+  if (!hasFeature) {
+    if (checkbox) checkbox.disabled = true;
+    if (status) {
+      status.hidden = true;
+      status.textContent = "";
+    }
+    return;
+  }
+  if (checkbox) checkbox.disabled = !bg;
+  if (!status) return;
+  if (!bg) {
+    status.hidden = false;
+    status.textContent = bundle ? "Background image is not available for this scene." : "Load a scene to display the background image.";
+    return;
+  }
+  const size = (bg.size_px && typeof bg.size_px === "object") ? bg.size_px : null;
+  const w = Number(size && size.width);
+  const h = Number(size && size.height);
+  const rec = String(bg.recording_id || "").trim();
+  const label = Number.isFinite(w) && Number.isFinite(h)
+    ? `${Math.round(w)}x${Math.round(h)} px`
+    : "image ready";
+  status.hidden = false;
+  status.textContent = rec ? `Recording ${rec} · ${label}` : label;
+}
+
 function getCanvasSize(canvas) {
   const rect = canvas.getBoundingClientRect();
   const dpr = window.devicePixelRatio || 1;
@@ -863,72 +1075,68 @@ function resizeCanvas(canvas, ctx, cssW, cssH, dpr) {
   ctx.setTransform(1, 0, 0, 1, 0, 0);
 }
 
+function toBBoxArray(ext) {
+  if (!ext || typeof ext !== "object") return null;
+  const vals = [Number(ext.min_x), Number(ext.min_y), Number(ext.max_x), Number(ext.max_y)];
+  if (!vals.every((v) => Number.isFinite(v))) return null;
+  return vals;
+}
+
+function buildAdvancedMetadataPayload(bundle) {
+  const map = bundle && bundle.map && typeof bundle.map === "object" ? bundle.map : null;
+  const bg = bundle && bundle.background && typeof bundle.background === "object" ? bundle.background : null;
+  return {
+    dataset_id: bundle ? bundle.dataset_id : null,
+    split: bundle ? bundle.split : null,
+    city: bundle ? bundle.city : null,
+    scene_id: bundle ? bundle.scene_id : null,
+    scene_label: bundle ? bundle.scene_label : null,
+    group_label: state.groupLabel || "Intersection",
+    group_id: bundle ? bundle.intersect_id : null,
+    group_display: bundle ? (bundle.intersect_label || intersectionLabel(bundle.intersect_id) || null) : null,
+    map_id: bundle ? bundle.map_id : null,
+    recording_id: bundle ? bundle.recording_id : null,
+    recording_label: bundle ? bundle.recording_label : null,
+    window_index: bundle && Number.isFinite(Number(bundle.window_index)) ? Number(bundle.window_index) : null,
+    window_count: bundle && Number.isFinite(Number(bundle.window_count)) ? Number(bundle.window_count) : null,
+    map_source_active: bundle ? activeMapSourceLabel(bundle) : null,
+    frames: bundle && Array.isArray(bundle.frames) ? bundle.frames.length : 0,
+    timestamps: bundle && Array.isArray(bundle.timestamps) ? bundle.timestamps : [],
+    modality_stats: bundle && bundle.modality_stats ? bundle.modality_stats : null,
+    warnings: bundle && Array.isArray(bundle.warnings) ? bundle.warnings : [],
+    intersect_by_modality: bundle && bundle.intersect_by_modality ? bundle.intersect_by_modality : null,
+    extents: {
+      scene_bbox: bundle ? toBBoxArray(bundle.extent) : null,
+      scene_size_m: bundle ? extentWH(bundle.extent) : { w: null, h: null },
+      map_bbox: map ? toBBoxArray(map.bbox) : null,
+      map_clip_bbox: map ? toBBoxArray(map.clip_extent) : null,
+      map_clip_size_m: map ? extentWH(map.clip_extent) : { w: null, h: null },
+    },
+    map: map
+      ? {
+          clip_mode: map.clip_mode || null,
+          map_file: map.map_file || null,
+          counts: map.counts || null,
+          lanes_shown: Array.isArray(map.lanes) ? map.lanes.length : 0,
+          stoplines_shown: Array.isArray(map.stoplines) ? map.stoplines.length : 0,
+          crosswalks_shown: Array.isArray(map.crosswalks) ? map.crosswalks.length : 0,
+          junctions_shown: Array.isArray(map.junctions) ? map.junctions.length : 0,
+          lanes_truncated: !!map.lanes_truncated,
+        }
+      : null,
+    background: bg
+      ? {
+          recording_id: bg.recording_id || null,
+          url: bg.url || null,
+          extent_bbox: toBBoxArray(bg.extent),
+          size_px: bg.size_px || null,
+        }
+      : null,
+  };
+}
+
 function summarizeBundle(bundle) {
-  const warnings = bundle.warnings || [];
-  const lines = [];
-  const groupLabel = state.groupLabel || "Intersection";
-  lines.push(`dataset: ${bundle.dataset_id}`);
-  lines.push(`split:   ${bundle.split}`);
-  lines.push(`scene:   ${bundle.scene_id}`);
-  lines.push(`city:    ${bundle.city}`);
-  lines.push(`group_label: ${groupLabel}`);
-  const label = bundle.intersect_label || intersectionLabel(bundle.intersect_id);
-  if (label) {
-    lines.push(`group: ${label}`);
-  }
-  lines.push(`group_id: ${bundle.intersect_id}`);
-  lines.push(`map_id:  ${bundle.map_id}`);
-  if (bundle.intersect_by_modality) {
-    lines.push(`intersect_by_modality: ${JSON.stringify(bundle.intersect_by_modality)}`);
-  }
-  lines.push(`frames:  ${bundle.frames.length}`);
-  if (bundle.timestamps && bundle.timestamps.length) {
-    const t0 = bundle.timestamps[0];
-    const t1 = bundle.timestamps[bundle.timestamps.length - 1];
-    lines.push(`t0..t1:  ${t0} .. ${t1}`);
-  }
-  lines.push(`extent:  x=[${fmt(bundle.extent.min_x, 1)}, ${fmt(bundle.extent.max_x, 1)}], y=[${fmt(bundle.extent.min_y, 1)}, ${fmt(bundle.extent.max_y, 1)}]`);
-
-  if (bundle.modality_stats) {
-    lines.push("");
-    lines.push("modality_stats:");
-    for (const key of ["ego", "infra", "vehicle", "traffic_light"]) {
-      const s = bundle.modality_stats[key];
-      if (!s) continue;
-      lines.push(
-        `- ${key}: rows=${s.rows}, unique_ts=${s.unique_ts}, min_ts=${s.min_ts}, max_ts=${s.max_ts}`
-      );
-    }
-  }
-
-  if (bundle.map) {
-    lines.push("");
-    lines.push(`map clip_mode: ${bundle.map.clip_mode || "?"}`);
-    if (bundle.map.map_file) {
-      lines.push(`map file: ${bundle.map.map_file}`);
-    }
-    if (bundle.map.counts) {
-      lines.push(
-        `map counts: lanes=${bundle.map.counts.LANE}, stoplines=${bundle.map.counts.STOPLINE}, crosswalks=${bundle.map.counts.CROSSWALK}, junctions=${bundle.map.counts.JUNCTION}`
-      );
-    }
-    if (bundle.map.bbox) {
-      lines.push(
-        `map bbox: x=[${fmt(bundle.map.bbox.min_x, 1)}, ${fmt(bundle.map.bbox.max_x, 1)}], y=[${fmt(bundle.map.bbox.min_y, 1)}, ${fmt(bundle.map.bbox.max_y, 1)}]`
-      );
-    }
-    lines.push(`map lanes(shown): ${bundle.map.lanes.length}${bundle.map.lanes_truncated ? " (truncated)" : ""}`);
-    lines.push(`map stoplines(shown): ${bundle.map.stoplines.length}`);
-    lines.push(`map crosswalks(shown): ${bundle.map.crosswalks.length}`);
-    lines.push(`map junctions(shown): ${bundle.map.junctions.length}`);
-    lines.push(`map clip:  x=[${fmt(bundle.map.clip_extent.min_x, 1)}, ${fmt(bundle.map.clip_extent.max_x, 1)}], y=[${fmt(bundle.map.clip_extent.min_y, 1)}, ${fmt(bundle.map.clip_extent.max_y, 1)}]`);
-  }
-  if (warnings.length) {
-    lines.push("");
-    lines.push("warnings:");
-    for (const w of warnings) lines.push(`- ${w}`);
-  }
-  return lines.join("\n");
+  return JSON.stringify(buildAdvancedMetadataPayload(bundle), null, 2);
 }
 
 function currentDatasetMeta() {
@@ -948,6 +1156,7 @@ function applyDatasetUi() {
   const meta = currentDatasetMeta() || {};
   state.groupLabel = meta.group_label || "Intersection";
   state.hasMap = meta.has_map !== undefined ? !!meta.has_map : true;
+  state.hasSceneBackground = !!meta.has_scene_background;
   state.splits = Array.isArray(meta.splits) && meta.splits.length ? meta.splits : ["train", "val"];
   state.defaultSplit = meta.default_split || state.splits[0] || "train";
   const fallbackModalities = (meta.family === "cpm-objects") ? ["infra"] : ["ego", "infra", "vehicle", "traffic_light"];
@@ -1000,17 +1209,27 @@ function applyDatasetUi() {
     if (mapTitle) mapTitle.textContent = "Map";
     if (mapOnly) mapOnly.hidden = false;
     if (fitMapBtn) fitMapBtn.hidden = false;
+    if (state.showMap === undefined || state.showMap === null) state.showMap = true;
   } else {
     if (mapTitle) mapTitle.textContent = "View";
     if (mapOnly) mapOnly.hidden = true;
     if (fitMapBtn) fitMapBtn.hidden = true;
+    state.showMap = false;
   }
+  if (!state.hasSceneBackground) state.sceneBgEnabled = false;
 
   // Optional basemap (raster) for datasets that provide a geo origin but no vector HD map.
   state.basemapMeta = (meta.basemap && typeof meta.basemap === "object") ? meta.basemap : null;
   const basemapWrap = $("basemapControls");
   const hasBasemap = !!(state.basemapMeta && (state.basemapMeta.origin || state.basemapMeta.origin_by_intersect));
-  if (basemapWrap) basemapWrap.hidden = !hasBasemap;
+  const mapSourceMode = supportsMapSourceSelector(meta);
+  if (mapSourceMode) state.basemapEnabled = false;
+  if (basemapWrap) basemapWrap.hidden = !hasBasemap || mapSourceMode;
+  if (mapSourceMode) {
+    applyMapSourceSelection(state.mapSource || "lanelet2", { silent: true });
+  }
+  syncSceneBackgroundUi(null);
+  syncMapSourceUi(null);
 
   // Dataset-specific modality availability and naming.
   const available = new Set(state.modalities || []);
@@ -1540,7 +1759,7 @@ function updateSubTypeUi(bundle) {
   wrap.innerHTML = "";
   for (const it of list) {
     const lab = document.createElement("label");
-    lab.className = "check small";
+    lab.className = "check small agentTypeRow";
 
     const inp = document.createElement("input");
     inp.type = "checkbox";
@@ -1556,8 +1775,17 @@ function updateSubTypeUi(bundle) {
     sw.className = "swatch";
     sw.style.background = (COLORS.subType && COLORS.subType[it.sub_type]) ? COLORS.subType[it.sub_type] : colorFromString(it.sub_type);
     lab.appendChild(sw);
-    const txt = document.createTextNode(`${labelizeEnum(it.sub_type)} (${it.count})`);
-    lab.appendChild(txt);
+    const line = document.createElement("span");
+    line.className = "agentType__line";
+    const name = document.createElement("span");
+    name.className = "agentType__name";
+    name.textContent = labelizeEnum(it.sub_type);
+    const count = document.createElement("span");
+    count.className = "agentType__count";
+    count.textContent = String(it.count);
+    line.appendChild(name);
+    line.appendChild(count);
+    lab.appendChild(line);
     wrap.appendChild(lab);
   }
 }
@@ -1573,9 +1801,9 @@ function upperBound(arr, x) {
   return lo;
 }
 
-function resetTrailCache() {
-  state.trailCache = null;
-  state.trailAllCache = null;
+function resetPathCache() {
+  state.pathCache = null;
+  state.pathAllCache = null;
 }
 
 function getSelectedTrack() {
@@ -1585,7 +1813,7 @@ function getSelectedTrack() {
 
   const sceneKey = `${bundle.dataset_id}:${bundle.split}:${bundle.scene_id}`;
   const cacheKey = `${sceneKey}:${key.modality}:${String(key.id)}`;
-  if (state.trailCache && state.trailCache.key === cacheKey) return state.trailCache;
+  if (state.pathCache && state.pathCache.key === cacheKey) return state.pathCache;
 
   const pts = [];
   const frames = [];
@@ -1618,21 +1846,21 @@ function getSelectedTrack() {
     lastY = y;
   }
 
-  state.trailCache = { key: cacheKey, pts, frames, meta: { type: metaType, sub_type: metaSubType } };
-  return state.trailCache;
+  state.pathCache = { key: cacheKey, pts, frames, meta: { type: metaType, sub_type: metaSubType } };
+  return state.pathCache;
 }
 
 function getAllTracksFor(modality) {
   const bundle = state.bundle;
   if (!bundle) return null;
   const sceneKey = `${bundle.dataset_id}:${bundle.split}:${bundle.scene_id}`;
-  if (!state.trailAllCache || state.trailAllCache.key !== sceneKey) {
-    state.trailAllCache = { key: sceneKey, byModality: {} };
+  if (!state.pathAllCache || state.pathAllCache.key !== sceneKey) {
+    state.pathAllCache = { key: sceneKey, byModality: {} };
   }
-  const cache = state.trailAllCache;
+  const cache = state.pathAllCache;
   if (cache.byModality[modality]) return cache.byModality[modality];
 
-  const tracks = new Map(); // id -> { pts: [[x,y],...], frames: [i,...] }
+  const tracks = new Map(); // id -> { pts: [[x,y],...], frames: [i,...], meta: {type, sub_type} }
   const lastById = new Map(); // id -> [x,y]
 
   for (let i = 0; i < bundle.frames.length; i++) {
@@ -1650,9 +1878,11 @@ function getAllTracksFor(modality) {
 
       let t = tracks.get(id);
       if (!t) {
-        t = { pts: [], frames: [] };
+        t = { pts: [], frames: [], meta: { type: null, sub_type: null } };
         tracks.set(id, t);
       }
+      if (t.meta.type == null && r.type != null) t.meta.type = r.type;
+      if (t.meta.sub_type == null && r.sub_type != null) t.meta.sub_type = r.sub_type;
       t.pts.push([x, y]);
       t.frames.push(i);
       lastById.set(id, [x, y]);
@@ -1684,12 +1914,15 @@ function render() {
   }
   const view = state.view;
 
+  // Optional scene background image (e.g., inD orthophoto).
+  drawSceneBackground(ctx, view, cssW, cssH, dpr, bundle);
+
   // Optional raster basemap (for datasets with geo origin but no HD map).
   drawBasemap(ctx, view, cssW, cssH, dpr);
   syncBasemapStatusUi();
 
   // Draw map (Path2D cached per scene)
-  if (bundle.map && state.mapPaths) {
+  if (state.showMap && bundle.map && state.mapPaths) {
     ctx.save();
     applyWorldTransform(ctx, view, cssW, cssH, dpr);
     const px = (n) => n / view.scale;
@@ -1790,19 +2023,11 @@ function render() {
     }
   }
   let counts = parts.join(" · ");
-  const drawAllTrails = !!(state.trailAll || !state.selectedKey);
-  if (state.showTrail) {
-    if (state.trailAll) {
-      counts += " · Trajectories: all objects in frame";
-    } else if (state.selectedKey && state.selectedKey.id != null) {
-      counts += ` · Selected ${state.selectedKey.modality}:${state.selectedKey.id}`;
-    } else {
-      counts += " · Trajectories: all objects in frame (preview) · click a dot to lock selection";
-    }
-  }
+  const rangeLabel = state.trajectoryRange === "past" ? "past only" : "past + future";
+  counts += ` · Trajectories: ${rangeLabel}`;
   $("countsLabel").textContent = counts;
 
-  // World drawing pass: trails + agents + TL + highlight
+  // World drawing pass: paths + agents + TL + highlight
   ctx.save();
   applyWorldTransform(ctx, view, cssW, cssH, dpr);
 
@@ -1921,13 +2146,13 @@ function render() {
       ctx.restore();
     };
 
-    if (state.trailFull) {
-      // Full-path baseline so "past + future" is always clearly visible.
-      drawSegment(0, pts.length, 0.42, 2.2, null, true);
+    if (state.trajectoryRange === "full") {
+      // Future-on mode: keep past strong and make future visibly dashed.
+      drawSegment(0, pts.length, 0.22, 1.8, null, false);
 
-      // Future part from current frame onward (dashed).
+      // Future part from current frame onward (dashed + halo for contrast).
       const futureStart = Math.max(0, k - 1);
-      drawSegment(futureStart, pts.length, 0.62, 2.4, [12, 8], false);
+      drawSegment(futureStart, pts.length, 0.95, 2.6, [10, 7], true);
 
       // Past part up to the current frame (solid emphasis).
       drawSegment(0, k, 0.92, 3.0, null, true);
@@ -1938,37 +2163,17 @@ function render() {
     drawSegment(0, k, 0.92, 3.0, null, true);
   };
 
-  // Trajectories (selected or all objects in the current frame)
-  if (state.showTrail) {
-    if (drawAllTrails) {
-      const seen = new Set();
-      for (const modality of agentModalitiesOrdered()) {
-        if (!state.layers[modality]) continue;
-        const tracks = getAllTracksFor(modality);
-        if (!tracks) continue;
-        for (const rec of fr[modality] || []) {
-          if (!shouldDrawRec(modality, rec)) continue;
-          if (!rec || rec.id == null) continue;
-          const key = `${modality}:${String(rec.id)}`;
-          if (seen.has(key)) continue;
-          seen.add(key);
-          const tr = tracks.get(String(rec.id));
-          if (!tr) continue;
-          const st = recSubType(rec);
-          const col = (st && st !== "UNKNOWN") ? colorForRec(rec) : null;
-          // Slightly lighter when drawing many trajectories.
-          drawTrajectory(modality, tr.pts, tr.frames, 0.55, col);
-        }
-      }
-    } else if (state.selectedKey) {
-      const tr = getSelectedTrack();
-      if (tr) {
-        const meta = tr.meta || {};
-        const metaRec = { type: meta.type, sub_type: meta.sub_type };
-        const st = recSubType(metaRec);
-        const col = (st && st !== "UNKNOWN") ? colorForRec(metaRec) : null;
-        drawTrajectory(state.selectedKey.modality, tr.pts, tr.frames, 1.0, col);
-      }
+  // Trajectories for all objects in scene.
+  for (const modality of agentModalitiesOrdered()) {
+    if (!state.layers[modality]) continue;
+    const tracks = getAllTracksFor(modality);
+    if (!tracks) continue;
+    for (const tr of tracks.values()) {
+      const metaRec = tr.meta || {};
+      if (!shouldDrawRec(modality, metaRec)) continue;
+      const st = recSubType(metaRec);
+      const col = (st && st !== "UNKNOWN") ? colorForRec(metaRec) : null;
+      drawTrajectory(modality, tr.pts, tr.frames, 0.55, col);
     }
   }
 
@@ -2035,34 +2240,31 @@ function pickNearestAgentAt(canvasX, canvasY) {
 
 function updateSceneInfo(extraLines = []) {
   const bundle = state.bundle;
-  let txt = bundle ? summarizeBundle(bundle) : "Select a scene…";
+  if (!bundle) {
+    $("sceneInfo").textContent = "Select a scene…";
+    return;
+  }
+  const payload = buildAdvancedMetadataPayload(bundle);
   if (state.selectedKey) {
-    txt += `\n\nselectedKey:\n${JSON.stringify(state.selectedKey, null, 2)}`;
-    if (state.selected) {
-      txt += "\n\nselected:\n" + JSON.stringify(state.selected, null, 2);
-    } else {
-      txt += "\n\nselected:\n(null at this frame)";
+    const tr = getSelectedTrack();
+    const ptsN = tr && tr.pts ? tr.pts.length : 0;
+    let pastN = null;
+    if (tr && tr.frames && tr.frames.length) {
+      const fr = clamp(state.frame, 0, Math.max(0, (bundle && bundle.frames ? bundle.frames.length : 1) - 1));
+      pastN = upperBound(tr.frames, fr);
     }
-
-    if (state.showTrail) {
-      const tr = getSelectedTrack();
-      const ptsN = tr && tr.pts ? tr.pts.length : 0;
-      let pastN = null;
-      if (tr && tr.frames && tr.frames.length) {
-        const fr = clamp(state.frame, 0, Math.max(0, (bundle && bundle.frames ? bundle.frames.length : 1) - 1));
-        pastN = upperBound(tr.frames, fr);
-      }
-      txt += `\n\ntrajectory:\n${JSON.stringify(
-        { points: ptsN, past_points: pastN, full: !!state.trailFull },
-        null,
-        2
-      )}`;
-    }
+    payload.selection = {
+      key: state.selectedKey,
+      frame_record: state.selected || null,
+      trajectory_mode: {
+        range: state.trajectoryRange === "past" ? "past" : "full",
+        points: ptsN,
+        past_points: pastN,
+      },
+    };
   }
-  if (extraLines.length) {
-    txt += "\n\n" + extraLines.join("\n");
-  }
-  $("sceneInfo").textContent = txt;
+  if (extraLines.length) payload.notes = extraLines;
+  $("sceneInfo").textContent = JSON.stringify(payload, null, 2);
 }
 
 function setPlaybackEnabled(enabled) {
@@ -2129,6 +2331,19 @@ function formatInt(n) {
   return Math.max(0, Math.round(v)).toLocaleString();
 }
 
+function formatSpeed(v) {
+  const n = Number(v);
+  if (!Number.isFinite(n)) return "n/a";
+  return `${n.toFixed(1)} m/s`;
+}
+
+function renderSceneBrowserGroup(title, rows) {
+  const body = (rows || [])
+    .map(([k, v]) => `<div class="sceneBrowser__row"><span class="sceneBrowser__label">${escapeHtml(k)}</span><span class="sceneBrowser__value">${escapeHtml(v)}</span></div>`)
+    .join("");
+  return `<div class="sceneBrowser__group"><div class="sceneBrowser__title">${escapeHtml(title)}</div>${body}</div>`;
+}
+
 function updateSplitAvailabilityHint(availability) {
   const el = $("splitAvailabilityHint");
   if (!el) return;
@@ -2136,31 +2351,34 @@ function updateSplitAvailabilityHint(availability) {
   const avail = availability && typeof availability === "object" ? availability : null;
   const byModality = avail && avail.by_modality && typeof avail.by_modality === "object" ? avail.by_modality : null;
   if (!byModality) {
-    el.textContent = "";
+    el.innerHTML = "";
     return;
   }
 
-  const modalOrder = Array.isArray(state.modalities) ? state.modalities.map(String) : [];
-  const parts = [];
+  let modalOrder = Array.isArray(state.modalities) ? state.modalities.map(String) : [];
+  if (!modalOrder.length) {
+    modalOrder = ["ego", "infra", "vehicle", "traffic_light"].filter((m) => Object.prototype.hasOwnProperty.call(byModality, m));
+  }
+  if (!modalOrder.length) {
+    modalOrder = Object.keys(byModality);
+  }
+  const rows = [];
   for (const m of modalOrder) {
     const c = Number(byModality[m] || 0);
     const label = modalityShortLabel(m);
-    parts.push(`${label}: ${formatInt(c)}`);
+    rows.push([label, formatInt(c)]);
   }
-
-  const total = Number(avail.scene_count || 0);
-  const hdr = `Split availability (${formatInt(total)} scenes)`;
-  const suffix = (state.includeTlOnlyScenes && String(currentDatasetMeta()?.family || "").toLowerCase() === "v2x-seq")
-    ? " · TL-only included"
-    : "";
-  el.textContent = parts.length ? `${hdr}: ${parts.join(" · ")}${suffix}` : `${hdr}${suffix}`;
+  el.innerHTML = renderSceneBrowserGroup("Availability", rows);
 }
 
-function updateSceneHint(total, shown, mismatch) {
+function updateSceneHint(total, _shown, _mismatch) {
   const el = $("sceneHint");
   if (!el) return;
   const groupLabel = state.groupLabel || "Intersection";
-  const parts = [];
+  const rows = [];
+  const allLabel = String(groupLabel).toLowerCase() === "intersection"
+    ? "All intersections"
+    : `All ${pluralizeLower(groupLabel) || "groups"}`;
   if (state.intersectId) {
     let lab = null;
     const interSel = $("intersectSelect");
@@ -2169,13 +2387,268 @@ function updateSceneHint(total, shown, mismatch) {
       if (opt && opt.textContent) lab = String(opt.textContent).replace(/\s*\(\d+\)\s*$/, "");
     }
     lab = lab || intersectionLabel(state.intersectId) || state.intersectId;
-    parts.push(`${groupLabel}: ${lab}`);
+    rows.push([groupLabel, String(lab)]);
   } else {
-    parts.push(`${groupLabel}: All ${pluralizeLower(groupLabel) || "groups"}`);
+    rows.push([groupLabel, allLabel]);
   }
-  if (total != null) parts.push(`Scenes: ${total}`);
-  if (mismatch != null && mismatch > 0) parts.push(`WARNING: ${mismatch} not in filter`);
-  el.textContent = parts.join(" · ");
+  rows.push(["Total scenes", formatInt(total != null ? total : 0)]);
+  el.innerHTML = renderSceneBrowserGroup("Scope", rows);
+}
+
+const SCENE_CLOSE_ENCOUNTER_THRESHOLD_M = 2.5;
+const SCENE_STOP_SPEED_MPS = 0.25;
+const SCENE_MOVE_SPEED_MPS = 0.8;
+
+function wrapAngleRad(a) {
+  let x = Number(a);
+  if (!Number.isFinite(x)) return null;
+  while (x > Math.PI) x -= Math.PI * 2;
+  while (x < -Math.PI) x += Math.PI * 2;
+  return x;
+}
+
+function headingBetween(p0, p1) {
+  if (!p0 || !p1) return null;
+  const dx = Number(p1.x) - Number(p0.x);
+  const dy = Number(p1.y) - Number(p0.y);
+  if (!Number.isFinite(dx) || !Number.isFinite(dy)) return null;
+  if (Math.hypot(dx, dy) < 1e-6) return null;
+  return Math.atan2(dy, dx);
+}
+
+function normalizeDtSeconds(dtRaw) {
+  let dt = Number(dtRaw);
+  if (!Number.isFinite(dt) || dt <= 0) return null;
+  // Some datasets carry millisecond timestamps; normalize to seconds.
+  if (dt > 20) dt /= 1000;
+  return dt > 0 ? dt : null;
+}
+
+function scenePublicIntersection(bundle) {
+  const raw = String(bundle && (bundle.intersect_label || bundle.intersect_id || "") || "");
+  const m = raw.match(/(\d{1,3})/);
+  if (m) return `Intersection ${String(Number(m[1])).padStart(2, "0")}`;
+  if (/^intersection\b/i.test(raw)) return raw.replace(/\s+/g, " ").trim();
+  return "Intersection";
+}
+
+function scenePublicScene(bundle) {
+  const sceneLabel = String(bundle && bundle.scene_label ? bundle.scene_label : "").trim();
+  const sceneId = String(bundle && bundle.scene_id != null ? bundle.scene_id : "").trim();
+  const fromLabel = sceneLabel.match(/scene\s*([0-9]+)/i) || sceneLabel.match(/\b([0-9]{1,4})\b/);
+  if (fromLabel) return `Scene ${Number(fromLabel[1])}`;
+  if (/^\d+$/.test(sceneId)) return `Scene ${Number(sceneId)}`;
+  return sceneLabel && /^scene/i.test(sceneLabel) ? sceneLabel : "Scene";
+}
+
+function isVruTrack(track) {
+  if (!track) return false;
+  const t = String(track.type || "").toUpperCase();
+  if (t === "VRU" || t === "PEDESTRIAN" || t === "BICYCLE") return true;
+  for (const st of (track.subTypes || [])) {
+    const s = String(st || "").toUpperCase();
+    if (s.includes("PED") || s.includes("BICYCLE") || s.includes("CYCL") || s.includes("SCOOT")) return true;
+  }
+  return false;
+}
+
+function extractYieldConflictCount(bundle) {
+  const sources = [];
+  if (Array.isArray(bundle && bundle.events)) sources.push(bundle.events);
+  if (Array.isArray(bundle && bundle.interaction_events)) sources.push(bundle.interaction_events);
+  if (Array.isArray(bundle && bundle.interactions)) sources.push(bundle.interactions);
+  if (!sources.length) return null;
+  let n = 0;
+  for (const src of sources) {
+    for (const it of src) {
+      const txt = typeof it === "string" ? it : JSON.stringify(it || {});
+      if (/yield|conflict/i.test(txt)) n += 1;
+    }
+  }
+  return n;
+}
+
+function collectSceneProfileMetrics(bundle) {
+  const frames = Array.isArray(bundle && bundle.frames) ? bundle.frames : [];
+  const timestamps = Array.isArray(bundle && bundle.timestamps) ? bundle.timestamps : [];
+  const modalities = Array.isArray(state.modalities) ? state.modalities.filter((m) => m !== "traffic_light") : ["infra", "vehicle", "ego"];
+
+  const tracks = new Map(); // key -> { type, subTypes:Set, samples:[...] }
+  let peakSimultaneous = 0;
+  let minInterAgentDistance = Infinity;
+  let closeEncounters = 0;
+  const pairState = new Map(); // key -> { close, lastFrame }
+
+  for (let fi = 0; fi < frames.length; fi++) {
+    const fr = frames[fi] || {};
+    const agents = [];
+    let frameCount = 0;
+
+    for (const modality of modalities) {
+      const recs = fr[modality] || [];
+      for (const rec of recs) {
+        if (!rec || rec.id == null) continue;
+        const x = Number(rec.x);
+        const y = Number(rec.y);
+        if (!Number.isFinite(x) || !Number.isFinite(y)) continue;
+
+        frameCount += 1;
+        const key = `${modality}:${String(rec.id)}`;
+        agents.push({ key, x, y });
+
+        let tr = tracks.get(key);
+        if (!tr) {
+          tr = { type: "UNKNOWN", subTypes: new Set(), samples: [] };
+          tracks.set(key, tr);
+        }
+
+        const t = recType(rec);
+        const st = recSubType(rec);
+        if (tr.type === "UNKNOWN" && t !== "UNKNOWN") tr.type = t;
+        tr.subTypes.add(st);
+
+        const vx = Number(rec.vx);
+        const vy = Number(rec.vy);
+        const speedRaw = Number(rec.speed_mps ?? rec.speed ?? rec.velocity ?? NaN);
+        tr.samples.push({
+          frame: fi,
+          ts: (timestamps[fi] != null && Number.isFinite(Number(timestamps[fi]))) ? Number(timestamps[fi]) : null,
+          x,
+          y,
+          vx: Number.isFinite(vx) ? vx : null,
+          vy: Number.isFinite(vy) ? vy : null,
+          speedRaw: Number.isFinite(speedRaw) ? Math.abs(speedRaw) : null,
+        });
+      }
+    }
+
+    peakSimultaneous = Math.max(peakSimultaneous, frameCount);
+
+    for (let i = 0; i < agents.length; i++) {
+      for (let j = i + 1; j < agents.length; j++) {
+        const a = agents[i];
+        const b = agents[j];
+        const d = Math.hypot(a.x - b.x, a.y - b.y);
+        if (Number.isFinite(d)) minInterAgentDistance = Math.min(minInterAgentDistance, d);
+
+        const pairKey = a.key < b.key ? `${a.key}|${b.key}` : `${b.key}|${a.key}`;
+        const prev = pairState.get(pairKey);
+        const prevClose = !!(prev && prev.lastFrame === fi - 1 && prev.close);
+        const isClose = Number.isFinite(d) && d <= SCENE_CLOSE_ENCOUNTER_THRESHOLD_M;
+        if (isClose && !prevClose) closeEncounters += 1;
+        pairState.set(pairKey, { close: isClose, lastFrame: fi });
+      }
+    }
+  }
+
+  let vruCount = 0;
+  let rareBus = 0;
+  let rareTruck = 0;
+  let speedSum = 0;
+  let speedN = 0;
+  let laneChanges = 0;
+  let turns = 0;
+  let fullStops = 0;
+
+  for (const tr of tracks.values()) {
+    if (isVruTrack(tr)) vruCount += 1;
+    const subTypes = Array.from(tr.subTypes || []);
+    const hasBus = subTypes.some((s) => /BUS/.test(String(s)));
+    const hasTruck = subTypes.some((s) => /TRUCK/.test(String(s)));
+    if (hasBus) rareBus += 1;
+    if (hasTruck) rareTruck += 1;
+
+    const samples = Array.isArray(tr.samples) ? tr.samples : [];
+    if (!samples.length) continue;
+
+    const speeds = new Array(samples.length).fill(null);
+    for (let i = 0; i < samples.length; i++) {
+      const s = samples[i];
+      let sp = null;
+      if (s.vx != null && s.vy != null) {
+        sp = Math.hypot(s.vx, s.vy);
+      } else if (s.speedRaw != null) {
+        sp = s.speedRaw;
+      } else if (i > 0) {
+        const p = samples[i - 1];
+        const dt = normalizeDtSeconds((s.ts != null && p.ts != null) ? (s.ts - p.ts) : (s.frame - p.frame));
+        if (dt != null) {
+          sp = Math.hypot(s.x - p.x, s.y - p.y) / dt;
+        }
+      }
+      if (Number.isFinite(sp)) {
+        speeds[i] = Math.max(0, sp);
+        speedSum += Math.max(0, sp);
+        speedN += 1;
+      }
+    }
+
+    let moved = false;
+    let inStop = false;
+    let stopRun = 0;
+    for (let i = 0; i < speeds.length; i++) {
+      const sp = speeds[i];
+      if (!Number.isFinite(sp)) continue;
+      if (sp >= SCENE_MOVE_SPEED_MPS) moved = true;
+      if (sp <= SCENE_STOP_SPEED_MPS) {
+        stopRun += 1;
+        if (moved && !inStop && stopRun >= 2) {
+          fullStops += 1;
+          inStop = true;
+        }
+      } else {
+        stopRun = 0;
+        if (sp > SCENE_STOP_SPEED_MPS + 0.2) inStop = false;
+      }
+    }
+
+    let lastTurnAt = -999;
+    let lastLaneChangeAt = -999;
+    for (let i = 2; i < samples.length - 2; i++) {
+      const p0 = samples[i - 2];
+      const p1 = samples[i];
+      const p2 = samples[i + 2];
+      const hin = headingBetween(p0, p1);
+      const hout = headingBetween(p1, p2);
+      if (hin == null || hout == null) continue;
+      const headingDelta = Math.abs(wrapAngleRad(hout - hin) || 0) * (180 / Math.PI);
+      const chord = Math.hypot(p2.x - p0.x, p2.y - p0.y);
+      if (!(chord > 3)) continue;
+      const area2 = Math.abs((p1.x - p0.x) * (p2.y - p0.y) - (p1.y - p0.y) * (p2.x - p0.x));
+      const lateralOffset = area2 / Math.max(1e-6, chord);
+      const sp = speeds[i];
+      const speedOk = !Number.isFinite(sp) || sp > SCENE_MOVE_SPEED_MPS;
+
+      if (speedOk && headingDelta >= 30) {
+        if (i - lastTurnAt > 6) {
+          turns += 1;
+          lastTurnAt = i;
+        }
+        continue;
+      }
+      if (speedOk && headingDelta <= 14 && lateralOffset >= 1.4) {
+        if (i - lastLaneChangeAt > 8) {
+          laneChanges += 1;
+          lastLaneChangeAt = i;
+        }
+      }
+    }
+  }
+
+  return {
+    totalAgents: tracks.size,
+    peakSimultaneous,
+    vruCount,
+    rareBus,
+    rareTruck,
+    avgSpeed: speedN > 0 ? (speedSum / speedN) : null,
+    laneChanges,
+    turns,
+    fullStops,
+    closeEncounters,
+    minInterAgentDistance: Number.isFinite(minInterAgentDistance) ? minInterAgentDistance : null,
+    yieldConflictEvents: extractYieldConflictCount(bundle),
+  };
 }
 
 function updateStatusBox(message = null) {
@@ -2193,83 +2666,77 @@ function updateStatusBox(message = null) {
     return;
   }
 
-  const warn = b.warnings || [];
-  const hasPrefix = (p) => warn.some((w) => String(w).startsWith(p));
-  const has = (w) => warn.includes(w);
+  const metrics = collectSceneProfileMetrics(b);
+  const trajectorySize = extentWH(b.extent);
+  const clipSize = extentWH((b.map && b.map.clip_extent) ? b.map.clip_extent : b.extent);
+  const lanesShown = b.map && Array.isArray(b.map.lanes) ? b.map.lanes.length : 0;
+  const crosswalksShown = b.map && Array.isArray(b.map.crosswalks) ? b.map.crosswalks.length : 0;
 
-  const isEmpty = hasPrefix("no_timestamps");
-  const mapFail = hasPrefix("map_load_failed");
-  const mapMismatch = has("scene_outside_map_bbox") || has("scene_center_outside_map_bbox");
-  const intersectMismatch = has("intersect_id_mismatch_across_modalities");
+  const rareVehicles = [];
+  if (metrics.rareBus > 0) rareVehicles.push(`Bus (${formatInt(metrics.rareBus)})`);
+  if (metrics.rareTruck > 0) rareVehicles.push(`Truck (${formatInt(metrics.rareTruck)})`);
+  const rareVehicleText = rareVehicles.length ? rareVehicles.join(" · ") : "None detected";
 
-  let tagText = "OK";
-  let tagCls = "statusTag statusTag--ok";
-  if (isEmpty) {
-    tagText = "Empty scene";
-    tagCls = "statusTag statusTag--bad";
-  } else if (mapFail) {
-    tagText = "Map error";
-    tagCls = "statusTag statusTag--bad";
-  } else if (mapMismatch) {
-    tagText = "Map mismatch";
-    tagCls = "statusTag statusTag--bad";
-  } else if (intersectMismatch || warn.length) {
-    tagText = warn.length ? `Warnings (${warn.length})` : "Warnings";
-    tagCls = "statusTag statusTag--warn";
+  const groups = [
+    {
+      title: "Agents",
+      rows: [
+        ["Total active agents", formatInt(metrics.totalAgents)],
+        ["Peak simultaneous", formatInt(metrics.peakSimultaneous)],
+        ["VRU count", formatInt(metrics.vruCount)],
+        ["Rare vehicle presence", rareVehicleText],
+      ],
+    },
+    {
+      title: "Motion",
+      rows: [
+        ["Average speed", formatSpeed(metrics.avgSpeed)],
+        ["Lane changes", formatInt(metrics.laneChanges)],
+        ["Turns", formatInt(metrics.turns)],
+        ["Full stops", formatInt(metrics.fullStops)],
+      ],
+    },
+    {
+      title: "Interaction",
+      rows: [
+        [`Close encounters (≤${SCENE_CLOSE_ENCOUNTER_THRESHOLD_M.toFixed(1)}m)`, formatInt(metrics.closeEncounters)],
+        ["Minimum inter-agent distance", fmtMeters(metrics.minInterAgentDistance)],
+      ],
+    },
+    {
+      title: "Spatial Context",
+      rows: [
+        ["Trajectory area", `${fmtMeters(trajectorySize.w)} × ${fmtMeters(trajectorySize.h)}`],
+        ["Scene clip size", `${fmtMeters(clipSize.w)} × ${fmtMeters(clipSize.h)}`],
+        ["Lanes shown", `${formatInt(lanesShown)}${b.map && b.map.lanes_truncated ? " (truncated)" : ""}`],
+        ["Crosswalks", formatInt(crosswalksShown)],
+      ],
+    },
+  ];
+  if (metrics.yieldConflictEvents != null) {
+    groups[2].rows.push(["Yield/conflict events", formatInt(metrics.yieldConflictEvents)]);
   }
 
-  const interLabel = b.intersect_label || intersectionLabel(b.intersect_id) || b.intersect_id || "?";
-  const title = `${interLabel} · Scene ${b.scene_id}`;
+  const groupsHtml = groups
+    .map((g) => {
+      const rows = g.rows
+        .slice(0, 4)
+        .map(([k, v]) => `<div class="sceneProfile__row"><span class="sceneProfile__label">${escapeHtml(k)}</span><span class="sceneProfile__value">${escapeHtml(v)}</span></div>`)
+        .join("");
+      return `<section class="sceneProfile__group"><div class="sceneProfile__groupTitle">${escapeHtml(g.title)}</div>${rows}</section>`;
+    })
+    .join("");
 
-  const mapFile = b.map && b.map.map_file ? b.map.map_file : null;
-  const scope = b.map && b.map.clip_mode ? b.map.clip_mode : null;
-  const scopeLabel = scope === "scene" ? "Focused (scene)" : scope === "intersection" ? "Full (intersection map)" : "None";
-
-  const { w: sceneW, h: sceneH } = extentWH(b.extent);
-  const { w: clipW, h: clipH } = extentWH(b.map && b.map.clip_extent ? b.map.clip_extent : null);
-  const { w: mapW, h: mapH } = extentWH(b.map && b.map.bbox ? b.map.bbox : null);
-
-  const items = [];
-  items.push({ k: "Split", v: splitLabel(b.split) });
-  if (b.city) items.push({ k: "City", v: b.city });
-  items.push({ k: `${state.groupLabel || "Intersection"} ID`, v: b.intersect_id || "?" });
-  if (state.hasMap) {
-    items.push({ k: "Map file", v: mapFile || "(none)" });
-    items.push({ k: "Map scope", v: scopeLabel });
-    items.push({ k: "Detail / padding", v: `Step ${state.mapPointsStep} · Pad ${fmtMeters(state.mapPadding)}` });
-  }
-  if (sceneW != null && sceneH != null) items.push({ k: "Trajectory extent", v: `${fmtMeters(sceneW)} × ${fmtMeters(sceneH)}` });
-  if (state.hasMap) {
-    if (clipW != null && clipH != null) items.push({ k: "Map clip", v: `${fmtMeters(clipW)} × ${fmtMeters(clipH)}` });
-    if (mapW != null && mapH != null) items.push({ k: "Map file extent", v: `${fmtMeters(mapW)} × ${fmtMeters(mapH)}` });
-    if (b.map && b.map.counts) {
-      const c = b.map.counts;
-      items.push({ k: "Lanes", v: `${(b.map.lanes || []).length}${b.map.lanes_truncated ? " (truncated)" : ""} / ${c.LANE}` });
-      items.push({ k: "Crosswalks", v: `${(b.map.crosswalks || []).length} / ${c.CROSSWALK}` });
-    }
-  }
-
-  const warnText =
-    warn.length === 0
-      ? ""
-      : `<div class="statusBox__warnings"><b>Warnings:</b> ${escapeHtml(warn.slice(0, 4).join(" · "))}${
-          warn.length > 4 ? ` · +${warn.length - 4} more` : ""
-        }</div>`;
-
-  const metaParts = [b.city || null, splitLabel(b.split), mapFile ? `map ${mapFile}` : null].filter(Boolean);
+  const headerTitle = `${scenePublicIntersection(b)} · ${scenePublicScene(b)}`;
+  const headerMeta = [b.city || null, splitLabel(b.split)].filter(Boolean).join(" · ");
   el.innerHTML = `
-    <div class="statusBox__top">
-      <div class="statusBox__title">${escapeHtml(title)}</div>
-      <span class="${tagCls}">${escapeHtml(tagText)}</span>
+    <div class="sceneProfile">
+      <div class="sceneProfile__header">
+        <div class="sceneProfile__title">${escapeHtml(headerTitle)}</div>
+        <div class="sceneProfile__meta">${escapeHtml(headerMeta || splitLabel(b.split))}</div>
+      </div>
+      ${groupsHtml}
     </div>
-    <div class="statusBox__meta">${escapeHtml(metaParts.join(" · "))}</div>
-    <div class="statusBox__grid">
-      ${items
-        .slice(0, 10)
-        .map((it) => `<div><b>${escapeHtml(it.k)}:</b> ${escapeHtml(it.v)}</div>`)
-        .join("")}
-    </div>
-    ${warnText}
   `;
 }
 
@@ -2355,6 +2822,8 @@ function profileTypeLabel(datasetType) {
   const t = String(datasetType || "").toLowerCase();
   if (t === "v2x_traj") return "V2X-Traj";
   if (t === "v2x_seq") return "V2X-Seq";
+  if (t === "ind") return "inD";
+  if (t === "sind") return "SinD";
   if (t === "consider_it_cpm") return "Consider.it CPM";
   if (!t) return "Unknown";
   return datasetType;
@@ -2399,6 +2868,8 @@ function datasetTypeFromFamily(family) {
   const fam = String(family || "").trim().toLowerCase();
   if (fam === "v2x-traj") return "v2x_traj";
   if (fam === "v2x-seq") return "v2x_seq";
+  if (fam === "ind") return "ind";
+  if (fam === "sind") return "sind";
   if (fam === "cpm-objects") return "consider_it_cpm";
   return "";
 }
@@ -2410,7 +2881,7 @@ function datasetTypeFromMeta(meta) {
 
 function supportedLocalFamily(family) {
   const fam = String(family || "").trim().toLowerCase();
-  return fam === "v2x-traj" || fam === "v2x-seq" || fam === "cpm-objects";
+  return fam === "v2x-traj" || fam === "v2x-seq" || fam === "ind" || fam === "sind" || fam === "cpm-objects";
 }
 
 function virtualDatasetMeta(datasetId, title, family) {
@@ -2460,10 +2931,39 @@ function virtualDatasetMeta(datasetId, title, family) {
       default_split: "all",
       group_label: "Sensor",
       has_map: false,
+      has_scene_background: false,
       has_traffic_lights: false,
       modalities: ["infra"],
       modality_labels: { infra: "Objects" },
       modality_short_labels: { infra: "Objects" },
+    };
+  }
+  if (fam === "ind") {
+    return {
+      ...base,
+      splits: ["all"],
+      default_split: "all",
+      group_label: "Location",
+      has_map: true,
+      has_scene_background: true,
+      has_traffic_lights: false,
+      modalities: ["infra"],
+      modality_labels: { infra: "Road users" },
+      modality_short_labels: { infra: "Objects" },
+    };
+  }
+  if (fam === "sind") {
+    return {
+      ...base,
+      splits: ["all"],
+      default_split: "all",
+      group_label: "City",
+      has_map: true,
+      has_scene_background: true,
+      has_traffic_lights: true,
+      modalities: ["infra", "traffic_light"],
+      modality_labels: { infra: "Road users", traffic_light: "Traffic lights" },
+      modality_short_labels: { infra: "Objects", traffic_light: "Lights" },
     };
   }
   return {
@@ -2472,6 +2972,7 @@ function virtualDatasetMeta(datasetId, title, family) {
     default_split: "all",
     group_label: "Group",
     has_map: false,
+    has_scene_background: false,
     modalities: ["infra"],
     modality_labels: { infra: "Objects" },
     modality_short_labels: { infra: "Objects" },
@@ -2532,6 +3033,24 @@ function runtimeProfilePreset(datasetType, meta) {
       name: selectedTitle || "Consider.it (CPM Objects)",
     };
   }
+  if (t === "ind") {
+    const datasetId = selectedDatasetId || "ind";
+    const safe = safeFromId || "ind";
+    return {
+      profile_id: `runtime-${safe}`,
+      dataset_id: datasetId,
+      name: selectedTitle || "inD",
+    };
+  }
+  if (t === "sind") {
+    const datasetId = selectedDatasetId || "sind";
+    const safe = safeFromId || "sind";
+    return {
+      profile_id: `runtime-${safe}`,
+      dataset_id: datasetId,
+      name: selectedTitle || "SinD",
+    };
+  }
   const safe = safeFromId || "dataset";
   return {
     profile_id: `runtime-${safe}`,
@@ -2566,7 +3085,7 @@ function isDesktopPickerAvailable(methodName) {
   return !!(api && typeof api[methodName] === "function");
 }
 
-async function pickPathsDesktop(methodName, fallbackPrompt) {
+async function pickPathsDesktop(methodName, fallbackPrompt, defaultPath = "") {
   if (isDesktopPickerAvailable(methodName)) {
     try {
       const raw = await window.pywebview.api[methodName]();
@@ -2582,18 +3101,17 @@ async function pickPathsDesktop(methodName, fallbackPrompt) {
     try {
       const payload = await postJson("/api/system/pick_folder", {
         prompt: String(fallbackPrompt || "Select dataset directory"),
+        default_path: String(defaultPath || "").trim(),
       });
       if (payload && Array.isArray(payload.paths)) {
         return payload.paths.map((x) => String(x || "").trim()).filter(Boolean);
       }
     } catch (_) {
-      // Fall through to manual prompt only if server-side picker is unavailable.
+      // Fall through to explicit error message below.
     }
+    throw new Error("Native folder picker is unavailable. Run the local server on your Mac and open the app from localhost.");
   }
-
-  const raw = window.prompt(fallbackPrompt, "");
-  if (raw == null) return [];
-  return parseConnectPaths(raw);
+  throw new Error("Folder picker method is not supported.");
 }
 
 function folderNameFromPath(pathStr) {
@@ -2649,37 +3167,80 @@ function updateSourcePanel() {
     if (hasFolder) {
       const dsName = String(meta.title || meta.id || "Dataset").trim();
       const folderName = String(src.folderName || folderNameFromPath(src.folderPath) || "dataset").trim();
+      const fullPath = String(src.folderPath || "").trim();
       sourceCardTitle.textContent = `${dsName} · ${folderName}`;
-      sourceCardPath.textContent = String(src.folderPath || "").trim();
+      sourceCardPath.textContent = `Folder: ${folderName}`;
+      sourceCardPath.title = fullPath;
     } else {
       sourceCardTitle.textContent = "Dataset folder";
       sourceCardPath.textContent = "";
+      sourceCardPath.title = "";
     }
   }
 }
 
-function sourceIssueMessage(validation) {
+function expectedDatasetLayoutHint(datasetType) {
+  const t = String(datasetType || "").trim().toLowerCase();
+  if (t === "v2x_traj") return "Expected root folders: ego-trajectories, infrastructure-trajectories, vehicle-trajectories, and optional maps/traffic-light.";
+  if (t === "v2x_seq") return "Expected root folders: cooperative-vehicle-infrastructure, single-infrastructure, and/or single-vehicle.";
+  if (t === "consider_it_cpm") return "Expected root folders: lidar and/or thermal_camera with CPM CSV logs.";
+  if (t === "ind") return "Expected inD root with data/*_tracks.csv, *_tracksMeta.csv, *_recordingMeta.csv and optional maps/lanelets.";
+  if (t === "sind") return "Expected SinD root with city folders, scenario folders, and Veh_smoothed_tracks.csv / Ped_smoothed_tracks.csv files.";
+  return "";
+}
+
+function sourceIssueMessage(validation, datasetType) {
   const errors = Array.isArray(validation && validation.errors) ? validation.errors : [];
   const warnings = Array.isArray(validation && validation.warnings) ? validation.warnings : [];
-  if (errors.length) return String(errors[0].message || "Validation failed.");
-  if (warnings.length) return String(warnings[0].message || "Validation warning.");
-  return "";
+  const first = errors.length ? errors[0] : (warnings.length ? warnings[0] : null);
+  if (!first) return "";
+  const msg = String(first.message || "Validation failed.").trim();
+  const hint = expectedDatasetLayoutHint(datasetType);
+  const code = String(first.code || "");
+  if (hint && (code === "E_SCHEMA_REQUIRED_COLUMNS" || code === "E_ROLE_REQUIRED_MISSING" || code === "E_PATH_MISSING")) {
+    return `${msg} ${hint}`;
+  }
+  return msg;
+}
+
+function isLikelyDirectoryPath(pathStr) {
+  const s = String(pathStr || "").trim();
+  if (!s) return false;
+  if (/[\\\/]$/.test(s)) return true;
+  const low = s.toLowerCase();
+  return !low.endsWith(".csv") && !low.endsWith(".json") && !low.endsWith(".proto") && !low.endsWith(".txt");
 }
 
 async function loadDatasetFromFolder(folderPathIn) {
   const meta = currentDatasetMeta() || {};
   const datasetType = datasetTypeFromMeta(meta);
+  const src = sourceState(datasetType);
   if (!datasetType) {
-    setConnectResult("This dataset family does not support local loading yet.", "bad");
+    src.hint = "This dataset family does not support local loading yet.";
+    src.tone = "bad";
+    persistSourceByType();
+    setConnectResult(src.hint, src.tone);
+    updateSourcePanel();
     return;
   }
   const folderPath = String(folderPathIn || "").trim();
   if (!folderPath) {
-    setConnectResult("No dataset directory selected.", "bad");
+    src.hint = "No dataset directory selected.";
+    src.tone = "bad";
+    persistSourceByType();
+    setConnectResult(src.hint, src.tone);
+    updateSourcePanel();
+    return;
+  }
+  if (!isLikelyDirectoryPath(folderPath)) {
+    src.hint = "Please select a dataset directory (folder), not a file.";
+    src.tone = "bad";
+    persistSourceByType();
+    setConnectResult(src.hint, src.tone);
+    updateSourcePanel();
     return;
   }
 
-  const src = sourceState(datasetType);
   const preset = runtimeProfilePreset(datasetType, meta);
   state.sourceBusy = true;
   src.hint = "Detecting dataset schema...";
@@ -2693,7 +3254,7 @@ async function loadDatasetFromFolder(folderPathIn) {
       paths: [folderPath],
     });
     if (!detected || !detected.profile) {
-      throw new Error("Could not detect dataset profile from selected paths.");
+      throw new Error(`Could not detect dataset profile from selected folder. ${expectedDatasetLayoutHint(datasetType)}`);
     }
     const profile = cloneObj(detected.profile);
     profile.profile_id = preset.profile_id;
@@ -2703,7 +3264,7 @@ async function loadDatasetFromFolder(folderPathIn) {
     const validated = await postJson("/api/profiles/validate", { profile });
     const status = String(((validated && validated.validation) ? validated.validation.status : "") || "");
     if (status !== "ready" && status !== "ready_with_warnings") {
-      const detail = sourceIssueMessage(validated && validated.validation);
+      const detail = sourceIssueMessage(validated && validated.validation, datasetType);
       throw new Error(detail || "Validation failed for selected source paths.");
     }
 
@@ -2719,9 +3280,10 @@ async function loadDatasetFromFolder(folderPathIn) {
     const savedProto = ((((saved || {}).profile || {}).bindings || {}).proto_schema || {}).path;
     src.protoPath = savedProto ? String(savedProto || "").trim() : "";
     src.hint = status === "ready_with_warnings"
-      ? `Loaded with warnings: ${sourceIssueMessage(validated.validation) || "check mapping."}`
+      ? `Loaded with warnings: ${sourceIssueMessage(validated.validation, datasetType) || "check mapping."}`
       : "Dataset source loaded.";
     src.tone = status === "ready_with_warnings" ? "warn" : "ok";
+    persistSourceByType();
 
     await openExplorerForDataset(runtimeDatasetId, { savePrev: false });
     setConnectResult(src.hint, src.tone);
@@ -2729,6 +3291,7 @@ async function loadDatasetFromFolder(folderPathIn) {
     const msg = `Load failed: ${e && e.message ? e.message : String(e)}`;
     src.hint = msg;
     src.tone = "bad";
+    persistSourceByType();
     setConnectResult(msg, "bad");
   } finally {
     state.sourceBusy = false;
@@ -2774,9 +3337,9 @@ function parseIntClamp(raw, fallback, minV, maxV) {
 
 function wizardSelectedDatasetType() {
   const selected = getElValue("wizType");
-  if (selected === "v2x_traj" || selected === "v2x_seq" || selected === "consider_it_cpm") return selected;
+  if (selected === "v2x_traj" || selected === "v2x_seq" || selected === "consider_it_cpm" || selected === "ind" || selected === "sind") return selected;
   const draftType = String(((state.profileWizard.draft || {}).profile || {}).dataset_type || "").trim();
-  if (draftType === "v2x_traj" || draftType === "v2x_seq" || draftType === "consider_it_cpm") return draftType;
+  if (draftType === "v2x_traj" || draftType === "v2x_seq" || draftType === "consider_it_cpm" || draftType === "ind" || draftType === "sind") return draftType;
   return "";
 }
 
@@ -2894,6 +3457,32 @@ function buildProfileFromWizardInputs() {
     setBindingPath(bindings, "maps_dir", getElValue("wizV2xMaps"), false, "dir");
     delete bindings.scenes_index;
     delete bindings.traj_ego;
+    delete bindings.cpm_logs;
+    delete bindings.proto_schema;
+  }
+
+  if (datasetType === "ind") {
+    const prevScene = profile.scene_strategy && typeof profile.scene_strategy === "object" ? profile.scene_strategy : {};
+    const windowS = Number.isFinite(Number(prevScene.window_s)) ? Number(prevScene.window_s) : 60;
+    profile.scene_strategy = { mode: "recording_window", window_s: Math.max(10, Math.min(600, windowS)) };
+    delete bindings.scenes_index;
+    delete bindings.traj_ego;
+    delete bindings.traj_cooperative;
+    delete bindings.traj_infra;
+    delete bindings.traj_vehicle;
+    delete bindings.traffic_light;
+    delete bindings.cpm_logs;
+    delete bindings.proto_schema;
+  }
+
+  if (datasetType === "sind") {
+    profile.scene_strategy = { mode: "scenario_scene" };
+    delete bindings.scenes_index;
+    delete bindings.traj_ego;
+    delete bindings.traj_cooperative;
+    delete bindings.traj_infra;
+    delete bindings.traj_vehicle;
+    delete bindings.traffic_light;
     delete bindings.cpm_logs;
     delete bindings.proto_schema;
   }
@@ -3375,6 +3964,17 @@ function renderHomeDatasetCards() {
     if (!ds || !ds.id) continue;
     const id = String(ds.id);
     if (seen.has(id)) continue;
+    const fam = String(ds.family || "").trim().toLowerCase();
+    const isProfileAlias = id.startsWith("profile-");
+    if (isProfileAlias && fam) {
+      const hasCatalogFamily = items.some((it) => {
+        const app = (it && typeof it.app === "object") ? it.app : {};
+        return String(app.family || "").trim().toLowerCase() === fam;
+      });
+      if (hasCatalogFamily) {
+        continue;
+      }
+    }
     seen.add(id);
     items.push({
       id,
@@ -3685,7 +4285,7 @@ function clearExplorerSceneState(message) {
   state.selected = null;
   state.view = null;
   state.mapPaths = null;
-  resetTrailCache();
+  resetPathCache();
   updateSubTypeUi(null);
 
   const interSel = $("intersectSelect");
@@ -3732,6 +4332,8 @@ function clearExplorerSceneState(message) {
   updateSceneHint(0, 0, 0);
   updateSplitAvailabilityHint(null);
   setPlaybackEnabled(false);
+  syncSceneBackgroundUi(null);
+  syncMapSourceUi(null);
   updateSceneModalityControls(null);
   updateStatusBox(msg);
   const si = $("sceneInfo");
@@ -3752,6 +4354,15 @@ function clearExplorerSceneState(message) {
 function sourcePromptText(datasetType, title) {
   const name = String(title || "dataset");
   if (datasetType === "v2x_traj") {
+    return `Select the ${name} dataset directory to start scene loading.`;
+  }
+  if (datasetType === "v2x_seq") {
+    return `Select the ${name} dataset directory to start scene loading.`;
+  }
+  if (datasetType === "ind") {
+    return `Select the ${name} dataset directory to start scene loading.`;
+  }
+  if (datasetType === "sind") {
     return `Select the ${name} dataset directory to start scene loading.`;
   }
   if (datasetType === "consider_it_cpm") {
@@ -3776,6 +4387,7 @@ async function openExplorerForDataset(datasetId, { savePrev = true, loadData = t
   applyDatasetUi();
   restoreDatasetSettings(next);
   syncControlsFromState();
+  syncMapSourceUi(null);
   updateSourcePanel();
 
   if (!loadData) {
@@ -3898,6 +4510,8 @@ async function loadSceneBundle() {
   const scene = state.sceneId;
   if (!ds || !split || !scene) {
     state.sceneModalities = null;
+    syncSceneBackgroundUi(null);
+    syncMapSourceUi(null);
     updateSceneModalityControls(null);
     setCanvasLoading(false);
     return;
@@ -3926,8 +4540,10 @@ async function loadSceneBundle() {
     state.frame = 0;
     state.selectedKey = null;
     state.selected = null;
+    syncSceneBackgroundUi(bundle);
+    syncMapSourceUi(bundle);
     updateSceneModalityControls(bundle);
-    resetTrailCache();
+    resetPathCache();
     updateSubTypeUi(bundle);
 
     // Reflect server-applied map settings (in case values were clamped/defaulted).
@@ -3978,6 +4594,8 @@ async function loadSceneBundle() {
       const msg = `Failed to load scene: ${e && e.message ? e.message : String(e)}`;
       updateStatusBox(msg);
       $("sceneInfo").textContent = msg;
+      syncSceneBackgroundUi(null);
+      syncMapSourceUi(null);
     }
     throw e;
   } finally {
@@ -4032,21 +4650,42 @@ function wireUi() {
   if (sourceFolderBtn) {
     sourceFolderBtn.addEventListener("click", async () => {
       if (state.sourceBusy) return;
-      const meta = currentDatasetMeta() || {};
-      const datasetType = datasetTypeFromMeta(meta);
-      if (!datasetType) {
-        setConnectResult("This dataset is not supported for local loading.", "bad");
+      try {
+        const meta = currentDatasetMeta() || {};
+        const datasetType = datasetTypeFromMeta(meta);
+        if (!datasetType) {
+          const src = sourceState(datasetType);
+          src.hint = "This dataset is not supported for local loading.";
+          src.tone = "bad";
+          persistSourceByType();
+          setConnectResult("This dataset is not supported for local loading.", "bad");
+          updateSourcePanel();
+          return;
+        }
+        const prompt = datasetType === "v2x_traj"
+          ? "Select the V2X-Traj dataset directory"
+          : datasetType === "v2x_seq"
+            ? "Select the V2X-Seq dataset directory"
+            : datasetType === "ind"
+              ? "Select the inD dataset directory"
+              : datasetType === "sind"
+                ? "Select the SinD dataset directory"
+                : "Select the Consider.it dataset directory";
+        const src = sourceState(datasetType);
+        const paths = await pickPathsDesktop("pick_folder", prompt, src.folderPath || "");
+        if (!paths.length) return;
+        await loadDatasetFromFolder(paths[0]);
+      } catch (e) {
+        const msg = `Folder picker failed: ${e && e.message ? e.message : String(e)}`;
+        const meta = currentDatasetMeta() || {};
+        const datasetType = datasetTypeFromMeta(meta);
+        const src = sourceState(datasetType);
+        src.hint = msg;
+        src.tone = "bad";
+        persistSourceByType();
+        setConnectResult(msg, "bad");
         updateSourcePanel();
-        return;
       }
-      const prompt = datasetType === "v2x_traj"
-        ? "Enter a V2X-Traj dataset directory path:"
-        : datasetType === "v2x_seq"
-          ? "Enter a V2X-Seq dataset directory path:"
-          : "Enter a Consider.it dataset directory path:";
-      const paths = await pickPathsDesktop("pick_folder", prompt);
-      if (!paths.length) return;
-      await loadDatasetFromFolder(paths[0]);
     });
   }
 
@@ -4236,6 +4875,13 @@ function wireUi() {
     await loadSceneBundle();
   });
 
+  const mapSourceSel = $("mapSourceSelect");
+  if (mapSourceSel) {
+    mapSourceSel.addEventListener("change", (e) => {
+      applyMapSourceSelection(String(e.target.value || "lanelet2"));
+    });
+  }
+
   $("showVelocity").addEventListener("change", (e) => {
     state.showVelocity = !!e.target.checked;
     render();
@@ -4247,7 +4893,9 @@ function wireUi() {
   });
 
   const bindCheck = (id, onChange) => {
-    $(id).addEventListener("change", (e) => {
+    const el = $(id);
+    if (!el) return;
+    el.addEventListener("change", (e) => {
       onChange(!!e.target.checked);
       render();
     });
@@ -4285,14 +4933,58 @@ function wireUi() {
   if (allBtn) allBtn.addEventListener("click", () => setAllSubTypes(true));
   const noneBtn = $("subTypeNoneBtn");
   if (noneBtn) noneBtn.addEventListener("click", () => setAllSubTypes(false));
+  const copyMetaBtn = $("copySceneMetaBtn");
+  if (copyMetaBtn) {
+    copyMetaBtn.addEventListener("click", async () => {
+      const raw = $("sceneInfo");
+      if (!raw) return;
+      const text = String(raw.textContent || "");
+      if (!text) return;
+      let ok = false;
+      try {
+        await navigator.clipboard.writeText(text);
+        ok = true;
+      } catch (_) {
+        ok = false;
+      }
+      const prev = String(copyMetaBtn.textContent || "Copy raw metadata");
+      copyMetaBtn.textContent = ok ? "Copied" : "Copy failed";
+      setTimeout(() => {
+        copyMetaBtn.textContent = prev;
+      }, 1100);
+    });
+  }
 
-  bindCheck("showTrail", (v) => (state.showTrail = v));
-  bindCheck("trailAll", (v) => (state.trailAll = v));
-  bindCheck("trailFull", (v) => (state.trailFull = v));
+  const bindTrajectoryRange = (id, value) => {
+    const el = $(id);
+    if (!el) return;
+    el.addEventListener("change", (e) => {
+      if (!e.target.checked) return;
+      state.trajectoryRange = value;
+      render();
+    });
+  };
+  bindTrajectoryRange("trajectoryRangePast", "past");
+  bindTrajectoryRange("trajectoryRangeFull", "full");
   bindCheck("holdTL", (v) => (state.holdTL = v));
+  bindCheck("showMap", (v) => {
+    state.showMap = v;
+    if (supportsMapSourceSelector(currentDatasetMeta())) {
+      state.mapSource = v ? "lanelet2" : (state.sceneBgEnabled ? "orthophoto" : "none");
+      syncMapSourceUi(state.bundle);
+    }
+  });
+  bindCheck("showSceneBg", (v) => {
+    state.sceneBgEnabled = v;
+    if (supportsMapSourceSelector(currentDatasetMeta())) {
+      state.mapSource = v ? "orthophoto" : (state.showMap ? "lanelet2" : "none");
+      syncMapSourceUi(state.bundle);
+    }
+  });
   bindCheck("showBasemap", (v) => {
     state.basemapEnabled = v;
     if (!v) state.basemapZoom = null;
+    syncMapSourceUi(state.bundle);
   });
   bindCheck("debugOverlay", (v) => (state.debugOverlay = v));
   bindCheck("sceneBox", (v) => (state.sceneBox = v));
@@ -4366,14 +5058,14 @@ function wireUi() {
 	      if (!picked) {
 	        state.selectedKey = null;
 	        state.selected = null;
-	        resetTrailCache();
+	        resetPathCache();
 	        updateSceneInfo();
 	        render();
 	        return;
 	      }
 	      state.selectedKey = { modality: picked.modality, id: picked.rec.id };
 	      state.selected = { modality: picked.modality, ...picked.rec };
-	      resetTrailCache();
+	      resetPathCache();
 	      updateSceneInfo();
 	      render();
 	    }
@@ -4692,6 +5384,7 @@ function wireHomeUi() {
 
 async function main() {
   loadPersistedDatasetSettings();
+  loadPersistedSourceByType();
   wireUi();
   wireHomeUi();
   setView("home");
