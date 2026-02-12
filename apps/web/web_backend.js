@@ -935,26 +935,50 @@ const WebBackend = {
       return low === "lidar" || low === "thermal_camera";
     }).map((x) => String(x).toLowerCase()));
     const preferTopOnly = wantedTop.size > 0;
+    const topLikelyRoots = new Set(topDirNames.filter((n) => {
+      const low = String(n || "").toLowerCase();
+      return low.includes("consider") || low.includes("cpm");
+    }).map((x) => String(x).toLowerCase()));
 
     const out = [];
-    const walk = async (dirHandle, relPrefix, depth) => {
+    const isLikelyCpmPath = (rel) => {
+      const parts = String(rel || "").toLowerCase().split("/").filter(Boolean);
+      if (!parts.length) return false;
+      if (parts.includes("lidar") || parts.includes("thermal_camera")) return true;
+      for (const p of parts) {
+        if (p.includes("consider") || p.includes("cpm")) return true;
+      }
+      return false;
+    };
+
+    const shouldIncludeCsv = (rel) => {
+      if (preferTopOnly) return true;
+      const low = String(rel || "").toLowerCase();
+      if (isLikelyCpmPath(low)) return true;
+      const base = low.split("/").pop() || "";
+      return base.includes("cpm");
+    };
+
+    const walk = async (dirHandle, relPrefix, depth, underLikelyRoot = false) => {
       for await (const entry of dirHandle.values()) {
         if (!entry || !entry.name) continue;
         const name = String(entry.name);
         const rel = relPrefix ? `${relPrefix}/${name}` : name;
+        const lowRel = String(rel || "").toLowerCase();
         if (entry.kind === "directory") {
           if (depth === 0 && preferTopOnly && !wantedTop.has(name.toLowerCase())) {
             continue;
           }
-          await walk(entry, rel, depth + 1);
+          const nextLikely = underLikelyRoot || isLikelyCpmPath(lowRel) || (depth === 0 && topLikelyRoots.has(String(name || "").toLowerCase()));
+          await walk(entry, rel, depth + 1, nextLikely);
           continue;
         }
         if (entry.kind === "file" && name.toLowerCase().endsWith(".csv")) {
-          out.push(rel);
+          if (underLikelyRoot || shouldIncludeCsv(rel)) out.push(rel);
         }
       }
     };
-    await walk(root, "", 0);
+    await walk(root, "", 0, false);
     out.sort((a, b) => a.localeCompare(b));
     return out;
   },
@@ -1008,12 +1032,11 @@ const WebBackend = {
         }
         tsIdx = Number(idxByCanonical.generationTime_ms);
         rsuIdx = Number(idxByCanonical.rsu);
+        const hasRequired = tsIdx >= 0 && idxByCanonical.xDistance_m >= 0 && idxByCanonical.yDistance_m >= 0;
+        if (!hasRequired) {
+          return [];
+        }
         headerDone = true;
-        lineNo += 1;
-        continue;
-      }
-
-      if (tsIdx < 0 || idxByCanonical.xDistance_m < 0 || idxByCanonical.yDistance_m < 0) {
         lineNo += 1;
         continue;
       }
