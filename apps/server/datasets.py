@@ -2768,18 +2768,29 @@ class SinDAdapter:
             return "OTHER", c.upper()
         return "UNKNOWN", None
 
+    @staticmethod
+    def _q3(v: Optional[float]) -> Optional[float]:
+        # Keep transport payload compact while preserving sub-centimeter precision.
+        if v is None:
+            return None
+        try:
+            return round(float(v), 3)
+        except Exception:
+            return None
+
     def _read_tracks_csv(
         self,
         path: Path,
         source_tag: str,
-    ) -> Tuple[Dict[int, List[Dict[str, Any]]], Dict[str, float], int, set[str]]:
+    ) -> Tuple[Dict[int, List[Dict[str, Any]]], Dict[str, float], int, set[str], Counter]:
         by_ts: Dict[int, List[Dict[str, Any]]] = defaultdict(list)
         extent = bbox_init()
         rows = 0
         unique_ids: set[str] = set()
+        sub_type_counts: Counter = Counter()
 
         if not path.exists() or not path.is_file():
-            return {}, extent, 0, unique_ids
+            return {}, extent, 0, unique_ids, sub_type_counts
 
         with path.open("r", encoding="utf-8", errors="replace", newline="") as f:
             r = csv.DictReader(f)
@@ -2810,30 +2821,30 @@ class SinDAdapter:
                 theta = safe_float(row.get("heading_rad"))
                 if theta is None:
                     theta = safe_float(row.get("yaw_rad"))
-
-                rec = {
+                # Emit only fields used by the frontend renderer/filters.
+                rec: Dict[str, Any] = {
                     "id": obj_id,
-                    "track_id": track_id,
-                    "object_id": track_id,
                     "type": obj_type,
                     "sub_type": sub_type,
-                    "sub_type_code": None,
-                    "tag": source_tag,
-                    "x": x,
-                    "y": y,
-                    "z": None,
-                    "length": safe_float(row.get("length")),
-                    "width": safe_float(row.get("width")),
-                    "height": None,
-                    "theta": theta,
-                    "v_x": safe_float(row.get("vx")),
-                    "v_y": safe_float(row.get("vy")),
+                    "x": self._q3(x),
+                    "y": self._q3(y),
                 }
+                for k, val in (
+                    ("length", safe_float(row.get("length"))),
+                    ("width", safe_float(row.get("width"))),
+                    ("theta", theta),
+                    ("v_x", safe_float(row.get("vx"))),
+                    ("v_y", safe_float(row.get("vy"))),
+                ):
+                    q = self._q3(val)
+                    if q is not None:
+                        rec[k] = q
                 by_ts[ts_key].append(rec)
                 unique_ids.add(obj_id)
+                sub_type_counts[str(sub_type or "UNKNOWN")] += 1
                 rows += 1
 
-        return by_ts, extent, rows, unique_ids
+        return by_ts, extent, rows, unique_ids, sub_type_counts
 
     @staticmethod
     def _normalize_col_name(raw: str) -> str:
@@ -2930,16 +2941,9 @@ class SinDAdapter:
                     bbox_update(extent, x, y)
                     rec = {
                         "id": f"{i+1}:{col}",
-                        "x": x,
-                        "y": y,
-                        "direction": None,
-                        "lane_id": col,
+                        "x": self._q3(x),
+                        "y": self._q3(y),
                         "color_1": color,
-                        "remain_1": None,
-                        "color_2": None,
-                        "remain_2": None,
-                        "color_3": None,
-                        "remain_3": None,
                     }
                     by_ts[ts_key].append(rec)
                     rows += 1
@@ -3342,17 +3346,19 @@ class SinDAdapter:
         extent = bbox_init()
         rows_infra = 0
         unique_agents: set[str] = set()
+        sub_type_counts: Counter = Counter()
 
         for src_tag, path in (("veh", ref.veh_path), ("ped", ref.ped_path)):
             if path is None:
                 continue
-            by_ts, ext, rows, ids = self._read_tracks_csv(path, source_tag=src_tag)
+            by_ts, ext, rows, ids, st_counts = self._read_tracks_csv(path, source_tag=src_tag)
             for k, arr in by_ts.items():
                 infra_by_ts[k].extend(arr)
             if bbox_is_valid(ext):
                 bbox_update_from_bbox(extent, ext)
             rows_infra += int(rows)
             unique_agents.update(ids)
+            sub_type_counts.update(st_counts)
 
         parsed_map: Optional[Dict[str, Any]] = None
         map_out: Optional[Dict[str, Any]] = None
@@ -3422,6 +3428,7 @@ class SinDAdapter:
                 "min_ts": min((self._ts_from_key(k) for k in infra_by_ts.keys()), default=None),
                 "max_ts": max((self._ts_from_key(k) for k in infra_by_ts.keys()), default=None),
                 "unique_agents": int(len(unique_agents)),
+                "sub_type_counts": dict(sub_type_counts),
             },
             "traffic_light": {
                 "rows": int(tl_rows),

@@ -47,10 +47,124 @@ _update_cache_key = ""
 _update_cache_ts = 0.0
 _update_cache_payload: dict[str, object] | None = None
 _SEMVER_RE = re.compile(r"^v?(\d+)\.(\d+)\.(\d+)(?:[-+].*)?$")
+_PRETTY_JSON = str(os.environ.get("TRAJ_PRETTY_JSON") or "").strip().lower() in ("1", "true", "yes", "on")
+_COMPACT_BUNDLE = str(os.environ.get("TRAJ_COMPACT_BUNDLE", "1") or "").strip().lower() in ("1", "true", "yes", "on")
 
 
 def json_bytes(obj: object) -> bytes:
-    return (json.dumps(obj, ensure_ascii=True, indent=2) + "\n").encode("utf-8")
+    if _PRETTY_JSON:
+        return (json.dumps(obj, ensure_ascii=True, indent=2) + "\n").encode("utf-8")
+    return json.dumps(obj, ensure_ascii=True, separators=(",", ":")).encode("utf-8")
+
+
+def _q3_number(raw: object) -> float | None:
+    if raw is None:
+        return None
+    try:
+        v = float(raw)
+    except Exception:
+        return None
+    if v != v or v in (float("inf"), float("-inf")):
+        return None
+    return round(v, 3)
+
+
+def _compact_agent_rec(rec: dict[str, object]) -> dict[str, object] | None:
+    out: dict[str, object] = {}
+    for key in ("id", "type", "sub_type"):
+        val = rec.get(key)
+        if val is not None and str(val) != "":
+            out[key] = val
+    for key in ("x", "y", "theta", "length", "width", "v_x", "v_y"):
+        q = _q3_number(rec.get(key))
+        if q is not None:
+            out[key] = q
+    return out if out else None
+
+
+def _compact_tl_rec(rec: dict[str, object]) -> dict[str, object] | None:
+    out: dict[str, object] = {}
+    rid = rec.get("id")
+    if rid is not None and str(rid) != "":
+        out["id"] = rid
+    for key in ("x", "y"):
+        q = _q3_number(rec.get(key))
+        if q is not None:
+            out[key] = q
+    color = rec.get("color_1")
+    if color is not None and str(color) != "":
+        out["color_1"] = str(color)
+    return out if out else None
+
+
+_AGENT_COMPACT_KEYS = frozenset({"id", "type", "sub_type", "x", "y", "theta", "length", "width", "v_x", "v_y"})
+_TL_COMPACT_KEYS = frozenset({"id", "x", "y", "color_1"})
+
+
+def _records_already_compact(arr: list[object], traffic_light: bool) -> bool:
+    allowed = _TL_COMPACT_KEYS if traffic_light else _AGENT_COMPACT_KEYS
+    for rec in arr:
+        if not isinstance(rec, dict):
+            continue
+        return set(rec.keys()).issubset(allowed)
+    return True
+
+
+def compact_bundle_payload(bundle: object) -> object:
+    """
+    Trim per-frame records to fields used by the frontend renderer/filtering code.
+    This reduces JSON size and parse cost for large scenes across all dataset families.
+    """
+    if not isinstance(bundle, dict):
+        return bundle
+    frames = bundle.get("frames")
+    if not isinstance(frames, list):
+        return bundle
+
+    out = dict(bundle)
+    changed = False
+    compact_frames: list[object] = []
+    for frame in frames:
+        if not isinstance(frame, dict):
+            compact_frames.append(frame)
+            continue
+        compact_frame: dict[str, object] = {}
+        frame_changed = False
+        for modality, arr in frame.items():
+            if not isinstance(arr, list):
+                compact_frame[str(modality)] = arr
+                continue
+            is_tl = str(modality) == "traffic_light"
+            # Fast path for adapters that already emit compact records (e.g., SinD).
+            if _records_already_compact(arr, traffic_light=is_tl):
+                compact_frame[str(modality)] = arr
+                continue
+            frame_changed = True
+            compact_arr: list[dict[str, object]] = []
+            if is_tl:
+                for rec in arr:
+                    if not isinstance(rec, dict):
+                        continue
+                    cr = _compact_tl_rec(rec)
+                    if cr is not None:
+                        compact_arr.append(cr)
+            else:
+                for rec in arr:
+                    if not isinstance(rec, dict):
+                        continue
+                    cr = _compact_agent_rec(rec)
+                    if cr is not None:
+                        compact_arr.append(cr)
+            compact_frame[str(modality)] = compact_arr
+        if frame_changed:
+            changed = True
+            compact_frames.append(compact_frame)
+        else:
+            compact_frames.append(frame)
+    if not changed:
+        return bundle
+    out["frames"] = compact_frames
+    return out
 
 
 def clamp_int(s: str, default: int, min_v: int, max_v: int) -> int:
@@ -671,6 +785,8 @@ class AppHandler(BaseHTTPRequestHandler):
                     max_lanes=max_lanes,
                     map_clip=map_clip,
                 )
+                if _COMPACT_BUNDLE:
+                    bundle = compact_bundle_payload(bundle)
                 self._send_json(200, bundle)
                 return
 

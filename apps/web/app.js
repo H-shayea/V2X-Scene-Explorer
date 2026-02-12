@@ -2,15 +2,30 @@
 
 const $ = (id) => document.getElementById(id);
 
-// Simple heuristic: if not running on the Python backend port (8000/5001) and no pywebview, assume web/static mode.
-const IS_WEB_MODE = !window.pywebview && (location.port !== '8000' && location.port !== '5001');
-if (IS_WEB_MODE) {
-  console.log("Running in Web Mode (Static/GitHub Pages)");
-  document.body.classList.add("is-web-mode");
+function hasDesktopBridge() {
+  const api = window.pywebview && window.pywebview.api ? window.pywebview.api : null;
+  if (!api) return false;
+  if (typeof api.is_desktop === "function") return true;
+  if (typeof api.pick_folder === "function") return true;
+  return false;
 }
 
+function isWebMode() {
+  return !hasDesktopBridge();
+}
+
+function syncRuntimeModeCss() {
+  const web = isWebMode();
+  if (document.body) {
+    document.body.classList.toggle("is-web-mode", web);
+  }
+  if (web) console.log("Running in Web Mode (Static/GitHub Pages)");
+}
+syncRuntimeModeCss();
+window.addEventListener("pywebviewready", syncRuntimeModeCss);
+
 async function fetchJson(url) {
-  if (IS_WEB_MODE && window.WebBackend && window.WebBackend.fetchJson) {
+  if (isWebMode() && window.WebBackend && window.WebBackend.fetchJson) {
     return window.WebBackend.fetchJson(url);
   }
   const res = await fetch(url);
@@ -22,7 +37,7 @@ async function fetchJson(url) {
 }
 
 async function postJson(url, payload) {
-  if (IS_WEB_MODE && window.WebBackend && window.WebBackend.postJson) {
+  if (isWebMode() && window.WebBackend && window.WebBackend.postJson) {
     return window.WebBackend.postJson(url, payload);
   }
   const res = await fetch(url, {
@@ -256,7 +271,7 @@ function currentBasemapConfig() {
   if (!Number.isFinite(lat) || !Number.isFinite(lon)) return null;
   return {
     provider,
-    tileUrl: tileUrl || (IS_WEB_MODE ? "https://tile.openstreetmap.org/{z}/{x}/{y}.png" : "/api/tiles/osm/{z}/{x}/{y}.png"),
+    tileUrl: tileUrl || (isWebMode() ? "https://tile.openstreetmap.org/{z}/{x}/{y}.png" : "/api/tiles/osm/{z}/{x}/{y}.png"),
     origin: { lat, lon },
   };
 }
@@ -1905,6 +1920,15 @@ function shouldDrawRec(modality, rec) {
 function computeSubTypeCounts(bundle) {
   const counts = new Map();
   if (!bundle || !bundle.frames) return counts;
+  // Fast path: backend may provide pre-aggregated subtype counts.
+  const pre = (((bundle.modality_stats || {}).infra || {}).sub_type_counts);
+  if (pre && typeof pre === "object" && !Array.isArray(pre)) {
+    for (const [k, v] of Object.entries(pre)) {
+      const n = Number(v || 0);
+      if (Number.isFinite(n) && n > 0) counts.set(String(k || "UNKNOWN"), n);
+    }
+    if (counts.size > 0) return counts;
+  }
   for (const fr of bundle.frames) {
     if (!fr) continue;
     for (const modality of agentModalitiesOrdered()) {
@@ -3355,7 +3379,7 @@ function isDesktopPickerAvailable(methodName) {
 }
 
 async function pickPathsDesktop(methodName, fallbackPrompt, defaultPath = "") {
-  if (IS_WEB_MODE && window.WebFS && methodName === 'pick_folder') {
+  if (isWebMode() && window.WebFS && methodName === 'pick_folder') {
     if (window.WebFS.isSupported && !window.WebFS.isSupported()) {
       alert("Your browser does not support the File System Access API (needed for local file access). Please use Chrome, Edge, or Opera.");
       return [];
@@ -4525,7 +4549,7 @@ function renderHomeDatasetCards() {
   if (!html) {
     const hasAnyDatasets = items.length > 0;
     if (!hasAnyDatasets) {
-      if (IS_WEB_MODE) {
+      if (isWebMode()) {
         wrap.innerHTML = `<div class="dsEmpty">No datasets loaded yet.<br>Click "Load dataset directory..." to open a local V2X-Traj folder.</div>`;
       } else {
         wrap.innerHTML = `<div class="dsEmpty">No datasets are available right now. Try reloading the app.</div>`;
@@ -5331,6 +5355,30 @@ function wireUi() {
     render();
   };
 
+  const readBgAlignInputs = () => {
+    const out = {
+      enabled: !!($("bgAlignEnabled") && $("bgAlignEnabled").checked),
+      flipY: !!($("bgAlignFlipY") && $("bgAlignFlipY").checked),
+      tx: Number($("bgAlignTx") && $("bgAlignTx").value),
+      ty: Number($("bgAlignTy") && $("bgAlignTy").value),
+      sx: Number($("bgAlignSx") && $("bgAlignSx").value),
+      sy: Number($("bgAlignSy") && $("bgAlignSy").value),
+      rotationDeg: Number($("bgAlignRot") && $("bgAlignRot").value),
+      alpha: Number($("bgAlignAlpha") && $("bgAlignAlpha").value),
+    };
+    if (!Number.isFinite(out.tx)) out.tx = 0;
+    if (!Number.isFinite(out.ty)) out.ty = 0;
+    if (!Number.isFinite(out.sx)) out.sx = 1;
+    if (!Number.isFinite(out.sy)) out.sy = 1;
+    if (!Number.isFinite(out.rotationDeg)) out.rotationDeg = 0;
+    if (!Number.isFinite(out.alpha)) out.alpha = 0.92;
+    out.sx = clamp(out.sx, 0.05, 10);
+    out.sy = clamp(out.sy, 0.05, 10);
+    out.rotationDeg = clamp(out.rotationDeg, -180, 180);
+    out.alpha = clamp(out.alpha, 0.2, 1.0);
+    return out;
+  };
+
   const bindBgAlignNumber = (id, key, { min = null, max = null } = {}) => {
     const el = $(id);
     if (!el) return;
@@ -5380,24 +5428,16 @@ function wireUi() {
       render();
     });
   }
-  const copyAlignBtn = $("bgAlignCopyBtn");
-  if (copyAlignBtn) {
-    copyAlignBtn.addEventListener("click", async () => {
+  const saveAlignBtn = $("bgAlignSaveBtn");
+  if (saveAlignBtn) {
+    saveAlignBtn.addEventListener("click", () => {
       if (!isSindDataset() || !state.bundle) return;
-      const city = String(state.bundle.city || state.bundle.intersect_id || "city");
-      const payload = { city, ...getSindBgAlign(state.bundle) };
-      const text = JSON.stringify(payload, null, 2);
-      let ok = false;
-      try {
-        await navigator.clipboard.writeText(text);
-        ok = true;
-      } catch (_) {
-        ok = false;
-      }
-      const prev = String(copyAlignBtn.textContent || "Copy values");
-      copyAlignBtn.textContent = ok ? "Copied" : "Copy failed";
+      // Explicitly save whatever is currently in the inputs (even before blur/change fires).
+      commitBgAlign(readBgAlignInputs());
+      const prev = String(saveAlignBtn.textContent || "Save");
+      saveAlignBtn.textContent = "Saved";
       setTimeout(() => {
-        copyAlignBtn.textContent = prev;
+        saveAlignBtn.textContent = prev;
       }, 1000);
     });
   }

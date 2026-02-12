@@ -1402,7 +1402,30 @@ select:focus {
 }
 
 .bgAlignActions {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+  align-items: center;
   margin-bottom: 0;
+}
+
+.bgAlignActions .btn {
+  width: 100%;
+  min-height: 34px;
+  height: auto;
+  padding: 6px 10px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  white-space: nowrap;
+  text-align: center;
+  line-height: 1.1;
+}
+
+.bgAlignHint {
+  margin-top: 0;
+  text-align: left;
+  line-height: 1.35;
 }
 
 .advancedMetaFold {
