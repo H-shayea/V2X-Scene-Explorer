@@ -374,6 +374,26 @@ const WebBackend = {
     localStorage.setItem(this.LS_PROFILES, JSON.stringify(list));
   },
 
+  normalizeDatasetType(raw) {
+    const s = String(raw || '').trim().toLowerCase();
+    if (s === 'v2x-traj' || s === 'v2x_traj' || s === 'v2xtraj') return 'v2x_traj';
+    if (s === 'v2x-seq' || s === 'v2x_seq' || s === 'v2xseq') return 'v2x_seq';
+    if (s === 'ind' || s === 'in-d' || s === 'ind_dataset') return 'ind';
+    if (s === 'sind' || s === 'sin-d' || s === 'sin_d' || s === 'sind_dataset') return 'sind';
+    if (s === 'consider-it-cpm' || s === 'consider_it_cpm' || s === 'cpm' || s === 'cpm-objects' || s === 'considerit') return 'consider_it_cpm';
+    return '';
+  },
+
+  datasetFamilyFromType(raw) {
+    const t = this.normalizeDatasetType(raw);
+    if (t === 'v2x_traj') return 'v2x-traj';
+    if (t === 'v2x_seq') return 'v2x-seq';
+    if (t === 'ind') return 'ind';
+    if (t === 'sind') return 'sind';
+    if (t === 'consider_it_cpm') return 'cpm-objects';
+    return '';
+  },
+
   async fetchJson(url) {
     if (url.endsWith('/api/app_meta')) {
       return { app_name: "V2X Scene Explorer (Web)", app_version: "0.2.0-web", desktop: false, update_repo: null };
@@ -407,15 +427,18 @@ const WebBackend = {
     if (!WebFS.rootHandle) throw new Error("No folder selected");
     const rootName = WebFS.rootHandle.name;
 
-    // Basic detection logic
-    const files = await WebFS.listDir(rootName);
-    let type = 'v2x_traj';
-    if (files.some(f => f.includes('recordingMeta'))) type = 'ind';
+    let type = this.normalizeDatasetType(payload && payload.dataset_type);
+    if (!type) {
+      // Basic detection logic when no dataset type was requested.
+      const files = await WebFS.listDir(rootName);
+      type = files.some(f => f.includes('recordingMeta')) ? 'ind' : 'v2x_traj';
+    }
 
     const profile = {
       profile_id: 'web-' + Date.now(),
       dataset_id: 'ds-' + Date.now(),
       name: rootName,
+      dataset_type: type,
       type: type,
       source_path: rootName,
       bindings: {}
@@ -426,18 +449,19 @@ const WebBackend = {
   async handleSaveProfile(payload) {
     const { profile } = payload;
     const profiles = this.getProfiles();
-    const datasets = this.getDatasets(); // this includes static
 
     const existingIdx = profiles.findIndex(p => p.profile_id === profile.profile_id);
     if (existingIdx >= 0) profiles[existingIdx] = profile;
     else profiles.push(profile);
+
+    const family = this.datasetFamilyFromType(profile.dataset_type || profile.type);
 
     // Save logic generally only touches local datasets. 
     // We constructs a new entry for the *new* dataset ID.
     const dsEntry = {
       id: profile.dataset_id,
       title: profile.name,
-      family: profile.type || 'v2x_traj',
+      family: family || 'v2x-traj',
       root: profile.source_path
     };
 

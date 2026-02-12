@@ -2948,8 +2948,21 @@ async function loadDatasets() {
   if (sel) sel.innerHTML = "";
   state.datasetsById = {};
   const supportedIds = [];
-  for (const ds of data.datasets || []) {
-    if (!ds || !ds.id) continue;
+  for (const raw of data.datasets || []) {
+    if (!raw || !raw.id) continue;
+    const id = String(raw.id || "").trim();
+    if (!id) continue;
+    const appSpec = (raw.app && typeof raw.app === "object") ? raw.app : {};
+    const family = String(raw.family || appSpec.family || "").trim().toLowerCase();
+    const supported = (typeof raw.supported === "boolean")
+      ? raw.supported
+      : ((typeof appSpec.supported === "boolean") ? appSpec.supported : true);
+    const ds = {
+      ...raw,
+      id,
+      family: family || String(raw.family || "").trim().toLowerCase(),
+      supported,
+    };
     // Only surface datasets that the backend can actually serve (adapter exists).
     if (ds.supported === false) continue;
     state.datasetsById[ds.id] = ds;
@@ -2975,19 +2988,52 @@ async function loadDatasets() {
 }
 
 async function loadCatalog() {
+  function staticCatalogFallback() {
+    try {
+      const raw = (window.WebBackend && Array.isArray(window.WebBackend.STATIC_CATALOG))
+        ? window.WebBackend.STATIC_CATALOG
+        : [];
+      return Array.isArray(raw) ? raw.filter((it) => it && it.id) : [];
+    } catch (_) {
+      return [];
+    }
+  }
+
+  function mergeCatalogItems(primary, fallback) {
+    const out = [];
+    const seen = new Set();
+    for (const it of primary || []) {
+      if (!it || !it.id) continue;
+      const id = String(it.id);
+      if (seen.has(id)) continue;
+      seen.add(id);
+      out.push(it);
+    }
+    for (const it of fallback || []) {
+      if (!it || !it.id) continue;
+      const id = String(it.id);
+      if (seen.has(id)) continue;
+      seen.add(id);
+      out.push(it);
+    }
+    return out;
+  }
+
   state.catalogById = {};
   state.catalogDatasets = [];
+  let apiItems = [];
   try {
     const data = await fetchJson("/api/catalog");
-    const items = Array.isArray(data.datasets) ? data.datasets : [];
-    state.catalogDatasets = items;
-    for (const it of items) {
-      if (it && it.id) state.catalogById[String(it.id)] = it;
-    }
+    apiItems = Array.isArray(data.datasets) ? data.datasets : [];
   } catch (e) {
-    // Catalog is optional; the app can still run with only /api/datasets.
-    state.catalogById = {};
-    state.catalogDatasets = [];
+    apiItems = [];
+  }
+
+  // Keep landing-page cards stable even when /api/catalog is missing/incomplete.
+  const items = mergeCatalogItems(apiItems, staticCatalogFallback());
+  state.catalogDatasets = items;
+  for (const it of items) {
+    if (it && it.id) state.catalogById[String(it.id)] = it;
   }
 }
 
@@ -3076,9 +3122,16 @@ function datasetTypeFromFamily(family) {
   return "";
 }
 
-function datasetTypeFromMeta(meta) {
+function datasetFamilyFromMeta(meta) {
   if (!meta || typeof meta !== "object") return "";
-  return datasetTypeFromFamily(meta.family);
+  const direct = String(meta.family || "").trim().toLowerCase();
+  if (direct) return direct;
+  const app = (meta.app && typeof meta.app === "object") ? meta.app : null;
+  return String((app && app.family) || "").trim().toLowerCase();
+}
+
+function datasetTypeFromMeta(meta) {
+  return datasetTypeFromFamily(datasetFamilyFromMeta(meta));
 }
 
 function supportedLocalFamily(family) {
@@ -3184,7 +3237,14 @@ function virtualDatasetMeta(datasetId, title, family) {
 function ensureDatasetMetaForCard(datasetId) {
   const did = String(datasetId || "").trim();
   if (!did) return null;
-  if (state.datasetsById && state.datasetsById[did]) return state.datasetsById[did];
+  if (state.datasetsById && state.datasetsById[did]) {
+    const existing = state.datasetsById[did];
+    const fam = datasetFamilyFromMeta(existing);
+    if (fam && String(existing.family || "").trim().toLowerCase() !== fam) {
+      state.datasetsById[did] = { ...existing, family: fam };
+    }
+    return state.datasetsById[did];
+  }
   const cat = (state.catalogById && state.catalogById[did]) ? state.catalogById[did] : null;
   if (!cat || typeof cat !== "object") return null;
   const app = (cat.app && typeof cat.app === "object") ? cat.app : {};
