@@ -410,6 +410,7 @@ const WebBackend = {
       return {};
     }
     if (url.includes('/scenes?')) return await this.handleListScenes(url);
+    if (url.includes('/intersections?')) return await this.handleListIntersections(url);
     if (url.includes('/bundle?')) return await this.handleLoadBundle(url);
 
     throw new Error(`WebBackend: Unhandled GET ${url}`);
@@ -427,18 +428,15 @@ const WebBackend = {
     if (!WebFS.rootHandle) throw new Error("No folder selected");
     const rootName = WebFS.rootHandle.name;
 
-    let type = this.normalizeDatasetType(payload && payload.dataset_type);
-    if (!type) {
-      // Basic detection logic when no dataset type was requested.
-      const files = await WebFS.listDir(rootName);
-      type = files.some(f => f.includes('recordingMeta')) ? 'ind' : 'v2x_traj';
-    }
+    // Basic detection logic
+    const files = await WebFS.listDir(rootName);
+    let type = 'v2x_traj';
+    if (files.some(f => f.includes('recordingMeta'))) type = 'ind';
 
     const profile = {
       profile_id: 'web-' + Date.now(),
       dataset_id: 'ds-' + Date.now(),
       name: rootName,
-      dataset_type: type,
       type: type,
       source_path: rootName,
       bindings: {}
@@ -454,14 +452,12 @@ const WebBackend = {
     if (existingIdx >= 0) profiles[existingIdx] = profile;
     else profiles.push(profile);
 
-    const family = this.datasetFamilyFromType(profile.dataset_type || profile.type);
-
     // Save logic generally only touches local datasets. 
     // We constructs a new entry for the *new* dataset ID.
     const dsEntry = {
       id: profile.dataset_id,
       title: profile.name,
-      family: family || 'v2x-traj',
+      family: profile.type || 'v2x-traj',
       root: profile.source_path
     };
 
@@ -487,6 +483,48 @@ const WebBackend = {
     localStorage.setItem(this.LS_DATASETS, JSON.stringify(local));
 
     return { ok: true, profile: profile };
+  },
+
+  async handleListIntersections(url) {
+    const urlObj = new URL(url, 'http://localhost');
+    const split = urlObj.searchParams.get('split') || 'train';
+
+    if (!WebFS.rootHandle) {
+      return { split, items: [] };
+    }
+
+    let csvText = await WebFS.readFileText('scenes.csv');
+    // If not at root, try split folder
+    if (!csvText) csvText = await WebFS.readFileText(WebFS.joinPath(WebFS.rootHandle.name, split, 'scenes.csv'));
+    if (!csvText) csvText = await WebFS.readFileText(WebFS.joinPath(WebFS.rootHandle.name, 'scenes.csv'));
+
+    if (!csvText) {
+      return { split, items: [] };
+    }
+
+    const rows = parseCsv(csvText);
+    const counts = {};
+    rows.forEach(r => {
+      // Filter by split logic
+      let match = false;
+      if (r.split) match = (r.split === split);
+      else {
+        const table = r.table || '';
+        match = (!table || table.includes(split));
+      }
+
+      if (match && r.intersect_id) {
+        counts[r.intersect_id] = (counts[r.intersect_id] || 0) + 1;
+      }
+    });
+
+    const items = Object.entries(counts).map(([k, v]) => ({
+      intersect_id: k,
+      intersect_label: k, // basic label
+      count: v
+    })).sort((a, b) => b.count - a.count);
+
+    return { split, items };
   },
 
   async handleListScenes(url) {
