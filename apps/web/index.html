@@ -1,150 +1,158 @@
 <!doctype html>
 <html lang="en">
-  <head>
-    <meta charset="utf-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>V2X Scene Explorer</title>
-    <link rel="stylesheet" href="/styles.css" />
-  </head>
-  <body>
-    <section id="homeView" class="home">
-      <div class="homeCard">
-        <div class="homeHero">
-          <img class="homeHero__img" src="/hero.svg" alt="" />
-        </div>
-        <div class="homeGrid">
-          <div class="homeMain">
-            <div class="homeBrand">
-              <div class="homeTitle">V2X Scene Explorer</div>
-              <div class="homeSubtitle">
-                An interactive viewer for multi-agent trajectory datasets: scenes, playback, trajectories, per-class filters, and maps when available.
-              </div>
-              <div id="homeStats" class="homeStats"></div>
-            </div>
 
-            <div class="homeControls homeControls--hub">
-              <label class="field homeField">
-                <span>Find a dataset</span>
-                <input id="homeSearch" class="textInput" placeholder="Search by name, scenario, or keyword..." />
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>V2X Scene Explorer</title>
+  <link rel="stylesheet" href="./styles.css" />
+</head>
+
+<body>
+  <section id="homeView" class="home">
+    <div class="homeCard">
+      <div class="homeHero">
+        <img class="homeHero__img" src="./hero.svg" alt="" />
+      </div>
+      <div class="homeGrid">
+        <div class="homeMain">
+          <div class="homeBrand">
+            <div class="homeTitle">V2X Scene Explorer</div>
+            <div class="homeSubtitle">
+              An interactive viewer for multi-agent trajectory datasets: scenes, playback, trajectories, per-class
+              filters, and maps when available.
+            </div>
+            <div id="homeStats" class="homeStats"></div>
+          </div>
+
+          <div class="homeControls homeControls--hub">
+            <label class="field homeField">
+              <span>Find a dataset</span>
+              <input id="homeSearch" class="textInput" placeholder="Search by name, scenario, or keyword..." />
+            </label>
+
+            <div class="homeFilters" aria-label="Dataset filters">
+              <label class="field field--compact">
+                <span>Category</span>
+                <select id="homeCategory">
+                  <option value="" selected>All</option>
+                </select>
               </label>
-
-              <div class="homeFilters" aria-label="Dataset filters">
-                <label class="field field--compact">
-                  <span>Category</span>
-                  <select id="homeCategory">
-                    <option value="" selected>All</option>
-                  </select>
-                </label>
-                <label class="field field--compact">
-                  <span>HD map</span>
-                  <select id="homeHasMap">
-                    <option value="" selected>All</option>
-                    <option value="yes">Yes</option>
-                    <option value="no">No</option>
-                    <option value="unknown">Unknown</option>
-                  </select>
-                </label>
-                <label class="field field--compact">
-                  <span>Traffic lights</span>
-                  <select id="homeHasTL">
-                    <option value="" selected>All</option>
-                    <option value="yes">Yes</option>
-                    <option value="no">No</option>
-                    <option value="unknown">Unknown</option>
-                  </select>
-                </label>
-                <label class="field field--compact">
-                  <span>Sort</span>
-                  <select id="homeSort">
-                    <option value="available" selected>Available first</option>
-                    <option value="year_desc">Year (new → old)</option>
-                    <option value="title_asc">Title (A → Z)</option>
-                  </select>
-                </label>
-              </div>
-            </div>
-
-            <div id="homeError" class="homeError" hidden></div>
-            <div id="homeConnectResult" class="hint hint--block" hidden></div>
-
-            <div id="homeDatasetCards" class="dsList" aria-label="Dataset catalog"></div>
-
-            <div class="homeFoot">
-              Tip: open a supported dataset to explore it. More datasets can be added later without changing the explorer UI.
+              <label class="field field--compact">
+                <span>HD map</span>
+                <select id="homeHasMap">
+                  <option value="" selected>All</option>
+                  <option value="yes">Yes</option>
+                  <option value="no">No</option>
+                  <option value="unknown">Unknown</option>
+                </select>
+              </label>
+              <label class="field field--compact">
+                <span>Traffic lights</span>
+                <select id="homeHasTL">
+                  <option value="" selected>All</option>
+                  <option value="yes">Yes</option>
+                  <option value="no">No</option>
+                  <option value="unknown">Unknown</option>
+                </select>
+              </label>
+              <label class="field field--compact">
+                <span>Sort</span>
+                <select id="homeSort">
+                  <option value="available" selected>Available first</option>
+                  <option value="year_desc">Year (new → old)</option>
+                  <option value="title_asc">Title (A → Z)</option>
+                </select>
+              </label>
             </div>
           </div>
 
-          <aside class="homeAside" aria-label="App overview">
-            <div class="homeAside__title">What You Can Do</div>
-            <div class="homeBullets">
-              <div class="homeBullet"><b>Browse scenes:</b> fast next/prev and jump to a scene ID.</div>
-              <div class="homeBullet"><b>Play trajectories:</b> scrub time, click an object, and show its full path.</div>
-              <div class="homeBullet"><b>See motion:</b> velocity arrows (movement) and heading arrows (orientation).</div>
-              <div class="homeBullet"><b>Filter intelligently:</b> by modality, type, and fine-grained class (subtype).</div>
-              <div class="homeBullet"><b>Understand context:</b> HD map rendering when the dataset provides it.</div>
-            </div>
+          <div id="homeError" class="homeError" hidden></div>
+          <div id="homeConnectResult" class="hint hint--block" hidden></div>
 
-            <div class="homeAside__title">Keyboard Shortcuts</div>
-            <div class="homeKbd">
-              <div><kbd>Space</kbd> Play/Pause</div>
-              <div><kbd>←</kbd>/<kbd>→</kbd> Prev/Next frame</div>
-              <div><kbd>N</kbd>/<kbd>P</kbd> Next/Prev scene</div>
-              <div><kbd>F</kbd> Fit view</div>
+          <div id="homeDatasetCards" class="dsList" aria-label="Dataset catalog"></div>
+
+          <div class="homeFoot">
+            Tip: open a supported dataset to explore it. More datasets can be added later without changing the explorer
+            UI.
+          </div>
+        </div>
+
+        <aside class="homeAside" aria-label="App overview">
+          <div class="homeAside__title">What You Can Do</div>
+          <div class="homeBullets">
+            <div class="homeBullet"><b>Browse scenes:</b> fast next/prev and jump to a scene ID.</div>
+            <div class="homeBullet"><b>Play trajectories:</b> scrub time, click an object, and show its full path.</div>
+            <div class="homeBullet"><b>See motion:</b> velocity arrows (movement) and heading arrows (orientation).
             </div>
-          </aside>
+            <div class="homeBullet"><b>Filter intelligently:</b> by modality, type, and fine-grained class (subtype).
+            </div>
+            <div class="homeBullet"><b>Understand context:</b> HD map rendering when the dataset provides it.</div>
+          </div>
+
+          <div class="homeAside__title">Keyboard Shortcuts</div>
+          <div class="homeKbd">
+            <div><kbd>Space</kbd> Play/Pause</div>
+            <div><kbd>←</kbd>/<kbd>→</kbd> Prev/Next frame</div>
+            <div><kbd>N</kbd>/<kbd>P</kbd> Next/Prev scene</div>
+            <div><kbd>F</kbd> Fit view</div>
+          </div>
+        </aside>
+      </div>
+    </div>
+  </section>
+
+  <div id="explorerView" hidden>
+    <header class="topbar">
+      <div class="topbar__row">
+        <div class="brand">
+          <div class="brand__title">V2X Scene Explorer</div>
+          <div class="brand__subtitle">Trajectory dataset explorer</div>
+        </div>
+
+        <div class="controls controls--primary">
+          <button id="backHomeBtn" class="btn btn--ghost btn--sm" type="button"
+            title="Return to the start screen">Home</button>
+          <label id="datasetField" class="field">
+            <span>Dataset</span>
+            <select id="datasetSelect"></select>
+          </label>
+
+          <label id="splitField" class="field">
+            <span>Split</span>
+            <select id="splitSelect">
+              <option value="train">Train</option>
+              <option value="val">Validation</option>
+            </select>
+          </label>
+
+          <label class="field">
+            <span id="groupLabel">Intersection</span>
+            <select id="intersectSelect"></select>
+          </label>
         </div>
       </div>
-    </section>
-
-    <div id="explorerView" hidden>
-      <header class="topbar">
-        <div class="topbar__row">
-          <div class="brand">
-            <div class="brand__title">V2X Scene Explorer</div>
-            <div class="brand__subtitle">Trajectory dataset explorer</div>
-            <div class="brand__meta">
-              <span id="appVersionBadge" class="chip">v?</span>
-              <button id="checkUpdateBtn" class="btn btn--ghost btn--sm" type="button" title="Check for a newer app version">Check updates</button>
-              <button id="downloadUpdateBtn" class="btn btn--sm" type="button" title="Download the latest release" hidden>Download update</button>
-            </div>
-            <div id="updateHint" class="hint" hidden></div>
-          </div>
-
-          <div class="controls controls--primary">
-            <button id="backHomeBtn" class="btn btn--ghost btn--sm" type="button" title="Return to the start screen">Home</button>
-            <label id="datasetField" class="field">
-              <span>Dataset</span>
-              <select id="datasetSelect"></select>
-            </label>
-
-            <label id="splitField" class="field">
-              <span>Split</span>
-              <select id="splitSelect">
-                <option value="train">Train</option>
-                <option value="val">Validation</option>
-              </select>
-            </label>
-
-            <label class="field">
-              <span id="groupLabel">Intersection</span>
-              <select id="intersectSelect"></select>
-            </label>
-          </div>
+      <div class="topbar__context" aria-live="polite">
+        <div class="topbar__contextMain">
+          <span class="topbar__contextLabel">Active dataset</span>
+          <span id="activeDatasetName" class="chip chip--dataset">Dataset</span>
         </div>
-        <div class="topbar__context" aria-live="polite">
-          <div class="topbar__contextMain">
-            <span class="topbar__contextLabel">Active dataset</span>
-            <span id="activeDatasetName" class="chip chip--dataset">Dataset</span>
-            <span id="activeDatasetLoadState" class="chip chip--no">Not loaded</span>
-            <span id="activeDatasetFolder" class="topbar__contextFolder" hidden></span>
+        <div class="topbar__utility">
+          <div class="topbar__utilityMain">
+            <span id="appVersionBadge" class="chip chip--utility">v?</span>
+            <button id="checkUpdateBtn" class="btn btn--ghost btn--sm btn--utility" type="button"
+              title="Check for a newer app version">Check updates</button>
+            <button id="downloadUpdateBtn" class="btn btn--sm btn--utility" type="button"
+              title="Download the latest release" hidden>Download update</button>
           </div>
-          <div id="explorerBreadcrumb" class="topbar__breadcrumb">Home / Dataset / Explorer</div>
+          <div id="updateHint" class="hint topbar__utilityHint" hidden></div>
         </div>
+      </div>
 
-      </header>
+    </header>
 
-      <main class="layout">
-      <aside class="panel">
+    <main class="layout">
+      <aside class="panel panel--theme-frosted">
         <div class="panel__section">
           <div class="panel__title">Data Source</div>
           <div id="sourceHint" class="hint hint--block">Pick a dataset directory to load this dataset.</div>
@@ -173,8 +181,10 @@
             <span>Current scene</span>
             <div class="sceneRow sceneRow--panel">
               <select id="sceneSelect"></select>
-              <button id="prevSceneBtn" class="btn btn--ghost btn--sm btn--icon" type="button" title="Previous scene" aria-label="Previous scene">&lt;</button>
-              <button id="nextSceneBtn" class="btn btn--ghost btn--sm btn--icon" type="button" title="Next scene" aria-label="Next scene">&gt;</button>
+              <button id="prevSceneBtn" class="btn btn--ghost btn--sm btn--icon" type="button" title="Previous scene"
+                aria-label="Previous scene">&lt;</button>
+              <button id="nextSceneBtn" class="btn btn--ghost btn--sm btn--icon" type="button" title="Next scene"
+                aria-label="Next scene">&gt;</button>
             </div>
           </label>
 
@@ -182,142 +192,193 @@
             <span>Go to scene ID</span>
             <div class="sceneJumpRow">
               <input id="sceneJumpInput" class="sceneJump" inputmode="numeric" placeholder="e.g., 123" />
-              <button id="sceneGoBtn" class="btn btn--ghost btn--sm" type="button" title="Jump to a scene ID">Jump</button>
+              <button id="sceneGoBtn" class="btn btn--ghost btn--sm" type="button"
+                title="Jump to a scene ID">Jump</button>
             </div>
           </label>
         </div>
 
         <div class="panel__section">
           <div class="panel__title" id="modalitiesTitle">Modalities</div>
-          <label class="check" id="layerEgoWrap"><input type="checkbox" id="layerEgo" checked /> <span id="layerEgoText">Ego vehicle</span></label>
-          <label class="check" id="layerInfraWrap"><input type="checkbox" id="layerInfra" checked /> <span id="layerInfraText">Infrastructure</span></label>
-          <label class="check" id="layerVehicleWrap"><input type="checkbox" id="layerVehicle" checked /> <span id="layerVehicleText">Other vehicles</span></label>
-          <label class="check" id="layerTLWrap"><input type="checkbox" id="layerTL" checked /> <span id="layerTLText">Traffic lights</span></label>
+          <label class="check" id="layerEgoWrap"><input type="checkbox" id="layerEgo" checked /> <span
+              id="layerEgoText">Ego vehicle</span></label>
+          <label class="check" id="layerInfraWrap"><input type="checkbox" id="layerInfra" checked /> <span
+              id="layerInfraText">Infrastructure</span></label>
+          <label class="check" id="layerVehicleWrap"><input type="checkbox" id="layerVehicle" checked /> <span
+              id="layerVehicleText">Other vehicles</span></label>
+          <label class="check" id="layerTLWrap"><input type="checkbox" id="layerTL" checked /> <span
+              id="layerTLText">Traffic lights</span></label>
         </div>
 
-	        <div class="panel__section" id="subTypeSection">
-	          <div class="panel__title">Agent Types</div>
-	          <div class="inlineActions">
-	            <button id="subTypeAllBtn" class="textLinkBtn" type="button">All</button>
-	            <button id="subTypeNoneBtn" class="textLinkBtn" type="button">None</button>
-	          </div>
-	          <div id="subTypeFilters" class="agentTypeList"></div>
-	        </div>
+        <div class="panel__section" id="subTypeSection">
+          <div class="panel__title">Agent Types</div>
+          <div class="inlineActions">
+            <button id="subTypeAllBtn" class="textLinkBtn" type="button">All</button>
+            <button id="subTypeNoneBtn" class="textLinkBtn" type="button">None</button>
+          </div>
+          <div id="subTypeFilters" class="agentTypeList"></div>
+        </div>
 
-	        <div class="panel__section">
-	          <div class="panel__title">Playback</div>
-	          <div class="playbackRow">
-	            <button id="playBtn" class="btn btn--ghost btn--sm">Play</button>
-	            <button id="stepBtn" class="btn btn--ghost btn--sm">Next frame</button>
-	            <label class="field field--inline">
-	              <span>Speed</span>
-	              <select id="speedSelect">
-	                <option value="0.25">0.25x</option>
-	                <option value="0.5">0.5x</option>
-	                <option value="1" selected>1x</option>
-	                <option value="2">2x</option>
-	                <option value="4">4x</option>
-	              </select>
-	            </label>
-	          </div>
-	          <details class="panelFold">
-	            <summary class="panelFold__summary">Trajectory Settings</summary>
-		            <label class="check small"><input type="checkbox" id="showVelocity" /> Show velocity arrows</label>
-		            <label class="check small"><input type="checkbox" id="showHeading" /> Show heading arrows</label>
-		            <div class="trajectoryRange" role="radiogroup" aria-labelledby="trajectoryRangeLabel">
-		              <div class="trajectoryRange__label" id="trajectoryRangeLabel">Trajectory range</div>
-		              <div class="trajectoryRange__options">
-		                <label class="check small trajectoryRange__option">
-		                  <input type="radio" name="trajectoryRange" id="trajectoryRangePast" value="past" />
-		                  <span>Past only</span>
-		                </label>
-		                <label class="check small trajectoryRange__option">
-		                  <input type="radio" name="trajectoryRange" id="trajectoryRangeFull" value="full" checked />
-		                  <span>Past + future</span>
-		                </label>
-		              </div>
-		            </div>
-	          </details>
-		          <label class="check small" id="holdTLWrap"><input type="checkbox" id="holdTL" checked /> Hold traffic lights between updates</label>
-	        </div>
+        <div class="panel__section">
+          <div class="panel__title">Playback</div>
+          <div class="playbackRow">
+            <button id="playBtn" class="btn btn--ghost btn--sm">Play</button>
+            <button id="stepBtn" class="btn btn--ghost btn--sm">Next frame</button>
+            <label class="field field--inline">
+              <span>Speed</span>
+              <select id="speedSelect">
+                <option value="0.25">0.25x</option>
+                <option value="0.5">0.5x</option>
+                <option value="1" selected>1x</option>
+                <option value="2">2x</option>
+                <option value="4">4x</option>
+              </select>
+            </label>
+          </div>
+          <details class="panelFold">
+            <summary class="panelFold__summary">Trajectory Settings</summary>
+            <label class="check small"><input type="checkbox" id="showVelocity" /> Show velocity arrows</label>
+            <label class="check small"><input type="checkbox" id="showHeading" /> Show heading arrows</label>
+            <div class="trajectoryRange" role="group" aria-labelledby="trajectoryRangeLabel">
+              <div class="trajectoryRange__label" id="trajectoryRangeLabel">Track display</div>
+              <div class="trajectoryRange__options">
+                <label class="check small trajectoryRange__option">
+                  <input type="checkbox" id="trajectoryRangeNone" value="none" />
+                  <span>Hide tracks</span>
+                </label>
+                <label class="check small trajectoryRange__option">
+                  <input type="checkbox" id="trajectoryRangePast" value="past" />
+                  <span>History tracks</span>
+                </label>
+                <label class="check small trajectoryRange__option">
+                  <input type="checkbox" id="trajectoryRangeFull" value="full" checked />
+                  <span>Full track</span>
+                </label>
+              </div>
+            </div>
+          </details>
+          <label class="check small" id="holdTLWrap"><input type="checkbox" id="holdTL" checked /> Hold traffic lights
+            between updates</label>
+        </div>
 
         <div class="panel__section panel__section--major" id="mapSection">
           <div class="panel__title" id="mapTitle">Map</div>
-	          <div class="row">
-	            <button id="fitSceneBtn" class="btn btn--ghost btn--sm">Fit trajectories</button>
-	            <button id="fitMapBtn" class="btn btn--ghost btn--sm">Fit map</button>
-	          </div>
-            <div id="sceneViewControls">
-              <div id="mapSourceControls" hidden>
-                <label class="field">
-                  <span>Map source</span>
-                  <select id="mapSourceSelect">
-                    <option value="lanelet2">Lanelet2 vector map</option>
-                    <option value="orthophoto">Orthophoto image</option>
-                    <option value="none">None</option>
-                  </select>
+          <div class="row">
+            <button id="fitSceneBtn" class="btn btn--ghost btn--sm">Fit trajectories</button>
+            <button id="fitMapBtn" class="btn btn--ghost btn--sm">Fit map</button>
+          </div>
+          <div id="sceneViewControls">
+            <div id="mapSourceControls" hidden>
+              <label class="field">
+                <span>Map source</span>
+                <select id="mapSourceSelect">
+                  <option value="lanelet2">Lanelet2 vector map</option>
+                  <option value="orthophoto">Orthophoto image</option>
+                  <option value="overlay">Lanelet2 + orthophoto (overlay)</option>
+                  <option value="none">None</option>
+                </select>
+              </label>
+              <div id="mapSourceStatus" class="hint"></div>
+            </div>
+            <label class="check small" id="showMapWrap"><input type="checkbox" id="showMap" checked /> Show vector
+              map</label>
+            <label class="check small" id="showSceneBgWrap"><input type="checkbox" id="showSceneBg" /> Show scene
+              background image</label>
+            <div id="sceneBgStatus" class="hint" hidden></div>
+            <details id="bgAlignSection" class="panelFold" hidden>
+              <summary class="panelFold__summary">Background alignment (SinD)</summary>
+              <label class="check small"><input type="checkbox" id="bgAlignEnabled" checked /> Apply correction</label>
+              <label class="check small"><input type="checkbox" id="bgAlignFlipY" /> Flip image vertically</label>
+              <label class="field">
+                <span>Image opacity</span>
+                <input id="bgAlignAlpha" type="range" min="0.20" max="1.00" step="0.01" value="0.92" />
+              </label>
+              <div class="bgAlignGrid">
+                <label class="field field--compact">
+                  <span>Offset X (m)</span>
+                  <input id="bgAlignTx" type="number" step="0.1" value="0" />
                 </label>
-                <div id="mapSourceStatus" class="hint"></div>
+                <label class="field field--compact">
+                  <span>Offset Y (m)</span>
+                  <input id="bgAlignTy" type="number" step="0.1" value="0" />
+                </label>
+                <label class="field field--compact">
+                  <span>Scale X</span>
+                  <input id="bgAlignSx" type="number" step="0.001" value="1" />
+                </label>
+                <label class="field field--compact">
+                  <span>Scale Y</span>
+                  <input id="bgAlignSy" type="number" step="0.001" value="1" />
+                </label>
+                <label class="field field--compact">
+                  <span>Rotation (deg)</span>
+                  <input id="bgAlignRot" type="number" step="0.1" value="0" />
+                </label>
               </div>
-              <label class="check small" id="showMapWrap"><input type="checkbox" id="showMap" checked /> Show vector map</label>
-              <label class="check small" id="showSceneBgWrap"><input type="checkbox" id="showSceneBg" /> Show scene background image</label>
-              <div id="sceneBgStatus" class="hint" hidden></div>
-            </div>
-            <div id="basemapControls" hidden>
-              <div class="panel__subhead">Basemap</div>
-              <label class="check small"><input type="checkbox" id="showBasemap" /> Show basemap (OpenStreetMap)</label>
-              <div id="basemapStatus" class="hint" hidden></div>
-            </div>
-	          <details id="mapOnlyControls" class="panelFold">
-	            <summary class="panelFold__summary">Advanced map controls</summary>
-	            <label class="field">
-	              <span>Scope</span>
-	              <select id="mapClipSelect">
-	                <option value="scene" selected>Focused (scene)</option>
-	                <option value="intersection">Full (intersection map)</option>
-	              </select>
-	            </label>
-	            <label class="field">
-	              <span>Detail</span>
-	              <select id="mapStepSelect">
-	                <option value="1">Step 1 (max)</option>
-	                <option value="2">Step 2 (high)</option>
-	                <option value="3" selected>Step 3 (medium)</option>
-	                <option value="5">Step 5 (low)</option>
-	                <option value="8">Step 8 (very low)</option>
-	              </select>
-	            </label>
-	            <label class="field">
-	              <span>Padding (m)</span>
-	              <select id="mapPadSelect">
-	                <option value="60">60</option>
-	                <option value="120" selected>120</option>
-	                <option value="250">250</option>
-	                <option value="500">500</option>
-	                <option value="1000">1000</option>
-	              </select>
-	            </label>
-	            <label class="field">
-	              <span>Lane limit</span>
-	              <select id="mapMaxLanesSelect">
-	                <option value="2000">2000</option>
-	                <option value="4000">4000</option>
-	                <option value="5000" selected>5000</option>
-	                <option value="8000">8000</option>
-	                <option value="12000">12000</option>
-	              </select>
-	            </label>
-	            <div class="panel__subhead">Map Layers</div>
-	            <label class="check small"><input type="checkbox" id="mapLanes" checked /> Lanes</label>
-	            <label class="check small"><input type="checkbox" id="mapStoplines" checked /> Stoplines</label>
-	            <label class="check small"><input type="checkbox" id="mapCrosswalks" checked /> Crosswalks</label>
-	            <label class="check small"><input type="checkbox" id="mapJunctions" checked /> Junction areas</label>
-	            <label class="check small"><input type="checkbox" id="focusMask" checked /> Dim outside trajectories (intersection view)</label>
-	          </details>
-	          <label class="check small"><input type="checkbox" id="sceneBox" checked /> Show trajectory extent</label>
-	        </div>
+              <div class="row bgAlignActions">
+                <button id="bgAlignResetBtn" class="btn btn--ghost btn--sm" type="button">Reset city</button>
+                <button id="bgAlignCopyBtn" class="btn btn--ghost btn--sm" type="button">Copy values</button>
+              </div>
+              <div id="bgAlignHint" class="hint"></div>
+            </details>
+          </div>
+          <div id="basemapControls" hidden>
+            <div class="panel__subhead">Basemap</div>
+            <label class="check small"><input type="checkbox" id="showBasemap" /> Show basemap (OpenStreetMap)</label>
+            <div id="basemapStatus" class="hint" hidden></div>
+          </div>
+          <details id="mapOnlyControls" class="panelFold">
+            <summary class="panelFold__summary">Advanced map controls</summary>
+            <label class="field">
+              <span>Scope</span>
+              <select id="mapClipSelect">
+                <option value="scene" selected>Focused (scene)</option>
+                <option value="intersection">Full (intersection map)</option>
+              </select>
+            </label>
+            <label class="field">
+              <span>Detail</span>
+              <select id="mapStepSelect">
+                <option value="1">Step 1 (max)</option>
+                <option value="2">Step 2 (high)</option>
+                <option value="3" selected>Step 3 (medium)</option>
+                <option value="5">Step 5 (low)</option>
+                <option value="8">Step 8 (very low)</option>
+              </select>
+            </label>
+            <label class="field">
+              <span>Padding (m)</span>
+              <select id="mapPadSelect">
+                <option value="60">60</option>
+                <option value="120" selected>120</option>
+                <option value="250">250</option>
+                <option value="500">500</option>
+                <option value="1000">1000</option>
+              </select>
+            </label>
+            <label class="field">
+              <span>Lane limit</span>
+              <select id="mapMaxLanesSelect">
+                <option value="2000">2000</option>
+                <option value="4000">4000</option>
+                <option value="5000" selected>5000</option>
+                <option value="8000">8000</option>
+                <option value="12000">12000</option>
+              </select>
+            </label>
+            <div class="panel__subhead">Map Layers</div>
+            <label class="check small"><input type="checkbox" id="mapLanes" checked /> Lanes</label>
+            <label class="check small"><input type="checkbox" id="mapStoplines" checked /> Stoplines</label>
+            <label class="check small"><input type="checkbox" id="mapCrosswalks" checked /> Crosswalks</label>
+            <label class="check small"><input type="checkbox" id="mapJunctions" checked /> Junction areas</label>
+            <label class="check small"><input type="checkbox" id="focusMask" checked /> Dim outside trajectories
+              (intersection view)</label>
+          </details>
+          <label class="check small"><input type="checkbox" id="sceneBox" checked /> Show trajectory extent</label>
+        </div>
 
-        <details class="panel__section panel__section--major panelFold panelFold--section" id="sceneDetailsSection" open>
+        <details class="panel__section panel__section--major panelFold panelFold--section" id="sceneDetailsSection"
+          open>
           <summary class="panel__title panelFold__summary panelFold__summary--title">Scene Profile</summary>
           <div id="statusBox" class="statusBox">Select a scene…</div>
           <details class="advancedMetaFold">
@@ -353,112 +414,134 @@
           </div>
         </div>
       </section>
-      </main>
-    </div>
+    </main>
+  </div>
 
-    <div id="profileWizardModal" class="modal" hidden aria-hidden="true">
-      <div class="modal__backdrop" data-close-profile-wizard></div>
-      <section class="modal__card" role="dialog" aria-modal="true" aria-labelledby="profileWizardTitle">
-        <div class="modal__head">
-          <div>
-            <div id="profileWizardTitle" class="modal__title">New Connection</div>
-            <div id="profileWizardSub" class="modal__subtitle">Step 1 of 3</div>
-          </div>
-          <button id="profileWizardCloseBtn" class="btn btn--ghost btn--sm btn--icon" type="button" title="Close" aria-label="Close">&times;</button>
+  <div id="profileWizardModal" class="modal" hidden aria-hidden="true">
+    <div class="modal__backdrop" data-close-profile-wizard></div>
+    <section class="modal__card" role="dialog" aria-modal="true" aria-labelledby="profileWizardTitle">
+      <div class="modal__head">
+        <div>
+          <div id="profileWizardTitle" class="modal__title">New Connection</div>
+          <div id="profileWizardSub" class="modal__subtitle">Step 1 of 3</div>
         </div>
+        <button id="profileWizardCloseBtn" class="btn btn--ghost btn--sm btn--icon" type="button" title="Close"
+          aria-label="Close">&times;</button>
+      </div>
 
-        <div class="wizardSteps" aria-hidden="true">
-          <span id="wizStepChip1" class="wizardStep">1 · Basics</span>
-          <span id="wizStepChip2" class="wizardStep">2 · Mapping</span>
-          <span id="wizStepChip3" class="wizardStep">3 · Review</span>
-        </div>
+      <div class="wizardSteps" aria-hidden="true">
+        <span id="wizStepChip1" class="wizardStep">1 · Basics</span>
+        <span id="wizStepChip2" class="wizardStep">2 · Mapping</span>
+        <span id="wizStepChip3" class="wizardStep">3 · Review</span>
+      </div>
 
-        <div class="wizardBody">
-          <section id="wizStep1" class="wizardPane">
-            <div class="connectGrid">
-              <label class="field field--compact">
-                <span>Dataset type</span>
-                <select id="wizType">
-                  <option value="auto" selected>Auto detect</option>
-                  <option value="v2x_traj">V2X-Traj style</option>
-                  <option value="v2x_seq">V2X-Seq style</option>
-                  <option value="ind">inD style</option>
-                  <option value="sind">SinD style</option>
-                  <option value="consider_it_cpm">Consider.it CPM style</option>
-                </select>
-              </label>
-
-              <label class="field field--compact">
-                <span>Connection name</span>
-                <input id="wizName" class="textInput" placeholder="e.g., RSU logs and map" />
-              </label>
-            </div>
-
-            <label class="field">
-              <span>Paths (one per line: folder or file)</span>
-              <textarea id="wizPaths" class="textInput textArea" placeholder="/Users/you/data/dataset-root&#10;/Users/you/data/file.csv"></textarea>
+      <div class="wizardBody">
+        <section id="wizStep1" class="wizardPane">
+          <div class="connectGrid">
+            <label class="field field--compact">
+              <span>Dataset type</span>
+              <select id="wizType">
+                <option value="auto" selected>Auto detect</option>
+                <option value="v2x_traj">V2X-Traj style</option>
+                <option value="v2x_seq">V2X-Seq style</option>
+                <option value="ind">inD style</option>
+                <option value="sind">SinD style</option>
+                <option value="consider_it_cpm">Consider.it CPM style</option>
+              </select>
             </label>
 
-            <div class="row">
-              <button id="wizDetectBtn" class="btn btn--ghost" type="button">Detect + Validate</button>
+            <label class="field field--compact">
+              <span>Connection name</span>
+              <input id="wizName" class="textInput" placeholder="e.g., RSU logs and map" />
+            </label>
+          </div>
+
+          <label class="field">
+            <span>Paths (one per line: folder or file)</span>
+            <textarea id="wizPaths" class="textInput textArea"
+              placeholder="/Users/you/data/dataset-root&#10;/Users/you/data/file.csv"></textarea>
+          </label>
+
+          <div class="row">
+            <button id="wizDetectBtn" class="btn btn--ghost" type="button">Detect + Validate</button>
+          </div>
+          <div id="wizDetectResult" class="hint hint--block" hidden></div>
+        </section>
+
+        <section id="wizStep2" class="wizardPane" hidden>
+          <div id="wizMapV2x" class="wizardMapBlock" hidden>
+            <div class="panel__subhead">V2X-Traj mapping</div>
+            <div class="connectGrid">
+              <label class="field field--compact"><span>Scenes index CSV *</span><input id="wizV2xScenes"
+                  class="textInput" placeholder="/path/scenes.csv" /></label>
+              <label class="field field--compact"><span>Ego trajectories dir *</span><input id="wizV2xEgo"
+                  class="textInput" placeholder="/path/ego-trajectories" /></label>
+              <label class="field field--compact"><span>Infrastructure trajectories dir *</span><input id="wizV2xInfra"
+                  class="textInput" placeholder="/path/infrastructure-trajectories" /></label>
+              <label class="field field--compact"><span>Vehicle trajectories dir *</span><input id="wizV2xVehicle"
+                  class="textInput" placeholder="/path/vehicle-trajectories" /></label>
+              <label class="field field--compact"><span>Traffic-light dir (optional)</span><input id="wizV2xTl"
+                  class="textInput" placeholder="/path/traffic-light" /></label>
+              <label class="field field--compact"><span>Maps dir (optional)</span><input id="wizV2xMaps"
+                  class="textInput" placeholder="/path/maps" /></label>
             </div>
-            <div id="wizDetectResult" class="hint hint--block" hidden></div>
-          </section>
+          </div>
 
-          <section id="wizStep2" class="wizardPane" hidden>
-            <div id="wizMapV2x" class="wizardMapBlock" hidden>
-              <div class="panel__subhead">V2X-Traj mapping</div>
-              <div class="connectGrid">
-                <label class="field field--compact"><span>Scenes index CSV *</span><input id="wizV2xScenes" class="textInput" placeholder="/path/scenes.csv" /></label>
-                <label class="field field--compact"><span>Ego trajectories dir *</span><input id="wizV2xEgo" class="textInput" placeholder="/path/ego-trajectories" /></label>
-                <label class="field field--compact"><span>Infrastructure trajectories dir *</span><input id="wizV2xInfra" class="textInput" placeholder="/path/infrastructure-trajectories" /></label>
-                <label class="field field--compact"><span>Vehicle trajectories dir *</span><input id="wizV2xVehicle" class="textInput" placeholder="/path/vehicle-trajectories" /></label>
-                <label class="field field--compact"><span>Traffic-light dir (optional)</span><input id="wizV2xTl" class="textInput" placeholder="/path/traffic-light" /></label>
-                <label class="field field--compact"><span>Maps dir (optional)</span><input id="wizV2xMaps" class="textInput" placeholder="/path/maps" /></label>
-              </div>
+          <div id="wizMapCpm" class="wizardMapBlock" hidden>
+            <div class="panel__subhead">Consider.it CPM mapping</div>
+            <label class="field"><span>CPM log CSV files (one per line) *</span><textarea id="wizCpmLogs"
+                class="textInput textArea" placeholder="/path/cpm_a.csv&#10;/path/cpm_b.csv"></textarea></label>
+            <div class="connectGrid">
+              <label class="field field--compact"><span>Proto schema (optional)</span><input id="wizCpmProto"
+                  class="textInput" placeholder="/path/sensor_interface-v1.2.1.proto" /></label>
+              <label class="field field--compact"><span>Scene window (seconds)</span><input id="wizCpmWindow"
+                  class="textInput" inputmode="numeric" placeholder="300" /></label>
+              <label class="field field--compact"><span>Scene gap (seconds)</span><input id="wizCpmGap"
+                  class="textInput" inputmode="numeric" placeholder="120" /></label>
             </div>
-
-            <div id="wizMapCpm" class="wizardMapBlock" hidden>
-              <div class="panel__subhead">Consider.it CPM mapping</div>
-              <label class="field"><span>CPM log CSV files (one per line) *</span><textarea id="wizCpmLogs" class="textInput textArea" placeholder="/path/cpm_a.csv&#10;/path/cpm_b.csv"></textarea></label>
-              <div class="connectGrid">
-                <label class="field field--compact"><span>Proto schema (optional)</span><input id="wizCpmProto" class="textInput" placeholder="/path/sensor_interface-v1.2.1.proto" /></label>
-                <label class="field field--compact"><span>Scene window (seconds)</span><input id="wizCpmWindow" class="textInput" inputmode="numeric" placeholder="300" /></label>
-                <label class="field field--compact"><span>Scene gap (seconds)</span><input id="wizCpmGap" class="textInput" inputmode="numeric" placeholder="120" /></label>
-              </div>
-              <div class="panel__subhead">Column mapping (optional overrides)</div>
-              <div class="connectGrid">
-                <label class="field field--compact"><span>Timestamp column</span><input id="wizCpmColTs" class="textInput" placeholder="generationTime_ms" /></label>
-                <label class="field field--compact"><span>Object ID column</span><input id="wizCpmColId" class="textInput" placeholder="objectID" /></label>
-                <label class="field field--compact"><span>X column</span><input id="wizCpmColX" class="textInput" placeholder="xDistance_m" /></label>
-                <label class="field field--compact"><span>Y column</span><input id="wizCpmColY" class="textInput" placeholder="yDistance_m" /></label>
-                <label class="field field--compact"><span>VX column</span><input id="wizCpmColVx" class="textInput" placeholder="xSpeed_mps" /></label>
-                <label class="field field--compact"><span>VY column</span><input id="wizCpmColVy" class="textInput" placeholder="ySpeed_mps" /></label>
-                <label class="field field--compact"><span>Heading column</span><input id="wizCpmColYaw" class="textInput" placeholder="yawAngle_deg" /></label>
-                <label class="field field--compact"><span>Class column</span><input id="wizCpmColClass" class="textInput" placeholder="classificationType" /></label>
-              </div>
+            <div class="panel__subhead">Column mapping (optional overrides)</div>
+            <div class="connectGrid">
+              <label class="field field--compact"><span>Timestamp column</span><input id="wizCpmColTs" class="textInput"
+                  placeholder="generationTime_ms" /></label>
+              <label class="field field--compact"><span>Object ID column</span><input id="wizCpmColId" class="textInput"
+                  placeholder="objectID" /></label>
+              <label class="field field--compact"><span>X column</span><input id="wizCpmColX" class="textInput"
+                  placeholder="xDistance_m" /></label>
+              <label class="field field--compact"><span>Y column</span><input id="wizCpmColY" class="textInput"
+                  placeholder="yDistance_m" /></label>
+              <label class="field field--compact"><span>VX column</span><input id="wizCpmColVx" class="textInput"
+                  placeholder="xSpeed_mps" /></label>
+              <label class="field field--compact"><span>VY column</span><input id="wizCpmColVy" class="textInput"
+                  placeholder="ySpeed_mps" /></label>
+              <label class="field field--compact"><span>Heading column</span><input id="wizCpmColYaw" class="textInput"
+                  placeholder="yawAngle_deg" /></label>
+              <label class="field field--compact"><span>Class column</span><input id="wizCpmColClass" class="textInput"
+                  placeholder="classificationType" /></label>
             </div>
+          </div>
 
-            <div class="row">
-              <button id="wizValidateBtn" class="btn btn--ghost" type="button">Validate Mapping</button>
-            </div>
-            <div id="wizValidateResult" class="hint hint--block" hidden></div>
-          </section>
+          <div class="row">
+            <button id="wizValidateBtn" class="btn btn--ghost" type="button">Validate Mapping</button>
+          </div>
+          <div id="wizValidateResult" class="hint hint--block" hidden></div>
+        </section>
 
-          <section id="wizStep3" class="wizardPane" hidden>
-            <div id="wizReviewSummary" class="statusBox">Run validation first.</div>
-            <div id="wizReviewIssues" class="wizardIssues"></div>
-          </section>
-        </div>
+        <section id="wizStep3" class="wizardPane" hidden>
+          <div id="wizReviewSummary" class="statusBox">Run validation first.</div>
+          <div id="wizReviewIssues" class="wizardIssues"></div>
+        </section>
+      </div>
 
-        <div class="wizardFoot">
-          <button id="wizPrevBtn" class="btn btn--ghost" type="button">Back</button>
-          <button id="wizNextBtn" class="btn" type="button">Next</button>
-          <button id="wizSaveBtn" class="btn" type="button" hidden>Save Connection</button>
-        </div>
-      </section>
-    </div>
+      <div class="wizardFoot">
+        <button id="wizPrevBtn" class="btn btn--ghost" type="button">Back</button>
+        <button id="wizNextBtn" class="btn" type="button">Next</button>
+        <button id="wizSaveBtn" class="btn" type="button" hidden>Save Connection</button>
+      </div>
+    </section>
+  </div>
 
-    <script src="/app.js"></script>
-  </body>
+  <script src="./web_backend.js"></script>
+  <script src="./app.js"></script>
+</body>
+
 </html>

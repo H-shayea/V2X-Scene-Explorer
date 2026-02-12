@@ -46,6 +46,7 @@ dataset/registry.private.json
 dataset/PROFILE_REPORT.md
 scripts/dataset/
 dataset/profiles/**
+dataset/profiles.local/
 !dataset/profiles/
 !dataset/profiles/v2x-traj/
 !dataset/profiles/v2x-traj/PROFILE_REPORT.md
@@ -58,3 +59,7 @@ Cooperative Trajectory.pdf
 
 # 
 drone-dataset-tools
+<<<<<<< HEAD
+=======
+SinD/
+>>>>>>> app

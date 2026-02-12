@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 from collections import OrderedDict
+import ipaddress
 import json
 import mimetypes
 import os
@@ -19,19 +20,21 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.error import HTTPError, URLError
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 from urllib.request import Request, urlopen
 
 try:
     # Preferred when running as a module: `python -m apps.server.server`
     from apps.app_meta import APP_NAME, APP_VERSION, DEFAULT_UPDATE_REPO
     from apps.server.datasets import DatasetStore
+    from apps.server.profiles import ProfileStore
 except ModuleNotFoundError:
     # Fallback when running as a script: `python apps/server/server.py`
     APP_NAME = "V2X Scene Explorer"
     APP_VERSION = str(os.environ.get("TRAJ_APP_VERSION") or "0.2.0").strip() or "0.2.0"
     DEFAULT_UPDATE_REPO = str(os.environ.get("TRAJ_UPDATE_REPO") or "H-shayea/V2X-Scene-Explorer").strip()
     from datasets import DatasetStore  # type: ignore
+    from profiles import ProfileStore  # type: ignore
 
 
 _TILE_CACHE_MAX = 512
@@ -133,13 +136,14 @@ def _fetch_update_payload_uncached() -> dict[str, object]:
         "release_url": None,
         "download_url": None,
         "published_at": None,
+        "release_prerelease": None,
+        "release_source": "latest",
         "error": None,
     }
     if not repo:
         return base
 
-    url = f"https://api.github.com/repos/{repo}/releases/latest"
-    try:
+    def _request_json(url: str) -> object:
         req = Request(
             url,
             headers={
@@ -148,16 +152,58 @@ def _fetch_update_payload_uncached() -> dict[str, object]:
             },
         )
         with urlopen(req, timeout=8) as resp:
-            raw = json.loads(resp.read().decode("utf-8", errors="replace"))
+            return json.loads(resp.read().decode("utf-8", errors="replace"))
+
+    latest_url = f"https://api.github.com/repos/{repo}/releases/latest"
+    raw: dict[str, object] | None = None
+    try:
+        latest_payload = _request_json(latest_url)
+        if isinstance(latest_payload, dict):
+            raw = latest_payload
+        else:
+            base["ok"] = False
+            base["error"] = "invalid response from release API"
+            base["comparison_mode"] = "error"
+            return base
+    except HTTPError as e:
+        # GitHub returns 404 on /releases/latest when there is no non-prerelease release.
+        if int(getattr(e, "code", 0) or 0) != 404:
+            base["ok"] = False
+            base["error"] = str(e)
+            base["comparison_mode"] = "error"
+            return base
+
+        fallback_url = f"https://api.github.com/repos/{repo}/releases?per_page=20"
+        try:
+            releases_payload = _request_json(fallback_url)
+        except Exception as ee:
+            base["ok"] = False
+            base["error"] = str(ee)
+            base["comparison_mode"] = "error"
+            return base
+
+        releases = releases_payload if isinstance(releases_payload, list) else []
+        for rel in releases:
+            if not isinstance(rel, dict):
+                continue
+            # Ignore drafts, but allow prereleases for tester channels.
+            if bool(rel.get("draft")):
+                continue
+            tag = str(rel.get("tag_name") or "").strip()
+            if not tag:
+                continue
+            raw = rel
+            base["release_source"] = "fallback_releases_list"
+            break
+
+        if raw is None:
+            base["comparison_mode"] = "no_releases"
+            base["release_url"] = f"https://github.com/{repo}/releases"
+            base["error"] = None
+            return base
     except Exception as e:
         base["ok"] = False
         base["error"] = str(e)
-        base["comparison_mode"] = "error"
-        return base
-
-    if not isinstance(raw, dict):
-        base["ok"] = False
-        base["error"] = "invalid response from release API"
         base["comparison_mode"] = "error"
         return base
 
@@ -174,6 +220,7 @@ def _fetch_update_payload_uncached() -> dict[str, object]:
     base["release_url"] = str(raw.get("html_url") or "").strip() or None
     base["download_url"] = _pick_release_download_url(raw)
     base["published_at"] = str(raw.get("published_at") or "").strip() or None
+    base["release_prerelease"] = bool(raw.get("prerelease"))
     return base
 
 
@@ -207,6 +254,71 @@ def get_app_meta() -> dict[str, object]:
         "update_repo": repo or None,
         "releases_url": f"https://github.com/{repo}/releases" if repo else None,
     }
+
+
+def _is_loopback_ip(host: str) -> bool:
+    raw = str(host or "").strip()
+    if not raw:
+        return False
+    if raw.startswith("::ffff:"):
+        raw = raw[7:]
+    if "%" in raw:
+        raw = raw.split("%", 1)[0]
+    if raw == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(raw).is_loopback
+    except Exception:
+        return False
+
+
+def _escape_osascript_text(s: str) -> str:
+    return str(s or "").replace("\\", "\\\\").replace('"', '\\"')
+
+
+def _pick_folder_macos(prompt: str, default_path: str | None = None) -> str | None:
+    if sys.platform != "darwin":
+        raise RuntimeError("native folder picker is supported only on macOS")
+
+    prompt_s = _escape_osascript_text(prompt or "Select a folder")
+    default_s = None
+    if default_path:
+        try:
+            p = Path(str(default_path)).expanduser().resolve()
+            if p.exists() and p.is_dir():
+                default_s = _escape_osascript_text(str(p))
+        except Exception:
+            default_s = None
+
+    lines = [f'set promptText to "{prompt_s}"']
+    if default_s:
+        lines.append(f'set defaultFolder to POSIX file "{default_s}"')
+        lines.append('set pickedFolder to choose folder with prompt promptText default location defaultFolder')
+    else:
+        lines.append('set pickedFolder to choose folder with prompt promptText')
+    lines.append("return POSIX path of pickedFolder")
+
+    script = "\n".join(lines)
+    try:
+        proc = subprocess.run(
+            ["osascript", "-e", script],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+    except Exception as e:
+        raise RuntimeError(f"failed to launch osascript: {e}") from e
+
+    if proc.returncode != 0:
+        err = (proc.stderr or proc.stdout or "").strip()
+        low = err.lower()
+        if "cancel" in low or "-128" in low:
+            return None
+        raise RuntimeError(err or f"osascript failed with exit code {proc.returncode}")
+
+    out = str(proc.stdout or "").strip()
+    return out or None
 
 
 def _reload_watch_files(repo_root: Path) -> list[Path]:
@@ -296,10 +408,21 @@ class AppHandler(BaseHTTPRequestHandler):
         path = parsed.path
 
         if path.startswith("/api/"):
-            self._handle_api(path, parse_qs(parsed.query))
+            self._handle_api("GET", path, parse_qs(parsed.query), None)
             return
 
         self._handle_static(path)
+
+    def do_POST(self) -> None:  # noqa: N802
+        parsed = urlparse(self.path)
+        path = parsed.path
+        if not path.startswith("/api/"):
+            self._send_error_json(404, "not_found")
+            return
+        body = self._read_json_body()
+        if body is None:
+            return
+        self._handle_api("POST", path, parse_qs(parsed.query), body)
 
     def log_message(self, fmt: str, *args) -> None:
         # Keep default behavior (stderr) but make it slightly cleaner.
@@ -317,6 +440,10 @@ class AppHandler(BaseHTTPRequestHandler):
     @property
     def web_root(self) -> Path:
         return self.server.web_root  # type: ignore[attr-defined]
+
+    @property
+    def profile_store(self) -> ProfileStore:
+        return self.server.profile_store  # type: ignore[attr-defined]
 
     def _send(self, status: int, body: bytes, content_type: str, extra_headers: dict[str, str] | None = None) -> None:
         self.send_response(status)
@@ -339,27 +466,59 @@ class AppHandler(BaseHTTPRequestHandler):
             payload["detail"] = detail
         self._send_json(status, payload)
 
-    def _handle_api(self, path: str, qs: dict) -> None:
+    def _read_json_body(self) -> dict | None:
+        raw_len = self.headers.get("Content-Length")
         try:
-            if path == "/api/health":
+            n = int(str(raw_len or "0"))
+        except Exception:
+            self._send_error_json(400, "bad_request", "invalid Content-Length")
+            return None
+        if n <= 0:
+            return {}
+        if n > 4 * 1024 * 1024:
+            self._send_error_json(413, "payload_too_large")
+            return None
+        try:
+            raw = self.rfile.read(n)
+        except Exception as e:
+            self._send_error_json(400, "bad_request", f"failed to read request body: {e}")
+            return None
+        try:
+            obj = json.loads(raw.decode("utf-8", errors="replace"))
+        except Exception as e:
+            self._send_error_json(400, "bad_request", f"invalid JSON body: {e}")
+            return None
+        if obj is None:
+            return {}
+        if not isinstance(obj, dict):
+            self._send_error_json(400, "bad_request", "JSON body must be an object")
+            return None
+        return obj
+
+    def _reload_store(self) -> None:
+        self.server.store = DatasetStore(self.repo_root)  # type: ignore[attr-defined]
+
+    def _handle_api(self, method: str, path: str, qs: dict, body: dict | None) -> None:
+        try:
+            if method == "GET" and path == "/api/health":
                 self._send_json(200, {"ok": True})
                 return
 
-            if path == "/api/app_meta":
+            if method == "GET" and path == "/api/app_meta":
                 self._send_json(200, get_app_meta())
                 return
 
-            if path == "/api/update/check":
+            if method == "GET" and path == "/api/update/check":
                 force = (qs.get("force", ["0"])[0] or "0") == "1"
                 self._send_json(200, get_update_payload(force=force))
                 return
 
             # Small same-origin tile proxy (helps when adblock/CORS blocks public tile servers).
-            if path.startswith("/api/tiles/"):
+            if method == "GET" and path.startswith("/api/tiles/"):
                 self._handle_tiles(path)
                 return
 
-            if path == "/api/catalog":
+            if method == "GET" and path == "/api/catalog":
                 catalog_path = (self.repo_root / "dataset" / "catalog.json").resolve()
                 if not catalog_path.exists():
                     self._send_error_json(404, "not_found", "catalog.json not found")
@@ -368,8 +527,78 @@ class AppHandler(BaseHTTPRequestHandler):
                 self._send_json(200, raw)
                 return
 
-            if path == "/api/datasets":
+            if method == "GET" and path == "/api/datasets":
                 self._send_json(200, {"datasets": self.store.list_datasets()})
+                return
+
+            if method == "GET" and path == "/api/profiles":
+                self._send_json(200, {"items": self.profile_store.list_profiles()})
+                return
+
+            if method == "GET" and path.startswith("/api/profiles/"):
+                parts = path.strip("/").split("/")
+                if len(parts) == 3 and parts[0] == "api" and parts[1] == "profiles":
+                    profile_id = unquote(str(parts[2] or "").strip())
+                    if not profile_id:
+                        self._send_error_json(400, "bad_request", "profile_id is required")
+                        return
+                    payload = self.profile_store.get_profile(profile_id)
+                    if not payload:
+                        self._send_error_json(404, "not_found", f"profile not found: {profile_id}")
+                        return
+                    self._send_json(200, payload)
+                    return
+
+            if method == "POST" and path == "/api/profiles/detect":
+                payload = self.profile_store.detect(body or {})
+                self._send_json(200, payload)
+                return
+
+            if method == "POST" and path == "/api/profiles/validate":
+                payload = self.profile_store.validate(body or {})
+                self._send_json(200, payload)
+                return
+
+            if method == "POST" and path == "/api/profiles/save":
+                saved = self.profile_store.save_profile(body or {})
+                self._reload_store()
+                self._send_json(200, {"ok": True, "profile": saved, "datasets": self.store.list_datasets()})
+                return
+
+            if method == "POST" and path == "/api/profiles/delete":
+                payload = self.profile_store.delete_profile(body or {})
+                self._reload_store()
+                self._send_json(200, {"ok": True, **payload, "datasets": self.store.list_datasets()})
+                return
+
+            if method == "POST" and path == "/api/profiles/default":
+                payload = self.profile_store.set_default_profile(body or {})
+                self._reload_store()
+                self._send_json(200, payload)
+                return
+
+            if method == "POST" and path == "/api/system/pick_folder":
+                client_host = str((self.client_address or ("", 0))[0] or "")
+                if not _is_loopback_ip(client_host):
+                    self._send_error_json(403, "forbidden", "native picker is only available from local loopback clients")
+                    return
+
+                prompt = str((body or {}).get("prompt") or "Select a folder").strip()
+                default_path = str((body or {}).get("default_path") or "").strip()
+                picked = _pick_folder_macos(prompt=prompt, default_path=default_path or None)
+                self._send_json(
+                    200,
+                    {
+                        "ok": True,
+                        "path": picked or "",
+                        "paths": [picked] if picked else [],
+                        "canceled": picked is None,
+                    },
+                )
+                return
+
+            if method != "GET":
+                self._send_error_json(404, "not_found")
                 return
 
             # /api/datasets/<id>/...
@@ -471,6 +700,8 @@ class AppHandler(BaseHTTPRequestHandler):
             self._send_error_json(404, "not_found")
         except KeyError as e:
             self._send_error_json(404, "not_found", str(e))
+        except ValueError as e:
+            self._send_error_json(400, "bad_request", str(e))
         except Exception as e:
             tb = traceback.format_exc(limit=5)
             self._send_error_json(500, "internal_error", f"{e}\n{tb}")
@@ -595,6 +826,7 @@ def main() -> int:
     if args.reload:
         return run_with_reload(repo_root=repo_root, host=args.host, port=args.port)
 
+    profile_store = ProfileStore(repo_root)
     store = DatasetStore(repo_root)
     if not store.specs:
         print("No datasets found. Ensure dataset/registry.json exists and points to valid paths.")
@@ -602,6 +834,7 @@ def main() -> int:
 
     server = ThreadingHTTPServer((args.host, args.port), AppHandler)
     server.store = store  # type: ignore[attr-defined]
+    server.profile_store = profile_store  # type: ignore[attr-defined]
     server.web_root = web_root  # type: ignore[attr-defined]
     server.repo_root = repo_root  # type: ignore[attr-defined]
 

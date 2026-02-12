@@ -10,6 +10,7 @@ import sys
 import threading
 import time
 from urllib.request import urlopen
+from typing import Any, List
 
 try:
     import webview
@@ -23,12 +24,66 @@ from http.server import ThreadingHTTPServer
 
 from apps.app_meta import APP_NAME
 from apps.server.datasets import DatasetStore
+from apps.server.profiles import ProfileStore
 from apps.server.server import AppHandler
 
 
 HOST = "127.0.0.1"
 WINDOW_SIZE = (1540, 980)
 MIN_WINDOW_SIZE = (1100, 760)
+
+
+class DesktopBridge:
+    def __init__(self) -> None:
+        self._window: Any = None
+
+    def attach_window(self, window: Any) -> None:
+        self._window = window
+
+    @staticmethod
+    def _normalize_dialog_result(raw: Any) -> List[str]:
+        if raw is None:
+            return []
+        if isinstance(raw, (list, tuple)):
+            return [str(x) for x in raw if str(x or "").strip()]
+        s = str(raw).strip()
+        return [s] if s else []
+
+    def is_desktop(self) -> bool:
+        return True
+
+    def pick_files(self) -> List[str]:
+        if self._window is None:
+            return []
+        try:
+            raw = self._window.create_file_dialog(webview.OPEN_DIALOG, allow_multiple=True)
+        except Exception:
+            return []
+        return self._normalize_dialog_result(raw)
+
+    def pick_folder(self) -> List[str]:
+        if self._window is None:
+            return []
+        try:
+            raw = self._window.create_file_dialog(webview.FOLDER_DIALOG, allow_multiple=False)
+        except Exception:
+            return []
+        return self._normalize_dialog_result(raw)
+
+    def pick_proto_file(self) -> List[str]:
+        if self._window is None:
+            return []
+        try:
+            raw = self._window.create_file_dialog(webview.OPEN_DIALOG, allow_multiple=False)
+        except Exception:
+            return []
+        out = self._normalize_dialog_result(raw)
+        if not out:
+            return []
+        p = Path(out[0])
+        if p.suffix.lower() != ".proto":
+            return []
+        return out
 
 
 def app_support_dir() -> Path:
@@ -86,7 +141,7 @@ def ensure_local_registry_template(path: Path, root: Path) -> None:
 
     placeholders = {
         "v2x-traj": "~/datasets/v2x-traj",
-        "consider-it-cpm": "~/datasets/ConsiderIt",
+        "consider-it-cpm": "~/datasets/Consider-It",
     }
     valid_roots = discover_valid_roots(root)
     template_roots = {
@@ -116,6 +171,9 @@ def ensure_local_registry_template(path: Path, root: Path) -> None:
         ordered_ids.append(did)
 
     changed = not path.exists()
+    project_dataset_dir = (root / "dataset").resolve()
+    legacy_consider_it_names = {"ConsiderIt", "ConsiderI-It"}
+
     for did in ("v2x-traj", "consider-it-cpm"):
         if did not in by_id:
             by_id[did] = {"id": did}
@@ -129,6 +187,29 @@ def ensure_local_registry_template(path: Path, root: Path) -> None:
             by_id[did]["root"] = template_roots[did]
             changed = True
             continue
+
+        # Normalize known legacy in-repo Consider.it folder names to canonical Consider-It.
+        if did == "consider-it-cpm":
+            try:
+                cur_resolved = resolve_root(cur_root, root)
+            except Exception:
+                cur_resolved = None
+            canonical_raw = str(template_roots.get(did) or "").strip()
+            canonical_ok = bool(canonical_raw) and root_exists(canonical_raw, root)
+            if cur_resolved is not None and canonical_ok:
+                try:
+                    canonical_resolved = resolve_root(canonical_raw, root)
+                except Exception:
+                    canonical_resolved = None
+                if (
+                    canonical_resolved is not None
+                    and cur_resolved.parent == project_dataset_dir
+                    and cur_resolved.name in legacy_consider_it_names
+                    and cur_resolved != canonical_resolved
+                ):
+                    by_id[did]["root"] = str(canonical_resolved)
+                    changed = True
+                    continue
 
         # Auto-heal stale placeholder roots only when we can resolve a valid local path.
         if not cur_ok and did in valid_roots and by_id[did].get("root") != valid_roots[did]:
@@ -170,12 +251,14 @@ def wait_for_health(url: str, timeout_s: float = 8.0) -> bool:
 
 def build_server(root: Path, host: str, port: int) -> ThreadingHTTPServer:
     web_root = (root / "apps" / "web").resolve()
+    profile_store = ProfileStore(root)
     store = DatasetStore(root)
     if not store.specs:
         raise RuntimeError("No datasets configured. Check registry.json / registry.local.json paths.")
 
     server = ThreadingHTTPServer((host, port), AppHandler)
     server.store = store  # type: ignore[attr-defined]
+    server.profile_store = profile_store  # type: ignore[attr-defined]
     server.web_root = web_root  # type: ignore[attr-defined]
     server.repo_root = root  # type: ignore[attr-defined]
     return server
@@ -209,14 +292,18 @@ def main() -> int:
         print("Server did not become healthy in time.")
         return 3
 
+    bridge = DesktopBridge()
+    window = None
     try:
-        webview.create_window(
+        window = webview.create_window(
             APP_NAME,
             url=url,
             width=WINDOW_SIZE[0],
             height=WINDOW_SIZE[1],
             min_size=MIN_WINDOW_SIZE,
+            js_api=bridge,
         )
+        bridge.attach_window(window)
         webview.start(debug=False)
     finally:
         server.shutdown()

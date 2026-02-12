@@ -2,7 +2,17 @@
 
 const $ = (id) => document.getElementById(id);
 
+// Simple heuristic: if not running on the Python backend port (8000/5001) and no pywebview, assume web/static mode.
+const IS_WEB_MODE = !window.pywebview && (location.port !== '8000' && location.port !== '5001');
+if (IS_WEB_MODE) {
+  console.log("Running in Web Mode (Static/GitHub Pages)");
+  document.body.classList.add("is-web-mode");
+}
+
 async function fetchJson(url) {
+  if (IS_WEB_MODE && window.WebBackend && window.WebBackend.fetchJson) {
+    return window.WebBackend.fetchJson(url);
+  }
   const res = await fetch(url);
   if (!res.ok) {
     const text = await res.text();
@@ -12,6 +22,9 @@ async function fetchJson(url) {
 }
 
 async function postJson(url, payload) {
+  if (IS_WEB_MODE && window.WebBackend && window.WebBackend.postJson) {
+    return window.WebBackend.postJson(url, payload);
+  }
   const res = await fetch(url, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -116,7 +129,7 @@ function queueRender() {
     renderQueued = false;
     try {
       render();
-    } catch (_) {}
+    } catch (_) { }
   });
 }
 
@@ -243,7 +256,7 @@ function currentBasemapConfig() {
   if (!Number.isFinite(lat) || !Number.isFinite(lon)) return null;
   return {
     provider,
-    tileUrl: tileUrl || "/api/tiles/osm/{z}/{x}/{y}.png",
+    tileUrl: tileUrl || (IS_WEB_MODE ? "https://tile.openstreetmap.org/{z}/{x}/{y}.png" : "/api/tiles/osm/{z}/{x}/{y}.png"),
     origin: { lat, lon },
   };
 }
@@ -352,25 +365,30 @@ function drawBasemap(ctx, view, cssW, cssH, dpr) {
 
 function drawSceneBackground(ctx, view, cssW, cssH, dpr, bundle) {
   if (!state.sceneBgEnabled) return;
-  const bg = currentSceneBackground(bundle);
-  if (!bg) return;
+  const placement = currentSceneBackgroundPlacement(bundle);
+  if (!placement) return;
+  const bg = placement.background;
   const tile = getTileImage(bg.url);
   if (!tile || tile.status !== "loaded") return;
 
-  const ext = bg.extent;
-  const x0y0 = viewWorldToCanvas(view, cssW, cssH, Number(ext.min_x), Number(ext.max_y));
-  const x1y1 = viewWorldToCanvas(view, cssW, cssH, Number(ext.max_x), Number(ext.min_y));
-  const x0 = Math.min(x0y0[0], x1y1[0]);
-  const y0 = Math.min(x0y0[1], x1y1[1]);
-  const w = Math.abs(x1y1[0] - x0y0[0]);
-  const h = Math.abs(x1y1[1] - x0y0[1]);
+  const [cx, cy] = viewWorldToCanvas(view, cssW, cssH, placement.cx, placement.cy);
+  const w = Math.max(1.0, Math.abs(placement.widthM * view.scale));
+  const h = Math.max(1.0, Math.abs(placement.heightM * view.scale));
   if (!(w > 1 && h > 1)) return;
 
   ctx.save();
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-  ctx.globalAlpha = 0.92;
+  ctx.globalAlpha = placement.alpha;
   ctx.imageSmoothingEnabled = true;
-  ctx.drawImage(tile.img, x0, y0, w, h);
+  ctx.translate(cx, cy);
+  if (placement.rotationDeg) {
+    // Screen Y axis points down, so world rotation sign is inverted on canvas.
+    ctx.rotate(-(Number(placement.rotationDeg) * Math.PI) / 180.0);
+  }
+  if (placement.flipY) {
+    ctx.scale(1, -1);
+  }
+  ctx.drawImage(tile.img, -w * 0.5, -h * 0.5, w, h);
   ctx.restore();
 }
 
@@ -484,7 +502,7 @@ const state = {
   speed: 1,
   showVelocity: false,
   showHeading: false,
-  trajectoryRange: "full", // "past" | "full"
+  trajectoryRange: "full", // "none" | "past" | "full"
   pathCache: null,
   pathAllCache: null,
   holdTL: true,
@@ -492,7 +510,7 @@ const state = {
   mapPadding: 120,
   mapClip: "scene",
   mapMaxLanes: 5000,
-  mapSource: "lanelet2", // none | lanelet2 | orthophoto
+  mapSource: "lanelet2", // none | lanelet2 | orthophoto | overlay
   layers: { ego: true, infra: true, vehicle: true, traffic_light: true },
   mapLayers: { lanes: true, stoplines: true, crosswalks: true, junctions: true },
   types: { VEHICLE: true, VRU: true, PEDESTRIAN: true, BICYCLE: true, OTHER: true, ANIMAL: true, RSU: true, UNKNOWN: true },
@@ -526,6 +544,7 @@ const state = {
   updateInfo: null,
   updateDownloadUrl: "",
   updateBusy: false,
+  sindBgAlignByCity: {},
   sceneTransitionTimer: null,
 };
 
@@ -533,6 +552,7 @@ const req = { intersections: 0, scenes: 0, bundle: 0 };
 
 const LS_LAST_DATASET = "trajExplorer.lastDatasetId";
 const LS_DATASET_SETTINGS = "trajExplorer.datasetSettingsById.v1";
+const LS_SIND_BG_ALIGN = "trajExplorer.sindBgAlignByCity.v1";
 const SS_SOURCE_BY_TYPE = "trajExplorer.sourceByType.v1";
 
 function safeJsonParse(s) {
@@ -586,7 +606,9 @@ function captureDatasetSettings() {
     speed: Number(state.speed || 1),
     showVelocity: !!state.showVelocity,
     showHeading: !!state.showHeading,
-    trajectoryRange: state.trajectoryRange === "past" ? "past" : "full",
+    trajectoryRange: (state.trajectoryRange === "none" || state.trajectoryRange === "past" || state.trajectoryRange === "full")
+      ? state.trajectoryRange
+      : "full",
     holdTL: !!state.holdTL,
     showMap: !!state.showMap,
     sceneBgEnabled: !!state.sceneBgEnabled,
@@ -609,7 +631,7 @@ function captureDatasetSettings() {
 function persistDatasetSettings() {
   try {
     localStorage.setItem(LS_DATASET_SETTINGS, JSON.stringify(state.datasetSettingsById || {}));
-  } catch (_) {}
+  } catch (_) { }
 }
 
 function loadPersistedDatasetSettings() {
@@ -621,7 +643,7 @@ function loadPersistedDatasetSettings() {
 function persistSourceByType() {
   try {
     sessionStorage.setItem(SS_SOURCE_BY_TYPE, JSON.stringify(state.sourceByType || {}));
-  } catch (_) {}
+  } catch (_) { }
 }
 
 function loadPersistedSourceByType() {
@@ -629,7 +651,83 @@ function loadPersistedSourceByType() {
     const raw = safeJsonParse(sessionStorage.getItem(SS_SOURCE_BY_TYPE));
     if (!raw || typeof raw !== "object") return;
     state.sourceByType = raw;
-  } catch (_) {}
+  } catch (_) { }
+}
+
+function defaultSindBgAlign() {
+  return {
+    enabled: true,
+    tx: 0,
+    ty: 0,
+    sx: 1,
+    sy: 1,
+    rotationDeg: 0,
+    alpha: 0.92,
+    flipY: false,
+  };
+}
+
+function isSindDataset(meta = currentDatasetMeta()) {
+  return String((meta && meta.family) || "").trim().toLowerCase() === "sind";
+}
+
+function sindBgAlignCityKey(bundle = state.bundle) {
+  if (!isSindDataset()) return null;
+  if (!bundle || typeof bundle !== "object") return null;
+  const city = String(bundle.city || bundle.intersect_id || "").trim();
+  if (!city) return null;
+  return `${state.datasetId || "sind"}::${city}`;
+}
+
+function persistSindBgAlignStore() {
+  try {
+    localStorage.setItem(LS_SIND_BG_ALIGN, JSON.stringify(state.sindBgAlignByCity || {}));
+  } catch (_) { }
+}
+
+function loadPersistedSindBgAlignStore() {
+  const raw = safeJsonParse(localStorage.getItem(LS_SIND_BG_ALIGN));
+  if (!raw || typeof raw !== "object") return;
+  state.sindBgAlignByCity = raw;
+}
+
+function getSindBgAlign(bundle = state.bundle) {
+  const key = sindBgAlignCityKey(bundle);
+  const base = defaultSindBgAlign();
+  if (!key) return base;
+  const got = state.sindBgAlignByCity && state.sindBgAlignByCity[key];
+  if (!got || typeof got !== "object") return base;
+  const sx = Number(got.sx);
+  const sy = Number(got.sy);
+  const alpha = Number(got.alpha);
+  return {
+    enabled: (got.enabled !== undefined) ? !!got.enabled : true,
+    tx: Number.isFinite(Number(got.tx)) ? Number(got.tx) : 0,
+    ty: Number.isFinite(Number(got.ty)) ? Number(got.ty) : 0,
+    sx: Number.isFinite(sx) && sx > 0 ? sx : 1,
+    sy: Number.isFinite(sy) && sy > 0 ? sy : 1,
+    rotationDeg: Number.isFinite(Number(got.rotationDeg)) ? Number(got.rotationDeg) : 0,
+    alpha: Number.isFinite(alpha) ? clamp(alpha, 0.2, 1.0) : 0.92,
+    flipY: !!got.flipY,
+  };
+}
+
+function setSindBgAlign(partial, bundle = state.bundle) {
+  const key = sindBgAlignCityKey(bundle);
+  if (!key) return;
+  const prev = getSindBgAlign(bundle);
+  const next = { ...prev, ...(partial || {}) };
+  // Keep values numerically stable.
+  next.tx = Number.isFinite(Number(next.tx)) ? Number(next.tx) : 0;
+  next.ty = Number.isFinite(Number(next.ty)) ? Number(next.ty) : 0;
+  next.sx = Number.isFinite(Number(next.sx)) && Number(next.sx) > 0 ? Number(next.sx) : 1;
+  next.sy = Number.isFinite(Number(next.sy)) && Number(next.sy) > 0 ? Number(next.sy) : 1;
+  next.rotationDeg = Number.isFinite(Number(next.rotationDeg)) ? Number(next.rotationDeg) : 0;
+  next.alpha = Number.isFinite(Number(next.alpha)) ? clamp(Number(next.alpha), 0.2, 1.0) : 0.92;
+  next.flipY = !!next.flipY;
+  next.enabled = !!next.enabled;
+  state.sindBgAlignByCity[key] = next;
+  persistSindBgAlignStore();
 }
 
 function saveCurrentDatasetSettings() {
@@ -663,11 +761,11 @@ function restoreDatasetSettings(ds) {
   const legacyTrailFull = (s.trailFull !== undefined) ? !!s.trailFull : undefined;
   const legacyShowPastPaths = (s.showPastPaths !== undefined) ? !!s.showPastPaths : legacyShowTrail;
   const legacyIncludeFuture = (s.pathIncludeFuture !== undefined) ? !!s.pathIncludeFuture : legacyTrailFull;
-  if (s.trajectoryRange === "past" || s.trajectoryRange === "full") {
+  if (s.trajectoryRange === "none" || s.trajectoryRange === "past" || s.trajectoryRange === "full") {
     state.trajectoryRange = s.trajectoryRange;
   } else {
-    // Older settings may have had "trajectories off"; map that to "past" now that the feature is always on.
-    if (legacyShowPastPaths === false) state.trajectoryRange = "past";
+    // Older settings may have had trajectories turned off.
+    if (legacyShowPastPaths === false) state.trajectoryRange = "none";
     else state.trajectoryRange = legacyIncludeFuture === false ? "past" : "full";
   }
   state.holdTL = (s.holdTL !== undefined) ? !!s.holdTL : true;
@@ -694,7 +792,7 @@ function restoreDatasetSettings(ds) {
   state.mapPointsStep = Number.isFinite(Number(s.mapPointsStep)) ? Number(s.mapPointsStep) : defaults.mapPointsStep;
   state.mapPadding = Number.isFinite(Number(s.mapPadding)) ? Number(s.mapPadding) : defaults.mapPadding;
   state.mapMaxLanes = Number.isFinite(Number(s.mapMaxLanes)) ? Number(s.mapMaxLanes) : defaults.mapMaxLanes;
-  state.mapSource = (s.mapSource === "none" || s.mapSource === "orthophoto") ? s.mapSource : "lanelet2";
+  state.mapSource = (s.mapSource === "none" || s.mapSource === "orthophoto" || s.mapSource === "overlay") ? s.mapSource : "lanelet2";
   state.mapLayers = { ...defaults.mapLayers, ...(s.mapLayers || {}) };
 
   state.debugOverlay = !!s.debugOverlay;
@@ -836,8 +934,9 @@ function syncControlsFromState() {
 
   setCheck("showVelocity", state.showVelocity);
   setCheck("showHeading", state.showHeading);
+  setCheck("trajectoryRangeNone", state.trajectoryRange === "none");
   setCheck("trajectoryRangePast", state.trajectoryRange === "past");
-  setCheck("trajectoryRangeFull", state.trajectoryRange !== "past");
+  setCheck("trajectoryRangeFull", state.trajectoryRange === "full");
   setCheck("holdTL", state.holdTL);
   setCheck("sceneTlOnly", state.includeTlOnlyScenes);
   setCheck("showMap", state.showMap);
@@ -895,6 +994,7 @@ function normalizeMapSource(raw) {
   const s = String(raw || "").trim().toLowerCase();
   if (s === "none") return "none";
   if (s === "orthophoto") return "orthophoto";
+  if (s === "overlay") return "overlay";
   return "lanelet2";
 }
 
@@ -907,6 +1007,10 @@ function applyMapSourceSelection(rawSource, { silent = false } = {}) {
     state.basemapEnabled = false;
   } else if (source === "orthophoto") {
     state.showMap = false;
+    state.sceneBgEnabled = true;
+    state.basemapEnabled = false;
+  } else if (source === "overlay") {
+    state.showMap = true;
     state.sceneBgEnabled = true;
     state.basemapEnabled = false;
   } else {
@@ -924,6 +1028,7 @@ function activeMapSourceLabel(bundle = state.bundle) {
   const meta = currentDatasetMeta() || {};
   if (supportsMapSourceSelector(meta)) {
     if (state.mapSource === "orthophoto") return "Orthophoto";
+    if (state.mapSource === "overlay") return "Lanelet2 + orthophoto";
     if (state.mapSource === "none") return "None";
     return "Lanelet2";
   }
@@ -953,13 +1058,14 @@ function syncMapSourceUi(bundle = state.bundle) {
       status.hidden = true;
       status.textContent = "";
     }
+    syncSindBgAlignUi(bundle);
     return;
   }
 
   const bgReady = !!currentSceneBackground(bundle);
   if (select) {
     select.disabled = false;
-    if (state.mapSource === "orthophoto" && !bgReady) {
+    if ((state.mapSource === "orthophoto" || state.mapSource === "overlay") && !bgReady) {
       state.mapSource = "lanelet2";
       state.showMap = true;
       state.sceneBgEnabled = false;
@@ -970,11 +1076,17 @@ function syncMapSourceUi(bundle = state.bundle) {
       optOrth.disabled = !bgReady;
       optOrth.textContent = bgReady ? "Orthophoto image" : "Orthophoto image (unavailable in this scene)";
     }
+    const optOverlay = Array.from(select.options || []).find((o) => o.value === "overlay");
+    if (optOverlay) {
+      optOverlay.disabled = !bgReady;
+      optOverlay.textContent = bgReady ? "Lanelet2 + orthophoto (overlay)" : "Lanelet2 + orthophoto (unavailable in this scene)";
+    }
   }
   if (status) {
     status.hidden = false;
     status.textContent = `Active: ${activeMapSourceLabel(bundle)}`;
   }
+  syncSindBgAlignUi(bundle);
 }
 
 function syncBasemapStatusUi() {
@@ -1020,6 +1132,82 @@ function currentSceneBackground(bundle = state.bundle) {
   return bg;
 }
 
+function currentSceneBackgroundPlacement(bundle = state.bundle) {
+  const bg = currentSceneBackground(bundle);
+  if (!bg) return null;
+  const ext = bg.extent;
+  const minX = Number(ext.min_x);
+  const maxX = Number(ext.max_x);
+  const minY = Number(ext.min_y);
+  const maxY = Number(ext.max_y);
+  if (![minX, maxX, minY, maxY].every((v) => Number.isFinite(v))) return null;
+
+  let cx = 0.5 * (minX + maxX);
+  let cy = 0.5 * (minY + maxY);
+  let widthM = Math.max(1e-6, maxX - minX);
+  let heightM = Math.max(1e-6, maxY - minY);
+  let rotationDeg = 0;
+  let alpha = 0.92;
+  let flipY = false;
+
+  const useSindCalib = isSindDataset() && !!sindBgAlignCityKey(bundle);
+  if (useSindCalib) {
+    const cal = getSindBgAlign(bundle);
+    if (cal.enabled) {
+      cx += Number(cal.tx || 0);
+      cy += Number(cal.ty || 0);
+      widthM *= Math.max(0.05, Number(cal.sx || 1));
+      heightM *= Math.max(0.05, Number(cal.sy || 1));
+      rotationDeg = Number(cal.rotationDeg || 0);
+      alpha = clamp(Number(cal.alpha || 0.92), 0.2, 1.0);
+      flipY = !!cal.flipY;
+    }
+  }
+
+  return {
+    background: bg,
+    cx,
+    cy,
+    widthM,
+    heightM,
+    rotationDeg,
+    alpha,
+    flipY,
+  };
+}
+
+function syncSindBgAlignUi(bundle = state.bundle) {
+  const fold = $("bgAlignSection");
+  const hint = $("bgAlignHint");
+  const show = isSindDataset() && !!currentSceneBackground(bundle) && !!sindBgAlignCityKey(bundle);
+  if (fold) fold.hidden = !show;
+  if (!show) {
+    if (hint) hint.textContent = "";
+    return;
+  }
+
+  const cal = getSindBgAlign(bundle);
+  setCheck("bgAlignEnabled", cal.enabled);
+  setCheck("bgAlignFlipY", cal.flipY);
+  const alphaEl = $("bgAlignAlpha");
+  if (alphaEl) alphaEl.value = String(cal.alpha);
+  const txEl = $("bgAlignTx");
+  if (txEl) txEl.value = String(cal.tx);
+  const tyEl = $("bgAlignTy");
+  if (tyEl) tyEl.value = String(cal.ty);
+  const sxEl = $("bgAlignSx");
+  if (sxEl) sxEl.value = String(cal.sx);
+  const syEl = $("bgAlignSy");
+  if (syEl) syEl.value = String(cal.sy);
+  const rotEl = $("bgAlignRot");
+  if (rotEl) rotEl.value = String(cal.rotationDeg);
+
+  if (hint) {
+    const city = String(bundle.city || bundle.intersect_id || "city");
+    hint.textContent = `City ${city} · tx ${cal.tx.toFixed(1)}m · ty ${cal.ty.toFixed(1)}m · sx ${cal.sx.toFixed(3)} · sy ${cal.sy.toFixed(3)} · rot ${cal.rotationDeg.toFixed(1)}°`;
+  }
+}
+
 function syncSceneBackgroundUi(bundle = state.bundle) {
   const wrap = $("showSceneBgWrap");
   const status = $("sceneBgStatus");
@@ -1031,6 +1219,7 @@ function syncSceneBackgroundUi(bundle = state.bundle) {
       status.hidden = true;
       status.textContent = "";
     }
+    syncSindBgAlignUi(bundle);
     return;
   }
   const hasFeature = !!state.hasSceneBackground;
@@ -1042,13 +1231,18 @@ function syncSceneBackgroundUi(bundle = state.bundle) {
       status.hidden = true;
       status.textContent = "";
     }
+    syncSindBgAlignUi(bundle);
     return;
   }
   if (checkbox) checkbox.disabled = !bg;
-  if (!status) return;
+  if (!status) {
+    syncSindBgAlignUi(bundle);
+    return;
+  }
   if (!bg) {
     status.hidden = false;
     status.textContent = bundle ? "Background image is not available for this scene." : "Load a scene to display the background image.";
+    syncSindBgAlignUi(bundle);
     return;
   }
   const size = (bg.size_px && typeof bg.size_px === "object") ? bg.size_px : null;
@@ -1060,6 +1254,7 @@ function syncSceneBackgroundUi(bundle = state.bundle) {
     : "image ready";
   status.hidden = false;
   status.textContent = rec ? `Recording ${rec} · ${label}` : label;
+  syncSindBgAlignUi(bundle);
 }
 
 function getCanvasSize(canvas) {
@@ -1114,23 +1309,24 @@ function buildAdvancedMetadataPayload(bundle) {
     },
     map: map
       ? {
-          clip_mode: map.clip_mode || null,
-          map_file: map.map_file || null,
-          counts: map.counts || null,
-          lanes_shown: Array.isArray(map.lanes) ? map.lanes.length : 0,
-          stoplines_shown: Array.isArray(map.stoplines) ? map.stoplines.length : 0,
-          crosswalks_shown: Array.isArray(map.crosswalks) ? map.crosswalks.length : 0,
-          junctions_shown: Array.isArray(map.junctions) ? map.junctions.length : 0,
-          lanes_truncated: !!map.lanes_truncated,
-        }
+        clip_mode: map.clip_mode || null,
+        map_file: map.map_file || null,
+        counts: map.counts || null,
+        lanes_shown: Array.isArray(map.lanes) ? map.lanes.length : 0,
+        stoplines_shown: Array.isArray(map.stoplines) ? map.stoplines.length : 0,
+        crosswalks_shown: Array.isArray(map.crosswalks) ? map.crosswalks.length : 0,
+        junctions_shown: Array.isArray(map.junctions) ? map.junctions.length : 0,
+        lanes_truncated: !!map.lanes_truncated,
+      }
       : null,
     background: bg
       ? {
-          recording_id: bg.recording_id || null,
-          url: bg.url || null,
-          extent_bbox: toBBoxArray(bg.extent),
-          size_px: bg.size_px || null,
-        }
+        recording_id: bg.recording_id || null,
+        url: bg.url || null,
+        extent_bbox: toBBoxArray(bg.extent),
+        size_px: bg.size_px || null,
+        alignment: isSindDataset() ? getSindBgAlign(bundle) : null,
+      }
       : null,
   };
 }
@@ -2023,7 +2219,9 @@ function render() {
     }
   }
   let counts = parts.join(" · ");
-  const rangeLabel = state.trajectoryRange === "past" ? "past only" : "past + future";
+  const rangeLabel = state.trajectoryRange === "none"
+    ? "hidden"
+    : (state.trajectoryRange === "past" ? "history tracks" : "full track");
   counts += ` · Trajectories: ${rangeLabel}`;
   $("countsLabel").textContent = counts;
 
@@ -2159,21 +2357,23 @@ function render() {
       return;
     }
 
-    // Past-only mode.
+    // History-only mode.
     drawSegment(0, k, 0.92, 3.0, null, true);
   };
 
   // Trajectories for all objects in scene.
-  for (const modality of agentModalitiesOrdered()) {
-    if (!state.layers[modality]) continue;
-    const tracks = getAllTracksFor(modality);
-    if (!tracks) continue;
-    for (const tr of tracks.values()) {
-      const metaRec = tr.meta || {};
-      if (!shouldDrawRec(modality, metaRec)) continue;
-      const st = recSubType(metaRec);
-      const col = (st && st !== "UNKNOWN") ? colorForRec(metaRec) : null;
-      drawTrajectory(modality, tr.pts, tr.frames, 0.55, col);
+  if (state.trajectoryRange !== "none") {
+    for (const modality of agentModalitiesOrdered()) {
+      if (!state.layers[modality]) continue;
+      const tracks = getAllTracksFor(modality);
+      if (!tracks) continue;
+      for (const tr of tracks.values()) {
+        const metaRec = tr.meta || {};
+        if (!shouldDrawRec(modality, metaRec)) continue;
+        const st = recSubType(metaRec);
+        const col = (st && st !== "UNKNOWN") ? colorForRec(metaRec) : null;
+        drawTrajectory(modality, tr.pts, tr.frames, 0.55, col);
+      }
     }
   }
 
@@ -2257,7 +2457,9 @@ function updateSceneInfo(extraLines = []) {
       key: state.selectedKey,
       frame_record: state.selected || null,
       trajectory_mode: {
-        range: state.trajectoryRange === "past" ? "past" : "full",
+        range: (state.trajectoryRange === "none" || state.trajectoryRange === "past" || state.trajectoryRange === "full")
+          ? state.trajectoryRange
+          : "full",
         points: ptsN,
         past_points: pastN,
       },
@@ -2746,8 +2948,21 @@ async function loadDatasets() {
   if (sel) sel.innerHTML = "";
   state.datasetsById = {};
   const supportedIds = [];
-  for (const ds of data.datasets || []) {
-    if (!ds || !ds.id) continue;
+  for (const raw of data.datasets || []) {
+    if (!raw || !raw.id) continue;
+    const id = String(raw.id || "").trim();
+    if (!id) continue;
+    const appSpec = (raw.app && typeof raw.app === "object") ? raw.app : {};
+    const family = String(raw.family || appSpec.family || "").trim().toLowerCase();
+    const supported = (typeof raw.supported === "boolean")
+      ? raw.supported
+      : ((typeof appSpec.supported === "boolean") ? appSpec.supported : true);
+    const ds = {
+      ...raw,
+      id,
+      family: family || String(raw.family || "").trim().toLowerCase(),
+      supported,
+    };
     // Only surface datasets that the backend can actually serve (adapter exists).
     if (ds.supported === false) continue;
     state.datasetsById[ds.id] = ds;
@@ -2773,19 +2988,52 @@ async function loadDatasets() {
 }
 
 async function loadCatalog() {
+  function staticCatalogFallback() {
+    try {
+      const raw = (window.WebBackend && Array.isArray(window.WebBackend.STATIC_CATALOG))
+        ? window.WebBackend.STATIC_CATALOG
+        : [];
+      return Array.isArray(raw) ? raw.filter((it) => it && it.id) : [];
+    } catch (_) {
+      return [];
+    }
+  }
+
+  function mergeCatalogItems(primary, fallback) {
+    const out = [];
+    const seen = new Set();
+    for (const it of primary || []) {
+      if (!it || !it.id) continue;
+      const id = String(it.id);
+      if (seen.has(id)) continue;
+      seen.add(id);
+      out.push(it);
+    }
+    for (const it of fallback || []) {
+      if (!it || !it.id) continue;
+      const id = String(it.id);
+      if (seen.has(id)) continue;
+      seen.add(id);
+      out.push(it);
+    }
+    return out;
+  }
+
   state.catalogById = {};
   state.catalogDatasets = [];
+  let apiItems = [];
   try {
     const data = await fetchJson("/api/catalog");
-    const items = Array.isArray(data.datasets) ? data.datasets : [];
-    state.catalogDatasets = items;
-    for (const it of items) {
-      if (it && it.id) state.catalogById[String(it.id)] = it;
-    }
+    apiItems = Array.isArray(data.datasets) ? data.datasets : [];
   } catch (e) {
-    // Catalog is optional; the app can still run with only /api/datasets.
-    state.catalogById = {};
-    state.catalogDatasets = [];
+    apiItems = [];
+  }
+
+  // Keep landing-page cards stable even when /api/catalog is missing/incomplete.
+  const items = mergeCatalogItems(apiItems, staticCatalogFallback());
+  state.catalogDatasets = items;
+  for (const it of items) {
+    if (it && it.id) state.catalogById[String(it.id)] = it;
   }
 }
 
@@ -2874,9 +3122,16 @@ function datasetTypeFromFamily(family) {
   return "";
 }
 
-function datasetTypeFromMeta(meta) {
+function datasetFamilyFromMeta(meta) {
   if (!meta || typeof meta !== "object") return "";
-  return datasetTypeFromFamily(meta.family);
+  const direct = String(meta.family || "").trim().toLowerCase();
+  if (direct) return direct;
+  const app = (meta.app && typeof meta.app === "object") ? meta.app : null;
+  return String((app && app.family) || "").trim().toLowerCase();
+}
+
+function datasetTypeFromMeta(meta) {
+  return datasetTypeFromFamily(datasetFamilyFromMeta(meta));
 }
 
 function supportedLocalFamily(family) {
@@ -2982,7 +3237,14 @@ function virtualDatasetMeta(datasetId, title, family) {
 function ensureDatasetMetaForCard(datasetId) {
   const did = String(datasetId || "").trim();
   if (!did) return null;
-  if (state.datasetsById && state.datasetsById[did]) return state.datasetsById[did];
+  if (state.datasetsById && state.datasetsById[did]) {
+    const existing = state.datasetsById[did];
+    const fam = datasetFamilyFromMeta(existing);
+    if (fam && String(existing.family || "").trim().toLowerCase() !== fam) {
+      state.datasetsById[did] = { ...existing, family: fam };
+    }
+    return state.datasetsById[did];
+  }
   const cat = (state.catalogById && state.catalogById[did]) ? state.catalogById[did] : null;
   if (!cat || typeof cat !== "object") return null;
   const app = (cat.app && typeof cat.app === "object") ? cat.app : {};
@@ -3076,48 +3338,8 @@ function sourceState(datasetType) {
 function updateExplorerHeaderContext() {
   const meta = currentDatasetMeta() || {};
   const datasetName = String(meta.title || state.datasetId || "Dataset").trim() || "Dataset";
-  const datasetType = datasetTypeFromMeta(meta);
-
   const datasetChip = $("activeDatasetName");
   if (datasetChip) datasetChip.textContent = datasetName;
-
-  const breadcrumb = $("explorerBreadcrumb");
-  if (breadcrumb) breadcrumb.textContent = `Home / ${datasetName} / Explorer`;
-
-  const loadChip = $("activeDatasetLoadState");
-  const folderEl = $("activeDatasetFolder");
-
-  let folderPath = "";
-  let folderName = "";
-  if (datasetType) {
-    const src = sourceState(datasetType);
-    folderPath = String(src.folderPath || "").trim();
-    folderName = String(src.folderName || folderNameFromPath(folderPath) || "").trim();
-  }
-  const loaded = !!folderPath;
-
-  if (loadChip) {
-    loadChip.classList.remove("chip--yes", "chip--no");
-    if (loaded) {
-      loadChip.textContent = "Loaded";
-      loadChip.classList.add("chip--yes");
-    } else {
-      loadChip.textContent = "Not loaded";
-      loadChip.classList.add("chip--no");
-    }
-  }
-
-  if (folderEl) {
-    if (loaded && folderName) {
-      folderEl.hidden = false;
-      folderEl.textContent = `Folder: ${folderName}`;
-      folderEl.title = folderPath;
-    } else {
-      folderEl.hidden = true;
-      folderEl.textContent = "";
-      folderEl.title = "";
-    }
-  }
 }
 
 function hasLoadedSourceForMeta(meta) {
@@ -3133,6 +3355,19 @@ function isDesktopPickerAvailable(methodName) {
 }
 
 async function pickPathsDesktop(methodName, fallbackPrompt, defaultPath = "") {
+  if (IS_WEB_MODE && window.WebFS && methodName === 'pick_folder') {
+    if (window.WebFS.isSupported && !window.WebFS.isSupported()) {
+      alert("Your browser does not support the File System Access API (needed for local file access). Please use Chrome, Edge, or Opera.");
+      return [];
+    }
+    try {
+      const handle = await window.WebFS.pickDirectory();
+      return handle ? [handle.name] : [];
+    } catch (e) {
+      console.error("Picker error:", e);
+      return [];
+    }
+  }
   if (isDesktopPickerAvailable(methodName)) {
     try {
       const raw = await window.pywebview.api[methodName]();
@@ -3240,6 +3475,41 @@ function expectedDatasetLayoutHint(datasetType) {
   return "";
 }
 
+function datasetTypeDisplayName(datasetType) {
+  const t = String(datasetType || "").trim().toLowerCase();
+  if (t === "v2x_traj") return "V2X-Traj";
+  if (t === "v2x_seq") return "V2X-Seq";
+  if (t === "consider_it_cpm") return "Consider.it";
+  if (t === "ind") return "inD";
+  if (t === "sind") return "SinD";
+  return "this dataset";
+}
+
+function friendlyLoadFailureMessage(err, datasetType) {
+  const raw = String((err && err.message) ? err.message : (err || "")).trim();
+  const low = raw.toLowerCase();
+  const name = datasetTypeDisplayName(datasetType);
+
+  if (
+    !raw
+    || low.includes("could not detect dataset profile")
+    || low.includes("validation failed")
+    || low.includes("required")
+    || low.includes("expected")
+    || low.includes("missing")
+    || low.includes("schema")
+    || low.includes("column")
+  ) {
+    return `Wrong folder for ${name}. Please select the correct dataset root.`;
+  }
+  if (low.includes("native folder picker is unavailable")) {
+    return "Folder picker is unavailable. Please run the app locally and try again.";
+  }
+  return raw.length > 140
+    ? `Could not load folder for ${name}. Please try again with the dataset root folder.`
+    : raw;
+}
+
 function sourceIssueMessage(validation, datasetType) {
   const errors = Array.isArray(validation && validation.errors) ? validation.errors : [];
   const warnings = Array.isArray(validation && validation.warnings) ? validation.warnings : [];
@@ -3339,7 +3609,7 @@ async function loadDatasetFromFolder(folderPathIn) {
     await openExplorerForDataset(runtimeDatasetId, { savePrev: false });
     setConnectResult(src.hint, src.tone);
   } catch (e) {
-    const msg = `Load failed: ${e && e.message ? e.message : String(e)}`;
+    const msg = friendlyLoadFailureMessage(e, datasetType);
     src.hint = msg;
     src.tone = "bad";
     persistSourceByType();
@@ -3960,12 +4230,6 @@ function renderHomeProfilesList() {
     .join("");
 }
 
-function yesNoChip(label, v) {
-  const vv = (v === true) ? "Yes" : (v === false) ? "No" : "?";
-  const cls = (v === true) ? "chip chip--yes" : (v === false) ? "chip chip--no" : "chip";
-  return `<span class="${cls}">${escapeHtml(label)}: ${escapeHtml(vv)}</span>`;
-}
-
 function prettyCategoryLabel(s) {
   const v = String(s || "").trim();
   if (!v) return null;
@@ -4070,9 +4334,13 @@ function renderHomeDatasetCards() {
     return !q || hay.includes(q);
   });
 
+  const hasFilters = !!(q || catFilter || mapFilter || tlFilter);
+  const showNoMatchFallback = hasFilters && items.length > 0 && filtered.length === 0;
+  const displayItems = showNoMatchFallback ? items : filtered;
+
   const installed = [];
   const catalogOnly = [];
-  for (const it of filtered) {
+  for (const it of displayItems) {
     const ds = state.datasetsById ? state.datasetsById[it.id] : null;
     if (ds && !ds.virtual) installed.push(it);
     else catalogOnly.push(it);
@@ -4110,12 +4378,12 @@ function renderHomeDatasetCards() {
     const totalCatalog = (state.catalogDatasets || []).length;
     const totalInstalled = Object.keys(state.datasetsById || {}).length;
     const totalProfiles = Array.isArray(state.profiles) ? state.profiles.length : 0;
-    const showing = filtered.length;
+    const showing = displayItems.length;
     const chips = [];
     chips.push(`<span class="chip chip--yes">Available: ${totalInstalled}</span>`);
     chips.push(`<span class="chip">Connections: ${totalProfiles}</span>`);
     if (totalCatalog) chips.push(`<span class="chip">Catalog: ${totalCatalog}</span>`);
-    if (q || catFilter || mapFilter || tlFilter) chips.push(`<span class="chip">Showing: ${showing}</span>`);
+    if (hasFilters) chips.push(`<span class="chip">Showing: ${showing}</span>`);
     statsEl.innerHTML = chips.join("");
   }
 
@@ -4133,25 +4401,48 @@ function renderHomeDatasetCards() {
         const active = state.datasetId && String(it.id) === String(state.datasetId);
 
         const caps = it.capabilities || {};
-        const chips = [];
         const catLabel = prettyCategoryLabel(it.category);
-        if (catLabel) chips.push(`<span class="chip">Category: ${escapeHtml(catLabel)}</span>`);
-        chips.push(yesNoChip("HD map", caps.has_map));
-        chips.push(yesNoChip("Traffic lights", caps.has_traffic_lights));
-        if (caps.coordinate_frame) chips.push(`<span class="chip">Frame: ${escapeHtml(caps.coordinate_frame)}</span>`);
-        if (caps.scene_unit) chips.push(`<span class="chip">Scene: ${escapeHtml(caps.scene_unit)}</span>`);
-        if (ds && Array.isArray(ds.splits)) chips.push(`<span class="chip">Splits: ${escapeHtml(ds.splits.map(splitLabel).join(" · "))}</span>`);
-        if (ds && ds.group_label) chips.push(`<span class="chip">Group: ${escapeHtml(ds.group_label)}</span>`);
+        const splits = ds && Array.isArray(ds.splits) && ds.splits.length
+          ? ds.splits.map(splitLabel).join(" · ")
+          : "";
 
-        const links = (Array.isArray(it.links) ? it.links : []).slice(0, 4);
-        const linkHtml = links
-          .map((l) => {
-            const href = l && l.url ? String(l.url) : "";
-            const label = l && l.label ? String(l.label) : "Link";
-            if (!href) return "";
-            return `<a class="linkPill" href="${escapeHtml(href)}" target="_blank" rel="noreferrer">${escapeHtml(label)}</a>`;
-          })
-          .filter(Boolean)
+        const coreFacts = [];
+        if (catLabel) coreFacts.push(["Category", catLabel]);
+        if (caps.coordinate_frame) coreFacts.push(["Frame", String(caps.coordinate_frame)]);
+        if (caps.scene_unit) coreFacts.push(["Scene", String(caps.scene_unit)]);
+        if (splits) coreFacts.push(["Splits", splits]);
+        const factsHtml = coreFacts.length
+          ? `<div class="dsFacts">${coreFacts.map(([k, v]) => `<div class="dsFact"><span class="dsFact__label">${escapeHtml(k)}</span><span class="dsFact__value">${escapeHtml(v)}</span></div>`).join("")}</div>`
+          : "";
+
+        function capabilityPill(label, value) {
+          const cls = value === true ? "dsCap dsCap--yes" : (value === false ? "dsCap dsCap--no" : "dsCap dsCap--unknown");
+          const val = value === true ? "Yes" : (value === false ? "No" : "Unknown");
+          return `<span class="${cls}">${escapeHtml(label)}: ${escapeHtml(val)}</span>`;
+        }
+        const capsHtml = `<div class="dsCaps">${capabilityPill("HD map", caps.has_map)}${capabilityPill("Traffic lights", caps.has_traffic_lights)}</div>`;
+
+        function linkPriority(label) {
+          const s = String(label || "").toLowerCase();
+          if (s.includes("paper") || s.includes("arxiv")) return 3;
+          if (s.includes("code") || s.includes("github") || s.includes("project")) return 2;
+          return 1;
+        }
+        const links = (Array.isArray(it.links) ? it.links : [])
+          .map((l) => ({
+            href: l && l.url ? String(l.url).trim() : "",
+            label: l && l.label ? String(l.label).trim() : "Link",
+          }))
+          .filter((l) => l.href);
+        links.sort((a, b) => {
+          const pr = linkPriority(b.label) - linkPriority(a.label);
+          if (pr) return pr;
+          return a.label.localeCompare(b.label);
+        });
+        const primaryLinks = links.slice(0, 2);
+        const extraLinks = links.slice(2, 5);
+        const linkHtml = primaryLinks
+          .map((l) => `<a class="dsActionLink" href="${escapeHtml(l.href)}" target="_blank" rel="noreferrer">${escapeHtml(l.label)}</a>`)
           .join("");
 
         const titleLine = escapeHtml(it.title || it.id || "Dataset");
@@ -4159,16 +4450,28 @@ function renderHomeDatasetCards() {
         const meta = metaBits.length ? `<div class="dsCard__meta">${escapeHtml(metaBits.join(" · "))}</div>` : "";
 
         const summary = String(it.summary || "").trim();
-        const summaryHtml = summary ? `<div class="dsSummary">${escapeHtml(summary)}</div>` : "";
+        const highlights = (Array.isArray(it.highlights) ? it.highlights : []).map((x) => String(x || "").trim()).filter(Boolean).slice(0, 4);
+        const summaryCompact = summary || (highlights.length ? highlights[0] : "");
+        const summaryHtml = summaryCompact ? `<p class="dsSummary dsSummary--compact">${escapeHtml(summaryCompact)}</p>` : "";
 
-        const highlights = (Array.isArray(it.highlights) ? it.highlights : []).map((x) => String(x || "").trim()).filter(Boolean).slice(0, 3);
-        const hiHtml = highlights.length
-          ? `<div class="dsHighlights">${highlights.map((h) => `<div class="dsHi">• ${escapeHtml(h)}</div>`).join("")}</div>`
+        const detailFacts = [];
+        if (ds && ds.group_label) detailFacts.push(["Group", String(ds.group_label)]);
+        const detailFactsHtml = detailFacts.length
+          ? `<div class="dsDetailFacts">${detailFacts.map(([k, v]) => `<div class="dsDetailFact"><span class="dsDetailFact__label">${escapeHtml(k)}</span><span class="dsDetailFact__value">${escapeHtml(v)}</span></div>`).join("")}</div>`
+          : "";
+        const detailHighlightsHtml = highlights.length
+          ? `<ul class="dsDetailList">${highlights.map((h) => `<li>${escapeHtml(h)}</li>`).join("")}</ul>`
+          : "";
+        const detailLinksHtml = extraLinks.length
+          ? `<div class="dsDetailLinks">${extraLinks.map((l) => `<a class="dsDetailLink" href="${escapeHtml(l.href)}" target="_blank" rel="noreferrer">${escapeHtml(l.label)}</a>`).join("")}</div>`
+          : "";
+        const detailsHtml = (summary || detailFacts.length || highlights.length > 1 || extraLinks.length)
+          ? `<details class="dsDetails"><summary>More details</summary><div class="dsDetails__body">${summary ? `<p class="dsDetailText">${escapeHtml(summary)}</p>` : ""}${detailHighlightsHtml}${detailFactsHtml}${detailLinksHtml}</div></details>`
           : "";
 
         const btnHtml = isSupported
-          ? `<button class="btn" type="button" data-open-dataset="${escapeHtml(it.id)}">Open Explorer</button>`
-          : `<button class="btn btn--ghost" type="button" disabled>Planned</button>`;
+          ? `<button class="btn btn--sm" type="button" data-open-dataset="${escapeHtml(it.id)}">Open Explorer</button>`
+          : `<button class="btn btn--ghost btn--sm" type="button" disabled>Planned</button>`;
 
         return `
           <article class="dsCard${active ? " dsCard--active" : ""}">
@@ -4180,11 +4483,12 @@ function renderHomeDatasetCards() {
               <span class="${tagCls}">${escapeHtml(tagText)}</span>
             </div>
             ${summaryHtml}
-            ${hiHtml}
-            <div class="dsChips">${chips.join("")}</div>
+            ${factsHtml}
+            ${capsHtml}
+            ${detailsHtml}
             <div class="dsActions">
-              ${btnHtml}
-              <div class="dsLinks">${linkHtml}</div>
+              <div class="dsActions__primary">${btnHtml}</div>
+              ${linkHtml ? `<div class="dsActionLinks">${linkHtml}</div>` : ""}
             </div>
           </article>
         `;
@@ -4199,7 +4503,19 @@ function renderHomeDatasetCards() {
     `;
   }
 
+  const fallbackNotice = showNoMatchFallback
+    ? `
+      <div class="dsEmpty">
+        <div>No exact match for current search/filters. Showing all datasets.</div>
+        <div style="margin-top:8px;">
+          <button id="homeClearFiltersBtn" class="btn btn--ghost btn--sm" type="button">Clear filters</button>
+        </div>
+      </div>
+    `
+    : "";
+
   const html = [
+    fallbackNotice,
     section("Available now", installed),
     section("Dataset catalog", catalogOnly),
   ]
@@ -4207,10 +4523,74 @@ function renderHomeDatasetCards() {
     .join("\n");
 
   if (!html) {
-    wrap.innerHTML = `<div class="dsEmpty">No datasets match your search/filters.</div>`;
+    const hasAnyDatasets = items.length > 0;
+    if (!hasAnyDatasets) {
+      if (IS_WEB_MODE) {
+        wrap.innerHTML = `<div class="dsEmpty">No datasets loaded yet.<br>Click "Load dataset directory..." to open a local V2X-Traj folder.</div>`;
+      } else {
+        wrap.innerHTML = `<div class="dsEmpty">No datasets are available right now. Try reloading the app.</div>`;
+      }
+      return;
+    }
+    if (hasFilters) {
+      wrap.innerHTML = `
+        <div class="dsEmpty">
+          <div>No exact match for current search/filters.</div>
+          <div style="margin-top:8px;">
+            <button id="homeClearFiltersBtn" class="btn btn--ghost btn--sm" type="button">Clear filters</button>
+          </div>
+        </div>
+      `;
+      const clearBtn = $("homeClearFiltersBtn");
+      if (clearBtn) {
+        clearBtn.addEventListener("click", () => {
+          state.homeSearch = "";
+          state.homeCategory = "";
+          state.homeHasMap = "";
+          state.homeHasTL = "";
+          state.homeSort = "available";
+          const search = $("homeSearch");
+          if (search) search.value = "";
+          const cat = $("homeCategory");
+          if (cat) cat.value = "";
+          const map = $("homeHasMap");
+          if (map) map.value = "";
+          const tl = $("homeHasTL");
+          if (tl) tl.value = "";
+          const sort = $("homeSort");
+          if (sort) sort.value = "available";
+          renderHomeDatasetCards();
+        });
+      }
+      return;
+    }
+    wrap.innerHTML = `<div class="dsEmpty">No datasets are available in this view.</div>`;
     return;
   }
   wrap.innerHTML = html;
+  if (showNoMatchFallback) {
+    const clearBtn = $("homeClearFiltersBtn");
+    if (clearBtn) {
+      clearBtn.addEventListener("click", () => {
+        state.homeSearch = "";
+        state.homeCategory = "";
+        state.homeHasMap = "";
+        state.homeHasTL = "";
+        state.homeSort = "available";
+        const search = $("homeSearch");
+        if (search) search.value = "";
+        const cat = $("homeCategory");
+        if (cat) cat.value = "";
+        const map = $("homeHasMap");
+        if (map) map.value = "";
+        const tl = $("homeHasTL");
+        if (tl) tl.value = "";
+        const sort = $("homeSort");
+        if (sort) sort.value = "available";
+        renderHomeDatasetCards();
+      });
+    }
+  }
 }
 
 function setHomeError(msg) {
@@ -4289,8 +4669,18 @@ async function checkForUpdates({ force = false, userInitiated = false } = {}) {
     state.updateDownloadUrl = String((data && (data.download_url || data.release_url || "")) || "").trim();
 
     if (!data || data.ok === false) {
-      const err = data && data.error ? String(data.error) : "Update check failed.";
+      const rawErr = data && data.error ? String(data.error) : "Update check failed.";
+      const lowErr = rawErr.toLowerCase();
+      const err = lowErr.includes("http error 404")
+        ? "No published release found yet for this repository."
+        : rawErr;
       setUpdateHint(err, userInitiated ? "bad" : "");
+      syncUpdateUi();
+      return;
+    }
+
+    if (data.comparison_mode === "no_releases") {
+      if (userInitiated) setUpdateHint("No published release found yet (or only drafts exist).", "warn");
       syncUpdateUi();
       return;
     }
@@ -4308,7 +4698,8 @@ async function checkForUpdates({ force = false, userInitiated = false } = {}) {
     }
 
     if (userInitiated) {
-      setUpdateHint(`You are up to date (${current || "current version"}).`, "ok");
+      const suffix = data.release_prerelease ? " · latest channel is prerelease." : "";
+      setUpdateHint(`You are up to date (${current || "current version"})${suffix}`, "ok");
     }
   } catch (e) {
     const msg = `Update check failed: ${e && e.message ? e.message : String(e)}`;
@@ -4432,7 +4823,7 @@ async function openExplorerForDataset(datasetId, { savePrev = true, loadData = t
   state.datasetId = next;
   try {
     localStorage.setItem(LS_LAST_DATASET, next);
-  } catch (_) {}
+  } catch (_) { }
 
   // Dataset meta first (splits + group label + map controls), then restore prefs.
   applyDatasetUi();
@@ -4673,7 +5064,7 @@ function wireUi() {
   const checkUpdateBtn = $("checkUpdateBtn");
   if (checkUpdateBtn) {
     checkUpdateBtn.addEventListener("click", () => {
-      checkForUpdates({ force: true, userInitiated: true }).catch(() => {});
+      checkForUpdates({ force: true, userInitiated: true }).catch(() => { });
     });
   }
 
@@ -4684,7 +5075,7 @@ function wireUi() {
       if (!url) return;
       try {
         window.open(url, "_blank", "noopener");
-      } catch (_) {}
+      } catch (_) { }
     });
   }
 
@@ -4818,10 +5209,10 @@ function wireUi() {
   };
 
   $("prevSceneBtn").addEventListener("click", () => {
-    goScene(-1).catch(() => {});
+    goScene(-1).catch(() => { });
   });
   $("nextSceneBtn").addEventListener("click", () => {
-    goScene(1).catch(() => {});
+    goScene(1).catch(() => { });
   });
 
   const jumpToScene = async (raw) => {
@@ -4876,13 +5267,13 @@ function wireUi() {
   };
 
   $("sceneGoBtn").addEventListener("click", () => {
-    jumpToScene($("sceneJumpInput").value).catch(() => {});
+    jumpToScene($("sceneJumpInput").value).catch(() => { });
   });
 
   $("sceneJumpInput").addEventListener("keydown", (ev) => {
     if (ev.key === "Enter") {
       ev.preventDefault();
-      jumpToScene($("sceneJumpInput").value).catch(() => {});
+      jumpToScene($("sceneJumpInput").value).catch(() => { });
     }
   });
 
@@ -4930,6 +5321,84 @@ function wireUi() {
   if (mapSourceSel) {
     mapSourceSel.addEventListener("change", (e) => {
       applyMapSourceSelection(String(e.target.value || "lanelet2"));
+    });
+  }
+
+  const commitBgAlign = (patch = {}) => {
+    if (!isSindDataset() || !state.bundle) return;
+    setSindBgAlign(patch, state.bundle);
+    syncSindBgAlignUi(state.bundle);
+    render();
+  };
+
+  const bindBgAlignNumber = (id, key, { min = null, max = null } = {}) => {
+    const el = $(id);
+    if (!el) return;
+    const onChange = () => {
+      let v = Number(el.value);
+      if (!Number.isFinite(v)) return;
+      if (min != null) v = Math.max(min, v);
+      if (max != null) v = Math.min(max, v);
+      commitBgAlign({ [key]: v });
+    };
+    el.addEventListener("change", onChange);
+    el.addEventListener("blur", onChange);
+  };
+
+  const bindBgAlignCheck = (id, key) => {
+    const el = $(id);
+    if (!el) return;
+    el.addEventListener("change", (e) => {
+      commitBgAlign({ [key]: !!e.target.checked });
+    });
+  };
+
+  bindBgAlignCheck("bgAlignEnabled", "enabled");
+  bindBgAlignCheck("bgAlignFlipY", "flipY");
+  bindBgAlignNumber("bgAlignTx", "tx");
+  bindBgAlignNumber("bgAlignTy", "ty");
+  bindBgAlignNumber("bgAlignSx", "sx", { min: 0.05, max: 10 });
+  bindBgAlignNumber("bgAlignSy", "sy", { min: 0.05, max: 10 });
+  bindBgAlignNumber("bgAlignRot", "rotationDeg", { min: -180, max: 180 });
+  const alphaEl = $("bgAlignAlpha");
+  if (alphaEl) {
+    alphaEl.addEventListener("input", () => {
+      const v = Number(alphaEl.value);
+      if (!Number.isFinite(v)) return;
+      commitBgAlign({ alpha: clamp(v, 0.2, 1.0) });
+    });
+  }
+  const resetAlignBtn = $("bgAlignResetBtn");
+  if (resetAlignBtn) {
+    resetAlignBtn.addEventListener("click", () => {
+      if (!isSindDataset() || !state.bundle) return;
+      const key = sindBgAlignCityKey(state.bundle);
+      if (!key) return;
+      state.sindBgAlignByCity[key] = defaultSindBgAlign();
+      persistSindBgAlignStore();
+      syncSindBgAlignUi(state.bundle);
+      render();
+    });
+  }
+  const copyAlignBtn = $("bgAlignCopyBtn");
+  if (copyAlignBtn) {
+    copyAlignBtn.addEventListener("click", async () => {
+      if (!isSindDataset() || !state.bundle) return;
+      const city = String(state.bundle.city || state.bundle.intersect_id || "city");
+      const payload = { city, ...getSindBgAlign(state.bundle) };
+      const text = JSON.stringify(payload, null, 2);
+      let ok = false;
+      try {
+        await navigator.clipboard.writeText(text);
+        ok = true;
+      } catch (_) {
+        ok = false;
+      }
+      const prev = String(copyAlignBtn.textContent || "Copy values");
+      copyAlignBtn.textContent = ok ? "Copied" : "Copy failed";
+      setTimeout(() => {
+        copyAlignBtn.textContent = prev;
+      }, 1000);
     });
   }
 
@@ -5006,15 +5475,27 @@ function wireUi() {
     });
   }
 
+  const setTrajectoryRangeUi = () => {
+    setCheck("trajectoryRangeNone", state.trajectoryRange === "none");
+    setCheck("trajectoryRangePast", state.trajectoryRange === "past");
+    setCheck("trajectoryRangeFull", state.trajectoryRange === "full");
+  };
+
   const bindTrajectoryRange = (id, value) => {
     const el = $(id);
     if (!el) return;
     el.addEventListener("change", (e) => {
-      if (!e.target.checked) return;
+      if (!e.target.checked) {
+        // Keep this control single-select even though it is rendered as checkboxes.
+        setTrajectoryRangeUi();
+        return;
+      }
       state.trajectoryRange = value;
+      setTrajectoryRangeUi();
       render();
     });
   };
+  bindTrajectoryRange("trajectoryRangeNone", "none");
   bindTrajectoryRange("trajectoryRangePast", "past");
   bindTrajectoryRange("trajectoryRangeFull", "full");
   bindCheck("holdTL", (v) => (state.holdTL = v));
@@ -5100,27 +5581,27 @@ function wireUi() {
     isDown = false;
     try {
       canvas.releasePointerCapture(ev.pointerId);
-    } catch (_) {}
+    } catch (_) { }
     if (!moved) {
       const rect = canvas.getBoundingClientRect();
       const cx = ev.clientX - rect.left;
       const cy = ev.clientY - rect.top;
-	      const picked = pickNearestAgentAt(cx, cy);
-	      if (!picked) {
-	        state.selectedKey = null;
-	        state.selected = null;
-	        resetPathCache();
-	        updateSceneInfo();
-	        render();
-	        return;
-	      }
-	      state.selectedKey = { modality: picked.modality, id: picked.rec.id };
-	      state.selected = { modality: picked.modality, ...picked.rec };
-	      resetPathCache();
-	      updateSceneInfo();
-	      render();
-	    }
-	  };
+      const picked = pickNearestAgentAt(cx, cy);
+      if (!picked) {
+        state.selectedKey = null;
+        state.selected = null;
+        resetPathCache();
+        updateSceneInfo();
+        render();
+        return;
+      }
+      state.selectedKey = { modality: picked.modality, id: picked.rec.id };
+      state.selected = { modality: picked.modality, ...picked.rec };
+      resetPathCache();
+      updateSceneInfo();
+      render();
+    }
+  };
 
   canvas.addEventListener("pointerup", endPointer);
   canvas.addEventListener("pointercancel", () => {
@@ -5193,22 +5674,22 @@ function wireUi() {
 
     if (ev.key && (ev.key === "n" || ev.key === "N") && !ev.metaKey && !ev.ctrlKey && !ev.altKey) {
       ev.preventDefault();
-      goScene(1).catch(() => {});
+      goScene(1).catch(() => { });
       return;
     }
     if (ev.key && (ev.key === "p" || ev.key === "P") && !ev.metaKey && !ev.ctrlKey && !ev.altKey) {
       ev.preventDefault();
-      goScene(-1).catch(() => {});
+      goScene(-1).catch(() => { });
       return;
     }
     if (ev.code === "PageDown") {
       ev.preventDefault();
-      goScene(1).catch(() => {});
+      goScene(1).catch(() => { });
       return;
     }
     if (ev.code === "PageUp") {
       ev.preventDefault();
-      goScene(-1).catch(() => {});
+      goScene(-1).catch(() => { });
       return;
     }
   });
@@ -5346,13 +5827,13 @@ function wireHomeUi() {
   const wizDetectBtn = $("wizDetectBtn");
   if (wizDetectBtn) {
     wizDetectBtn.addEventListener("click", () => {
-      wizardDetect().catch(() => {});
+      wizardDetect().catch(() => { });
     });
   }
   const wizValidateBtn = $("wizValidateBtn");
   if (wizValidateBtn) {
     wizValidateBtn.addEventListener("click", () => {
-      wizardValidate().catch(() => {});
+      wizardValidate().catch(() => { });
     });
   }
 
@@ -5391,7 +5872,7 @@ function wireHomeUi() {
   const wizSaveBtn = $("wizSaveBtn");
   if (wizSaveBtn) {
     wizSaveBtn.addEventListener("click", () => {
-      saveConnectionProfileFromWizard().catch(() => {});
+      saveConnectionProfileFromWizard().catch(() => { });
     });
   }
 
@@ -5435,6 +5916,7 @@ function wireHomeUi() {
 
 async function main() {
   loadPersistedDatasetSettings();
+  loadPersistedSindBgAlignStore();
   loadPersistedSourceByType();
   wireUi();
   wireHomeUi();
@@ -5457,7 +5939,7 @@ async function main() {
   // Update checks run in the background and should not block loading datasets.
   loadAppMeta()
     .then(() => checkForUpdates({ force: false, userInitiated: false }))
-    .catch(() => {});
+    .catch(() => { });
 
   window.addEventListener("beforeunload", () => {
     if (state.started) saveCurrentDatasetSettings();
