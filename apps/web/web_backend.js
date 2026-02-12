@@ -184,11 +184,24 @@ function trajDomain() {
   return (window.TrajDomain && typeof window.TrajDomain === "object") ? window.TrajDomain : null;
 }
 
+function warnMissingTrajDomainOnce() {
+  if (window.__trajDomainWarnedBackend) return;
+  window.__trajDomainWarnedBackend = true;
+  console.warn("TrajDomain (domain.js) is unavailable in WebBackend; using built-in fallback mappings.");
+}
+
 function domainNormalizeDatasetType(raw) {
   const d = trajDomain();
   if (d && typeof d.normalizeDatasetType === "function") {
     return d.normalizeDatasetType(raw);
   }
+  warnMissingTrajDomainOnce();
+  const s = String(raw || '').trim().toLowerCase();
+  if (s === 'v2x-traj' || s === 'v2x_traj' || s === 'v2xtraj') return 'v2x_traj';
+  if (s === 'v2x-seq' || s === 'v2x_seq' || s === 'v2xseq') return 'v2x_seq';
+  if (s === 'ind' || s === 'in-d' || s === 'ind_dataset') return 'ind';
+  if (s === 'sind' || s === 'sin-d' || s === 'sin_d' || s === 'sind_dataset') return 'sind';
+  if (s === 'consider-it-cpm' || s === 'consider_it_cpm' || s === 'cpm' || s === 'cpm-objects' || s === 'considerit') return 'consider_it_cpm';
   return '';
 }
 
@@ -197,6 +210,13 @@ function domainDatasetFamilyFromType(raw) {
   if (d && typeof d.datasetFamilyFromType === "function") {
     return d.datasetFamilyFromType(raw);
   }
+  warnMissingTrajDomainOnce();
+  const t = domainNormalizeDatasetType(raw);
+  if (t === 'v2x_traj') return 'v2x-traj';
+  if (t === 'v2x_seq') return 'v2x-seq';
+  if (t === 'ind') return 'ind';
+  if (t === 'sind') return 'sind';
+  if (t === 'consider_it_cpm') return 'cpm-objects';
   return '';
 }
 
@@ -205,6 +225,14 @@ function domainCapabilitiesFromType(raw) {
   if (d && typeof d.capabilitiesFromDatasetType === "function") {
     return d.capabilitiesFromDatasetType(raw);
   }
+  warnMissingTrajDomainOnce();
+  const t = domainNormalizeDatasetType(raw);
+  if (t === "v2x_traj" || t === "v2x_seq") {
+    return { has_map: true, has_traffic_lights: true, splits: ["train", "val"], group_label: "Intersection" };
+  }
+  if (t === "ind") return { has_map: true, has_traffic_lights: false, splits: ["all"], group_label: "Location" };
+  if (t === "sind") return { has_map: true, has_traffic_lights: true, splits: ["all"], group_label: "City" };
+  if (t === "consider_it_cpm") return { has_map: false, has_traffic_lights: false, splits: ["all"], group_label: "Sensor" };
   return {};
 }
 
@@ -213,6 +241,13 @@ function domainDefaultSceneStrategy(raw) {
   if (d && typeof d.defaultSceneStrategy === "function") {
     return d.defaultSceneStrategy(raw);
   }
+  warnMissingTrajDomainOnce();
+  const t = domainNormalizeDatasetType(raw);
+  if (t === "v2x_traj") return { mode: "intersection_scene" };
+  if (t === "v2x_seq") return { mode: "sequence_scene" };
+  if (t === "ind") return { mode: "recording_window", window_s: 60 };
+  if (t === "sind") return { mode: "scenario_scene" };
+  if (t === "consider_it_cpm") return { mode: "time_window", window_s: 300, gap_s: 120 };
   return { mode: "intersection_scene" };
 }
 

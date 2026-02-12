@@ -6,6 +6,12 @@ function trajDomain() {
   return (window.TrajDomain && typeof window.TrajDomain === "object") ? window.TrajDomain : null;
 }
 
+function warnMissingTrajDomainOnce() {
+  if (window.__trajDomainWarned) return;
+  window.__trajDomainWarned = true;
+  console.warn("TrajDomain (domain.js) is unavailable; using built-in fallback mappings.");
+}
+
 function hasDesktopBridge() {
   const api = window.pywebview && window.pywebview.api ? window.pywebview.api : null;
   if (!api) return false;
@@ -3305,7 +3311,15 @@ function profileTypeLabel(datasetType) {
   if (d && typeof d.datasetTypeLabel === "function") {
     return d.datasetTypeLabel(datasetType);
   }
-  return datasetType ? String(datasetType) : "Unknown";
+  warnMissingTrajDomainOnce();
+  const t = String(datasetType || "").toLowerCase();
+  if (t === "v2x_traj") return "V2X-Traj";
+  if (t === "v2x_seq") return "V2X-Seq";
+  if (t === "ind") return "inD";
+  if (t === "sind") return "SinD";
+  if (t === "consider_it_cpm") return "Consider.it CPM";
+  if (!t) return "Unknown";
+  return datasetType;
 }
 
 function profileStatusLabel(status) {
@@ -3348,6 +3362,13 @@ function datasetTypeFromFamily(family) {
   if (d && typeof d.datasetTypeFromFamily === "function") {
     return d.datasetTypeFromFamily(family);
   }
+  warnMissingTrajDomainOnce();
+  const fam = String(family || "").trim().toLowerCase();
+  if (fam === "v2x-traj") return "v2x_traj";
+  if (fam === "v2x-seq") return "v2x_seq";
+  if (fam === "ind") return "ind";
+  if (fam === "sind") return "sind";
+  if (fam === "cpm-objects") return "consider_it_cpm";
   return "";
 }
 
@@ -3368,7 +3389,9 @@ function supportedLocalFamily(family) {
   if (d && typeof d.isSupportedLocalFamily === "function") {
     return !!d.isSupportedLocalFamily(family);
   }
-  return false;
+  warnMissingTrajDomainOnce();
+  const fam = String(family || "").trim().toLowerCase();
+  return fam === "v2x-traj" || fam === "v2x-seq" || fam === "ind" || fam === "sind" || fam === "cpm-objects";
 }
 
 function virtualDatasetMeta(datasetId, title, family) {
@@ -3376,12 +3399,90 @@ function virtualDatasetMeta(datasetId, title, family) {
   if (d && typeof d.buildVirtualDatasetMeta === "function") {
     return d.buildVirtualDatasetMeta(datasetId, title, family);
   }
-  return {
+  warnMissingTrajDomainOnce();
+  const fam = String(family || "").trim().toLowerCase();
+  const base = {
     id: String(datasetId || "").trim(),
     title: String(title || datasetId || "").trim() || "Dataset",
-    family: String(family || "").trim().toLowerCase(),
+    family: fam,
     supported: false,
     virtual: true,
+  };
+  if (fam === "v2x-traj") {
+    return {
+      ...base,
+      splits: ["train", "val"],
+      default_split: "train",
+      group_label: "Intersection",
+      has_map: true,
+      has_traffic_lights: true,
+      modalities: ["ego", "infra", "vehicle", "traffic_light"],
+      modality_labels: { ego: "Ego vehicle", infra: "Infrastructure", vehicle: "Other vehicles", traffic_light: "Traffic lights" },
+      modality_short_labels: { ego: "Ego", infra: "Infra", vehicle: "Vehicles", traffic_light: "Lights" },
+    };
+  }
+  if (fam === "v2x-seq") {
+    return {
+      ...base,
+      splits: ["train", "val"],
+      default_split: "val",
+      group_label: "Intersection",
+      has_map: true,
+      has_traffic_lights: true,
+      modalities: ["ego", "infra", "vehicle", "traffic_light"],
+      modality_labels: {
+        ego: "Cooperative vehicle-infrastructure",
+        infra: "Single infrastructure",
+        vehicle: "Single vehicle",
+        traffic_light: "Traffic lights",
+      },
+      modality_short_labels: { ego: "Coop", infra: "Infra", vehicle: "Vehicle", traffic_light: "Lights" },
+    };
+  }
+  if (fam === "cpm-objects") {
+    return {
+      ...base,
+      splits: ["all"],
+      default_split: "all",
+      group_label: "Sensor",
+      has_map: false,
+      has_scene_background: false,
+      has_traffic_lights: false,
+      modalities: ["infra"],
+      modality_labels: { infra: "Objects" },
+      modality_short_labels: { infra: "Objects" },
+    };
+  }
+  if (fam === "ind") {
+    return {
+      ...base,
+      splits: ["all"],
+      default_split: "all",
+      group_label: "Location",
+      has_map: true,
+      has_scene_background: true,
+      has_traffic_lights: false,
+      modalities: ["infra"],
+      modality_labels: { infra: "Road users" },
+      modality_short_labels: { infra: "Objects" },
+    };
+  }
+  if (fam === "sind") {
+    return {
+      ...base,
+      splits: ["all"],
+      default_split: "all",
+      group_label: "City",
+      has_map: true,
+      has_scene_background: true,
+      has_traffic_lights: true,
+      modalities: ["infra", "traffic_light"],
+      modality_labels: { infra: "Road users", traffic_light: "Traffic lights" },
+      modality_short_labels: { infra: "Objects", traffic_light: "Lights" },
+    };
+  }
+  return {
+    ...base,
     splits: ["all"],
     default_split: "all",
     group_label: "Group",
@@ -3671,6 +3772,13 @@ function expectedDatasetLayoutHint(datasetType) {
   if (d && typeof d.expectedDatasetLayoutHint === "function") {
     return d.expectedDatasetLayoutHint(datasetType);
   }
+  warnMissingTrajDomainOnce();
+  const t = String(datasetType || "").trim().toLowerCase();
+  if (t === "v2x_traj") return "Expected root folders: ego-trajectories, infrastructure-trajectories, vehicle-trajectories, and optional maps/traffic-light.";
+  if (t === "v2x_seq") return "Expected root folders: cooperative-vehicle-infrastructure, single-infrastructure, and/or single-vehicle.";
+  if (t === "consider_it_cpm") return "Expected root folders: lidar and/or thermal_camera with CPM CSV logs.";
+  if (t === "ind") return "Expected inD root with data/*_tracks.csv, *_tracksMeta.csv, *_recordingMeta.csv and optional maps/lanelets.";
+  if (t === "sind") return "Expected SinD root with city folders, scenario folders, and Veh_smoothed_tracks.csv / Ped_smoothed_tracks.csv files.";
   return "";
 }
 
@@ -3679,6 +3787,13 @@ function datasetTypeDisplayName(datasetType) {
   if (d && typeof d.datasetTypeDisplayName === "function") {
     return d.datasetTypeDisplayName(datasetType);
   }
+  warnMissingTrajDomainOnce();
+  const t = String(datasetType || "").trim().toLowerCase();
+  if (t === "v2x_traj") return "V2X-Traj";
+  if (t === "v2x_seq") return "V2X-Seq";
+  if (t === "consider_it_cpm") return "Consider.it";
+  if (t === "ind") return "inD";
+  if (t === "sind") return "SinD";
   return "this dataset";
 }
 
@@ -3804,6 +3919,15 @@ async function loadDatasetFromFolder(folderPathIn) {
     persistSourceByType();
 
     await openExplorerForDataset(runtimeDatasetId, { savePrev: false });
+    const loadedScenes = Array.isArray(state.sceneIds) ? state.sceneIds.length : 0;
+    if (loadedScenes <= 0) {
+      const hint = expectedDatasetLayoutHint(datasetType);
+      src.hint = hint
+        ? `Dataset loaded, but no scenes were found. ${hint}`
+        : "Dataset loaded, but no scenes were found in the selected directory.";
+      src.tone = "warn";
+      persistSourceByType();
+    }
     setConnectResult(src.hint, src.tone);
   } catch (e) {
     const msg = friendlyLoadFailureMessage(e, datasetType);
