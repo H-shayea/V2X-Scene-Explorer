@@ -485,6 +485,16 @@ function buildPathFromPolyline(path, pts, close = false) {
   if (close) path.closePath();
 }
 
+function buildLanePolygonFromBoundaries(left, right) {
+  if (!Array.isArray(left) || !Array.isArray(right) || left.length < 2 || right.length < 2) return [];
+  const poly = left.concat([...right].reverse());
+  if (poly.length < 3) return [];
+  const first = poly[0];
+  const last = poly[poly.length - 1];
+  if (!first || !last || first[0] !== last[0] || first[1] !== last[1]) poly.push([first[0], first[1]]);
+  return poly;
+}
+
 const COLORS = {
   modality: {
     ego: "#2563eb",
@@ -1823,21 +1833,61 @@ function computeSceneViewExtent(bundle) {
 function buildMapPaths(map) {
   if (!map) return null;
 
-  const lanesRoad = new Path2D();
-  const lanesIntersection = new Path2D();
+  const laneCenterRoad = new Path2D();
+  const laneCenterIntersection = new Path2D();
+  const laneBoundaryRoad = new Path2D();
+  const laneBoundaryIntersection = new Path2D();
+  const laneSurfaceRoad = new Path2D();
+  const laneSurfaceIntersection = new Path2D();
   const stoplines = new Path2D();
   const crosswalks = new Path2D();
   const junctions = new Path2D();
+  let laneBoundaryCount = 0;
+  let laneSurfaceCount = 0;
 
   for (const lane of map.lanes || []) {
-    const p = lane && lane.is_intersection ? lanesIntersection : lanesRoad;
-    buildPathFromPolyline(p, lane.centerline, false);
+    const isIntersection = !!(lane && lane.is_intersection);
+    const centerPath = isIntersection ? laneCenterIntersection : laneCenterRoad;
+    const boundaryPath = isIntersection ? laneBoundaryIntersection : laneBoundaryRoad;
+    const surfacePath = isIntersection ? laneSurfaceIntersection : laneSurfaceRoad;
+    buildPathFromPolyline(centerPath, lane.centerline, false);
+
+    const left = Array.isArray(lane && lane.left_boundary) ? lane.left_boundary : [];
+    const right = Array.isArray(lane && lane.right_boundary) ? lane.right_boundary : [];
+    const polyRaw = Array.isArray(lane && lane.polygon) ? lane.polygon : [];
+    const poly = polyRaw.length >= 3 ? polyRaw : buildLanePolygonFromBoundaries(left, right);
+    if (left.length >= 2) {
+      buildPathFromPolyline(boundaryPath, left, false);
+      laneBoundaryCount += 1;
+    }
+    if (right.length >= 2) {
+      buildPathFromPolyline(boundaryPath, right, false);
+      laneBoundaryCount += 1;
+    }
+    if (poly.length >= 3) {
+      buildPathFromPolyline(surfacePath, poly, true);
+      laneSurfaceCount += 1;
+    }
   }
   for (const s of map.stoplines || []) buildPathFromPolyline(stoplines, s.centerline, false);
   for (const cw of map.crosswalks || []) buildPathFromPolyline(crosswalks, cw.polygon, true);
   for (const j of map.junctions || []) buildPathFromPolyline(junctions, j.polygon, true);
 
-  return { lanesRoad, lanesIntersection, stoplines, crosswalks, junctions };
+  return {
+    lanesRoad: laneCenterRoad,
+    lanesIntersection: laneCenterIntersection,
+    laneCenterRoad,
+    laneCenterIntersection,
+    laneBoundaryRoad,
+    laneBoundaryIntersection,
+    laneBoundaryCount,
+    laneSurfaceRoad,
+    laneSurfaceIntersection,
+    laneSurfaceCount,
+    stoplines,
+    crosswalks,
+    junctions,
+  };
 }
 
 function recType(rec) {
@@ -2353,6 +2403,27 @@ function render() {
     ctx.save();
     applyWorldTransform(ctx, view, cssW, cssH, dpr);
     const px = (n) => n / view.scale;
+    const isOverlayOnPhoto = normalizeMapSource(state.mapSource) === "overlay" && !!bundle.background;
+    const laneCenterRoad = state.mapPaths.laneCenterRoad || state.mapPaths.lanesRoad;
+    const laneCenterIntersection = state.mapPaths.laneCenterIntersection || state.mapPaths.lanesIntersection;
+    const laneBoundaryRoad = state.mapPaths.laneBoundaryRoad || laneCenterRoad;
+    const laneBoundaryIntersection = state.mapPaths.laneBoundaryIntersection || laneCenterIntersection;
+    const laneSurfaceRoad = state.mapPaths.laneSurfaceRoad;
+    const laneSurfaceIntersection = state.mapPaths.laneSurfaceIntersection;
+    const hasLaneSurfaces = Number(state.mapPaths.laneSurfaceCount || 0) > 0;
+    const hasLaneBoundaries = Number(state.mapPaths.laneBoundaryCount || 0) > 0;
+    const laneCenterRoadWidthPx = isOverlayOnPhoto ? 1.5 : 0.9;
+    const laneCenterInterWidthPx = isOverlayOnPhoto ? 2.1 : 1.3;
+    const laneCenterRoadAlpha = isOverlayOnPhoto ? 0.54 : 0.28;
+    const laneCenterInterAlpha = isOverlayOnPhoto ? 0.72 : 0.46;
+    const laneBoundaryRoadWidthPx = isOverlayOnPhoto ? 2.0 : 1.25;
+    const laneBoundaryInterWidthPx = isOverlayOnPhoto ? 2.5 : 1.65;
+    const laneBoundaryAlpha = isOverlayOnPhoto ? 0.76 : 0.6;
+    const laneSurfaceRoadAlpha = isOverlayOnPhoto ? 0.14 : 0.22;
+    const laneSurfaceInterAlpha = isOverlayOnPhoto ? 0.2 : 0.3;
+    const stoplineWidthPx = isOverlayOnPhoto ? 2.8 : 2.0;
+    const junctionStrokeWidthPx = isOverlayOnPhoto ? 2.8 : 2.0;
+    const junctionStrokeAlpha = isOverlayOnPhoto ? 0.36 : 0.22;
 
     // Junction polygons
     if (state.mapLayers.junctions) {
@@ -2363,9 +2434,9 @@ function render() {
       ctx.restore();
 
       ctx.save();
-      ctx.globalAlpha = 0.22;
+      ctx.globalAlpha = junctionStrokeAlpha;
       ctx.strokeStyle = "#111827";
-      ctx.lineWidth = px(2.0);
+      ctx.lineWidth = px(junctionStrokeWidthPx);
       ctx.setLineDash([px(6), px(6)]);
       ctx.stroke(state.mapPaths.junctions);
       ctx.setLineDash([]);
@@ -2386,27 +2457,65 @@ function render() {
       ctx.save();
       ctx.globalAlpha = 0.55;
       ctx.strokeStyle = "#ef4444";
-      ctx.lineWidth = px(2.0);
+      ctx.lineWidth = px(stoplineWidthPx);
       ctx.stroke(state.mapPaths.stoplines);
       ctx.restore();
     }
 
     // Lanes
     if (state.mapLayers.lanes) {
-      // Non-intersection lanes (lighter)
+      if (hasLaneSurfaces && laneSurfaceRoad && laneSurfaceIntersection) {
+        // Lanelet2 visuals: paint lane surfaces first, then boundaries/centerlines.
+        ctx.save();
+        ctx.globalAlpha = laneSurfaceRoadAlpha;
+        ctx.fillStyle = "#22c55e";
+        ctx.fill(laneSurfaceRoad);
+        ctx.restore();
+
+        ctx.save();
+        ctx.globalAlpha = laneSurfaceInterAlpha;
+        ctx.fillStyle = "#ef4444";
+        ctx.fill(laneSurfaceIntersection);
+        ctx.restore();
+      }
+
+      // In overlay mode, add a white halo so lanes remain readable on orthophoto textures.
+      if (isOverlayOnPhoto) {
+        const haloRoad = hasLaneBoundaries ? laneBoundaryRoad : laneCenterRoad;
+        const haloInter = hasLaneBoundaries ? laneBoundaryIntersection : laneCenterIntersection;
+        ctx.save();
+        ctx.globalAlpha = 0.58;
+        ctx.strokeStyle = "#ffffff";
+        ctx.lineWidth = px(laneBoundaryRoadWidthPx + 1.6);
+        ctx.stroke(haloRoad);
+        ctx.lineWidth = px(laneBoundaryInterWidthPx + 1.9);
+        ctx.stroke(haloInter);
+        ctx.restore();
+      }
+
+      if (hasLaneBoundaries) {
+        ctx.save();
+        ctx.globalAlpha = laneBoundaryAlpha;
+        ctx.strokeStyle = "#f8fafc";
+        ctx.lineWidth = px(laneBoundaryRoadWidthPx);
+        ctx.stroke(laneBoundaryRoad);
+        ctx.lineWidth = px(laneBoundaryInterWidthPx);
+        ctx.stroke(laneBoundaryIntersection);
+        ctx.restore();
+      }
+
       ctx.save();
-      ctx.globalAlpha = 0.22;
-      ctx.strokeStyle = "#111827";
-      ctx.lineWidth = px(1.0);
-      ctx.stroke(state.mapPaths.lanesRoad);
+      ctx.globalAlpha = laneCenterRoadAlpha;
+      ctx.strokeStyle = "#0f172a";
+      ctx.lineWidth = px(laneCenterRoadWidthPx);
+      ctx.stroke(laneCenterRoad);
       ctx.restore();
 
-      // Intersection lanes (bolder) to visually separate "intersection area" from the surrounding map.
       ctx.save();
-      ctx.globalAlpha = 0.5;
-      ctx.strokeStyle = "#111827";
-      ctx.lineWidth = px(1.8);
-      ctx.stroke(state.mapPaths.lanesIntersection);
+      ctx.globalAlpha = laneCenterInterAlpha;
+      ctx.strokeStyle = "#0f172a";
+      ctx.lineWidth = px(laneCenterInterWidthPx);
+      ctx.stroke(laneCenterIntersection);
       ctx.restore();
     }
 

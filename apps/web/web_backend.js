@@ -206,14 +206,33 @@ function processMapData(raw) {
     }).filter(Boolean);
   }
 
-  const lanes = Object.values(raw.LANE || {}).map(l => ({
-    id: l.id,
-    lane_type: l.lane_type,
-    turn_direction: l.turn_direction,
-    is_intersection: l.is_intersection,
-    has_traffic_control: l.has_traffic_control,
-    centerline: parsePoly(l.centerline)
-  }));
+  function buildLanePolygon(left, right) {
+    if (!Array.isArray(left) || !Array.isArray(right) || left.length < 2 || right.length < 2) return [];
+    const poly = left.concat([...right].reverse());
+    if (poly.length < 3) return [];
+    const a = poly[0];
+    const b = poly[poly.length - 1];
+    if (!a || !b || a[0] !== b[0] || a[1] !== b[1]) poly.push([a[0], a[1]]);
+    return poly;
+  }
+
+  const lanes = Object.values(raw.LANE || {}).map(l => {
+    const leftBoundary = parsePoly(l.left_boundary);
+    const rightBoundary = parsePoly(l.right_boundary);
+    let polygon = parsePoly(l.polygon);
+    if (polygon.length < 3) polygon = buildLanePolygon(leftBoundary, rightBoundary);
+    return {
+      id: l.id,
+      lane_type: l.lane_type,
+      turn_direction: l.turn_direction,
+      is_intersection: l.is_intersection,
+      has_traffic_control: l.has_traffic_control,
+      centerline: parsePoly(l.centerline),
+      left_boundary: leftBoundary,
+      right_boundary: rightBoundary,
+      polygon
+    };
+  });
 
   const stoplines = Object.values(raw.STOPLINE || {}).map(s => ({
     id: s.id,

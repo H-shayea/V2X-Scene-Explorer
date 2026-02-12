@@ -786,6 +786,16 @@ class V2XTrajAdapter:
                 bbox_update(b, x, y)
             return b
 
+        def lane_polygon(left: List[Tuple[float, float]], right: List[Tuple[float, float]]) -> List[Tuple[float, float]]:
+            if len(left) < 2 or len(right) < 2:
+                return []
+            poly = list(left) + list(reversed(right))
+            if len(poly) < 3:
+                return []
+            if poly[0] != poly[-1]:
+                poly.append(poly[0])
+            return poly
+
         lanes_out: List[Dict[str, Any]] = []
         for lane_id, lane in (data.get("LANE") or {}).items():
             if not isinstance(lane, dict):
@@ -793,6 +803,12 @@ class V2XTrajAdapter:
             cl = parse_polyline(lane.get("centerline"))
             if not cl:
                 continue
+            left = parse_polyline(lane.get("left_boundary"))
+            right = parse_polyline(lane.get("right_boundary"))
+            poly = parse_polyline(lane.get("polygon"))
+            if len(poly) < 3:
+                poly = lane_polygon(left, right)
+            lane_geom = poly if len(poly) >= 3 else cl
             lanes_out.append(
                 {
                     "id": lane_id,
@@ -801,7 +817,10 @@ class V2XTrajAdapter:
                     "is_intersection": lane.get("is_intersection"),
                     "has_traffic_control": lane.get("has_traffic_control"),
                     "centerline": cl,
-                    "bbox": feature_bbox(cl),
+                    "left_boundary": left,
+                    "right_boundary": right,
+                    "polygon": poly,
+                    "bbox": feature_bbox(lane_geom),
                 }
             )
 
@@ -906,6 +925,9 @@ class V2XTrajAdapter:
                     "is_intersection": l["is_intersection"],
                     "has_traffic_control": l["has_traffic_control"],
                     "centerline": l["centerline"],
+                    "left_boundary": l.get("left_boundary") or [],
+                    "right_boundary": l.get("right_boundary") or [],
+                    "polygon": l.get("polygon") or [],
                 }
                 for l in lanes
             ],
@@ -1858,11 +1880,19 @@ class InDAdapter:
             elif len(right) >= 2:
                 center = right
 
+            left = self._downsample_polyline(left, step)
+            right = self._downsample_polyline(right, step)
             center = self._downsample_polyline(center, step)
             if len(center) < 2:
                 continue
 
-            b = self._polyline_bbox(center)
+            polygon: List[Tuple[float, float]] = []
+            if len(left) >= 2 and len(right) >= 2:
+                polygon = left + list(reversed(right))
+                if len(polygon) >= 3 and polygon[0] != polygon[-1]:
+                    polygon.append(polygon[0])
+
+            b = self._polyline_bbox(polygon if len(polygon) >= 3 else center)
             if b is None:
                 continue
             bbox_update_from_bbox(map_bbox, b)
@@ -1874,6 +1904,9 @@ class InDAdapter:
                     "is_intersection": bool((tags.get("subtype") or "").lower() in ("intersection",)),
                     "has_traffic_control": False,
                     "centerline": center,
+                    "left_boundary": left,
+                    "right_boundary": right,
+                    "polygon": polygon,
                     "bbox": b,
                 }
             )
@@ -1940,6 +1973,9 @@ class InDAdapter:
                     "is_intersection": l.get("is_intersection"),
                     "has_traffic_control": l.get("has_traffic_control"),
                     "centerline": l.get("centerline") or [],
+                    "left_boundary": l.get("left_boundary") or [],
+                    "right_boundary": l.get("right_boundary") or [],
+                    "polygon": l.get("polygon") or [],
                 }
                 for l in lanes
             ],
@@ -3186,10 +3222,18 @@ class SinDAdapter:
             elif len(right) >= 2:
                 center = right
 
+            left = self._downsample_polyline(left, step)
+            right = self._downsample_polyline(right, step)
             center = self._downsample_polyline(center, step)
             if len(center) < 2:
                 continue
-            b = self._polyline_bbox(center)
+            polygon: List[Tuple[float, float]] = []
+            if len(left) >= 2 and len(right) >= 2:
+                polygon = left + list(reversed(right))
+                if len(polygon) >= 3 and polygon[0] != polygon[-1]:
+                    polygon.append(polygon[0])
+
+            b = self._polyline_bbox(polygon if len(polygon) >= 3 else center)
             if b is None:
                 continue
             bbox_update_from_bbox(map_bbox, b)
@@ -3203,6 +3247,9 @@ class SinDAdapter:
                     "is_intersection": bool(("intersection" in st_low) or ("junction" in st_low)),
                     "has_traffic_control": False,
                     "centerline": center,
+                    "left_boundary": left,
+                    "right_boundary": right,
+                    "polygon": polygon,
                     "bbox": b,
                 }
             )
@@ -3303,6 +3350,9 @@ class SinDAdapter:
                     "is_intersection": l.get("is_intersection"),
                     "has_traffic_control": l.get("has_traffic_control"),
                     "centerline": l.get("centerline") or [],
+                    "left_boundary": l.get("left_boundary") or [],
+                    "right_boundary": l.get("right_boundary") or [],
+                    "polygon": l.get("polygon") or [],
                 }
                 for l in lanes
             ],
