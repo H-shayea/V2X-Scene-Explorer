@@ -24,15 +24,31 @@ function webBackendQueryOverride() {
   return null;
 }
 
-function shouldUseEmbeddedWebBackend() {
+function hasEmbeddedWebBackend() {
   const wb = window.WebBackend;
-  if (!isWebMode() || !wb || typeof wb.fetchJson !== "function" || typeof wb.postJson !== "function") return false;
-  const forced = webBackendQueryOverride();
-  if (forced !== null) return forced;
-  // On localhost/loopback we usually have the real Python backend; prefer it over the lightweight JS shim.
-  const host = String(window.location.hostname || "").trim().toLowerCase();
-  if (host === "localhost" || host === "127.0.0.1" || host === "[::1]" || host === "::1") return false;
-  return true;
+  return !!(wb && typeof wb.fetchJson === "function" && typeof wb.postJson === "function");
+}
+
+function shouldForceEmbeddedWebBackend() {
+  return webBackendQueryOverride() === true;
+}
+
+function canFallbackToEmbeddedWebBackend() {
+  if (!isWebMode() || !hasEmbeddedWebBackend()) return false;
+  return webBackendQueryOverride() !== false;
+}
+
+function isEmbeddedFallbackStatus(status) {
+  const s = Number(status);
+  return s === 404 || s === 405 || s === 501 || s === 502 || s === 503 || s === 504;
+}
+
+function makeApiError(url, res, text) {
+  const err = new Error(`${res.status} ${res.statusText}: ${text}`);
+  err.status = Number(res.status || 0);
+  err.url = String(url || "");
+  err.body = String(text || "");
+  return err;
 }
 
 function syncRuntimeModeCss() {
@@ -46,31 +62,59 @@ syncRuntimeModeCss();
 window.addEventListener("pywebviewready", syncRuntimeModeCss);
 
 async function fetchJson(url) {
-  if (shouldUseEmbeddedWebBackend()) {
+  const forceEmbedded = shouldForceEmbeddedWebBackend();
+  if (forceEmbedded && hasEmbeddedWebBackend()) {
     return window.WebBackend.fetchJson(url);
   }
-  const res = await fetch(url);
-  if (!res.ok) {
-    const text = await res.text();
-    throw new Error(`${res.status} ${res.statusText}: ${text}`);
+
+  try {
+    const res = await fetch(url);
+    if (!res.ok) {
+      const text = await res.text();
+      const err = makeApiError(url, res, text);
+      if (canFallbackToEmbeddedWebBackend() && isEmbeddedFallbackStatus(err.status)) {
+        return window.WebBackend.fetchJson(url);
+      }
+      throw err;
+    }
+    return await res.json();
+  } catch (err) {
+    const status = Number(err && err.status);
+    if (canFallbackToEmbeddedWebBackend() && (!Number.isFinite(status) || isEmbeddedFallbackStatus(status))) {
+      return window.WebBackend.fetchJson(url);
+    }
+    throw err;
   }
-  return res.json();
 }
 
 async function postJson(url, payload) {
-  if (shouldUseEmbeddedWebBackend()) {
+  const forceEmbedded = shouldForceEmbeddedWebBackend();
+  if (forceEmbedded && hasEmbeddedWebBackend()) {
     return window.WebBackend.postJson(url, payload);
   }
-  const res = await fetch(url, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(payload || {}),
-  });
-  if (!res.ok) {
-    const text = await res.text();
-    throw new Error(`${res.status} ${res.statusText}: ${text}`);
+
+  try {
+    const res = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload || {}),
+    });
+    if (!res.ok) {
+      const text = await res.text();
+      const err = makeApiError(url, res, text);
+      if (canFallbackToEmbeddedWebBackend() && isEmbeddedFallbackStatus(err.status)) {
+        return window.WebBackend.postJson(url, payload);
+      }
+      throw err;
+    }
+    return await res.json();
+  } catch (err) {
+    const status = Number(err && err.status);
+    if (canFallbackToEmbeddedWebBackend() && (!Number.isFinite(status) || isEmbeddedFallbackStatus(status))) {
+      return window.WebBackend.postJson(url, payload);
+    }
+    throw err;
   }
-  return res.json();
 }
 
 function clamp(n, lo, hi) {
@@ -3540,19 +3584,49 @@ function isDesktopPickerAvailable(methodName) {
   return !!(api && typeof api[methodName] === "function");
 }
 
+async function pickFolderViaWebFs() {
+  if (!window.WebFS) {
+    throw new Error("Web file picker is unavailable.");
+  }
+  if (window.WebFS.isSupported && !window.WebFS.isSupported()) {
+    alert("Your browser does not support the File System Access API (needed for local file access). Please use Chrome, Edge, or Opera.");
+    return [];
+  }
+  try {
+    const handle = await window.WebFS.pickDirectory();
+    return handle ? [handle.name] : [];
+  } catch (e) {
+    console.error("Picker error:", e);
+    return [];
+  }
+}
+
+async function pickFolderViaApi(promptText, defaultPath = "") {
+  const url = "/api/system/pick_folder";
+  const res = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      prompt: String(promptText || "Select dataset directory"),
+      default_path: String(defaultPath || "").trim(),
+    }),
+  });
+  if (!res.ok) {
+    const text = await res.text();
+    throw makeApiError(url, res, text);
+  }
+  const payload = await res.json();
+  if (payload && Array.isArray(payload.paths)) {
+    return payload.paths.map((x) => String(x || "").trim()).filter(Boolean);
+  }
+  const one = String((payload && payload.path) || "").trim();
+  return one ? [one] : [];
+}
+
 async function pickPathsDesktop(methodName, fallbackPrompt, defaultPath = "") {
-  if (shouldUseEmbeddedWebBackend() && window.WebFS && methodName === 'pick_folder') {
-    if (window.WebFS.isSupported && !window.WebFS.isSupported()) {
-      alert("Your browser does not support the File System Access API (needed for local file access). Please use Chrome, Edge, or Opera.");
-      return [];
-    }
-    try {
-      const handle = await window.WebFS.pickDirectory();
-      return handle ? [handle.name] : [];
-    } catch (e) {
-      console.error("Picker error:", e);
-      return [];
-    }
+  const forceEmbedded = shouldForceEmbeddedWebBackend();
+  if (methodName === "pick_folder" && forceEmbedded && window.WebFS) {
+    return pickFolderViaWebFs();
   }
   if (isDesktopPickerAvailable(methodName)) {
     try {
@@ -3566,16 +3640,28 @@ async function pickPathsDesktop(methodName, fallbackPrompt, defaultPath = "") {
 
   // Web mode: ask the local backend to open a native folder picker (macOS).
   if (methodName === "pick_folder") {
-    try {
-      const payload = await postJson("/api/system/pick_folder", {
-        prompt: String(fallbackPrompt || "Select dataset directory"),
-        default_path: String(defaultPath || "").trim(),
-      });
-      if (payload && Array.isArray(payload.paths)) {
-        return payload.paths.map((x) => String(x || "").trim()).filter(Boolean);
+    let apiErr = null;
+    if (!forceEmbedded) {
+      try {
+        return await pickFolderViaApi(fallbackPrompt || "Select dataset directory", defaultPath);
+      } catch (e) {
+        apiErr = e;
+        const status = Number(e && e.status);
+        if (status === 403) {
+          throw new Error("Native folder picker is blocked on this URL. Open the app from http://localhost and try again.");
+        }
       }
-    } catch (_) {
-      // Fall through to explicit error message below.
+    }
+
+    if (canFallbackToEmbeddedWebBackend() && window.WebFS) {
+      const status = Number(apiErr && apiErr.status);
+      if (!Number.isFinite(status) || isEmbeddedFallbackStatus(status)) {
+        return pickFolderViaWebFs();
+      }
+    }
+
+    if (apiErr) {
+      throw apiErr;
     }
     throw new Error("Native folder picker is unavailable. Run the local server on your Mac and open the app from localhost.");
   }

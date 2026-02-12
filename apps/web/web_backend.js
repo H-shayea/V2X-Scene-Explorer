@@ -165,6 +165,10 @@ function processMapData(raw) {
 // === Web Backend Emulation ===
 
 const WebBackend = {
+  LS_DATASETS: "traj.web.datasets",
+  LS_PROFILES: "traj.web.profiles",
+  LS_DEFAULT_PROFILE: "traj.web.default_profile",
+
   STATIC_CATALOG: [
     {
       "id": "v2x-traj",
@@ -348,30 +352,47 @@ const WebBackend = {
     }
   ],
 
+  nowIso() {
+    return new Date().toISOString();
+  },
+
   getDatasets() {
     const local = [];
     try {
       const stored = JSON.parse(localStorage.getItem(this.LS_DATASETS));
       if (Array.isArray(stored)) local.push(...stored);
     } catch (e) { }
-    // Return unique usage: static catalog + local overrides/additions
-    // For simplicity, just concat. Local detections will have 'ds-timestamp' IDs.
+    // Return static catalog + local overrides/additions.
     return [...this.STATIC_CATALOG, ...local];
   },
 
   saveDatasets(list) {
-    // Only save the dynamic/local ones to LS, filtering out static catalog
-    const staticIds = new Set(this.STATIC_CATALOG.map(d => d.id));
-    const toSave = list.filter(d => !staticIds.has(d.id));
+    const staticIds = new Set(this.STATIC_CATALOG.map((d) => d.id));
+    const toSave = Array.isArray(list) ? list.filter((d) => d && !staticIds.has(d.id)) : [];
     localStorage.setItem(this.LS_DATASETS, JSON.stringify(toSave));
   },
 
   getProfiles() {
-    try { return JSON.parse(localStorage.getItem(this.LS_PROFILES) || '[]'); } catch { return []; }
+    try {
+      const stored = JSON.parse(localStorage.getItem(this.LS_PROFILES) || '[]');
+      return Array.isArray(stored) ? stored : [];
+    } catch {
+      return [];
+    }
   },
 
   saveProfiles(list) {
-    localStorage.setItem(this.LS_PROFILES, JSON.stringify(list));
+    localStorage.setItem(this.LS_PROFILES, JSON.stringify(Array.isArray(list) ? list : []));
+  },
+
+  getDefaultProfileId() {
+    return String(localStorage.getItem(this.LS_DEFAULT_PROFILE) || "").trim();
+  },
+
+  setDefaultProfileId(profileId) {
+    const pid = String(profileId || "").trim();
+    if (pid) localStorage.setItem(this.LS_DEFAULT_PROFILE, pid);
+    else localStorage.removeItem(this.LS_DEFAULT_PROFILE);
   },
 
   normalizeDatasetType(raw) {
@@ -394,12 +415,142 @@ const WebBackend = {
     return '';
   },
 
+  capabilitiesFromType(raw) {
+    const t = this.normalizeDatasetType(raw);
+    if (t === "v2x_traj" || t === "v2x_seq") {
+      return { has_map: true, has_traffic_lights: true, splits: ["train", "val"], group_label: "Intersection" };
+    }
+    if (t === "ind") return { has_map: true, has_traffic_lights: false, splits: ["all"], group_label: "Location" };
+    if (t === "sind") return { has_map: true, has_traffic_lights: true, splits: ["all"], group_label: "City" };
+    if (t === "consider_it_cpm") return { has_map: false, has_traffic_lights: false, splits: ["all"], group_label: "Sensor" };
+    return {};
+  },
+
+  defaultSceneStrategy(raw) {
+    const t = this.normalizeDatasetType(raw);
+    if (t === "v2x_traj") return { mode: "intersection_scene" };
+    if (t === "v2x_seq") return { mode: "sequence_scene" };
+    if (t === "ind") return { mode: "recording_window", window_s: 60 };
+    if (t === "sind") return { mode: "scenario_scene" };
+    if (t === "consider_it_cpm") return { mode: "time_window", window_s: 300, gap_s: 120 };
+    return { mode: "intersection_scene" };
+  },
+
+  profileSummary(profile, defaultProfileId = this.getDefaultProfileId()) {
+    const p = (profile && typeof profile === "object") ? profile : {};
+    const profileId = String(p.profile_id || "");
+    const validation = (p.validation && typeof p.validation === "object") ? p.validation : {};
+    return {
+      profile_id: profileId,
+      name: String(p.name || profileId || "Profile"),
+      dataset_id: String(p.dataset_id || ""),
+      dataset_type: String(p.dataset_type || ""),
+      status: String(validation.status || ""),
+      last_checked: String(validation.last_checked || ""),
+      is_default: !!(defaultProfileId && profileId === defaultProfileId),
+    };
+  },
+
+  listProfileSummaries() {
+    const defaultProfileId = this.getDefaultProfileId();
+    const out = this.getProfiles().map((p) => this.profileSummary(p, defaultProfileId));
+    out.sort((a, b) => {
+      if (!!a.is_default !== !!b.is_default) return a.is_default ? -1 : 1;
+      const an = String(a.name || "").toLowerCase();
+      const bn = String(b.name || "").toLowerCase();
+      if (an < bn) return -1;
+      if (an > bn) return 1;
+      return String(a.profile_id || "").localeCompare(String(b.profile_id || ""));
+    });
+    return out;
+  },
+
+  normalizeProfile(profileIn, fallbackType = "") {
+    const src = (profileIn && typeof profileIn === "object") ? profileIn : {};
+    const now = this.nowIso();
+    const datasetType = this.normalizeDatasetType(src.dataset_type || fallbackType) || "v2x_traj";
+    const profileId = String(src.profile_id || `web-${Date.now()}`).trim();
+    const datasetId = String(src.dataset_id || `profile-${datasetType.replace(/_/g, "-")}-${profileId.slice(0, 8)}`).trim();
+    const rootsIn = Array.isArray(src.roots) ? src.roots : [];
+    const roots = rootsIn.map((x) => String(x || "").trim()).filter(Boolean);
+    if (!roots.length && WebFS.rootHandle && WebFS.rootHandle.name) roots.push(String(WebFS.rootHandle.name));
+
+    const detectorIn = (src.detector && typeof src.detector === "object") ? src.detector : {};
+    const detector = {
+      score: Number.isFinite(Number(detectorIn.score)) ? Number(detectorIn.score) : 0,
+      second_best: Number.isFinite(Number(detectorIn.second_best)) ? Number(detectorIn.second_best) : 0,
+      decision_mode: String(detectorIn.decision_mode || "auto"),
+      checked_at: String(detectorIn.checked_at || now),
+    };
+
+    const validation = {
+      status: "ready",
+      errors: [],
+      warnings: [],
+      last_checked: now,
+    };
+    const capabilities = this.capabilitiesFromType(datasetType);
+    const bindings = (src.bindings && typeof src.bindings === "object") ? { ...src.bindings } : {};
+    const sceneStrategy = (src.scene_strategy && typeof src.scene_strategy === "object")
+      ? { ...src.scene_strategy }
+      : this.defaultSceneStrategy(datasetType);
+    const cacheIn = (src.cache && typeof src.cache === "object") ? src.cache : {};
+
+    const profile = {
+      ...src,
+      schema_version: String(src.schema_version || "profile-v1"),
+      profile_id: profileId,
+      dataset_id: datasetId,
+      name: String(src.name || "Dataset Profile"),
+      dataset_type: datasetType,
+      adapter_version: String(src.adapter_version || "web-shim"),
+      roots,
+      bindings,
+      scene_strategy: sceneStrategy,
+      detector,
+      validation,
+      cache: {
+        index_dir: String(cacheIn.index_dir || ""),
+        fingerprint: String(cacheIn.fingerprint || ""),
+        index_version: String(cacheIn.index_version || "web-shim"),
+        last_indexed_at: String(cacheIn.last_indexed_at || ""),
+        scene_count: Number(cacheIn.scene_count || 0),
+        row_count: Number(cacheIn.row_count || 0),
+      },
+      capabilities,
+      ui_defaults: (src.ui_defaults && typeof src.ui_defaults === "object") ? { ...src.ui_defaults } : {},
+    };
+    return { profile, validation, capabilities };
+  },
+
+  inferDatasetTypeFromRootEntries(entries) {
+    const names = Array.isArray(entries) ? entries.map((x) => String(x || "").trim().toLowerCase()) : [];
+    if (names.includes("lidar") || names.includes("thermal_camera") || names.some((x) => x.includes("cpm"))) {
+      return "consider_it_cpm";
+    }
+    if (names.includes("cooperative-vehicle-infrastructure") || names.includes("single-infrastructure") || names.includes("single-vehicle")) {
+      return "v2x_seq";
+    }
+    if (names.includes("ego-trajectories") || names.includes("infrastructure-trajectories") || names.includes("vehicle-trajectories")) {
+      return "v2x_traj";
+    }
+    if (names.some((x) => x.includes("recordingmeta") || x.endsWith("_tracks.csv"))) {
+      return "ind";
+    }
+    if (names.some((x) => x.includes("veh_smoothed_tracks") || x.includes("ped_smoothed_tracks"))) {
+      return "sind";
+    }
+    return "v2x_traj";
+  },
+
   async fetchJson(url) {
     if (url.endsWith('/api/app_meta')) {
       return { app_name: "V2X Scene Explorer (Web)", app_version: "0.2.0-web", desktop: false, update_repo: null };
     }
     if (url.endsWith('/api/datasets')) return { datasets: this.getDatasets() };
-    if (url.endsWith('/api/profiles')) return { items: this.getProfiles() };
+    if (url.endsWith('/api/profiles')) return { items: this.listProfileSummaries() };
+    const profileMatch = String(url).match(/\/api\/profiles\/([^/?#]+)/);
+    if (profileMatch) return await this.handleGetProfile(decodeURIComponent(profileMatch[1]));
     if (url.includes('/meta')) { // Handle /api/datasets/{id}/meta
       // Extract ID
       const parts = url.split('/');
@@ -418,71 +569,136 @@ const WebBackend = {
 
   async postJson(url, payload) {
     if (url.endsWith('/api/profiles/detect')) return await this.handleDetect(payload);
-    if (url.endsWith('/api/profiles/validate')) return { validation: { status: "ready" }, profile: payload.profile };
+    if (url.endsWith('/api/profiles/validate')) return await this.handleValidate(payload);
     if (url.endsWith('/api/profiles/save')) return await this.handleSaveProfile(payload);
+    if (url.endsWith('/api/profiles/delete')) return await this.handleDeleteProfile(payload);
+    if (url.endsWith('/api/profiles/default')) return await this.handleSetDefaultProfile(payload);
 
     throw new Error(`WebBackend: Unhandled POST ${url}`);
   },
 
   async handleDetect(payload) {
-    if (!WebFS.rootHandle) throw new Error("No folder selected");
-    const rootName = WebFS.rootHandle.name;
+    if (!WebFS.rootHandle) {
+      const validation = {
+        status: "broken_path",
+        errors: [{ code: "E_ROLE_REQUIRED_MISSING", message: "Provide at least one folder or file path." }],
+        warnings: [],
+        last_checked: this.nowIso(),
+      };
+      return { ok: false, error: "No folder selected.", validation };
+    }
 
-    // Basic detection logic
+    const rootName = String(WebFS.rootHandle.name || "").trim() || "Web Dataset";
     const files = await WebFS.listDir(rootName);
-    let type = 'v2x_traj';
-    if (files.some(f => f.includes('recordingMeta'))) type = 'ind';
-
-    const profile = {
-      profile_id: 'web-' + Date.now(),
-      dataset_id: 'ds-' + Date.now(),
-      name: rootName,
-      type: type,
-      source_path: rootName,
-      bindings: {}
+    const hinted = this.normalizeDatasetType(payload && payload.dataset_type);
+    const datasetType = hinted || this.inferDatasetTypeFromRootEntries(files);
+    const base = {
+      name: String((payload && payload.name) || rootName),
+      dataset_type: datasetType,
+      roots: [rootName],
+      bindings: {},
+      scene_strategy: this.defaultSceneStrategy(datasetType),
+      detector: {
+        score: hinted ? 100 : 70,
+        second_best: 0,
+        decision_mode: hinted ? "auto" : "confirm",
+        checked_at: this.nowIso(),
+      },
     };
-    return { profile, type };
+    const out = this.normalizeProfile(base, datasetType);
+    return { ok: true, profile: out.profile, validation: out.validation, capabilities: out.capabilities };
+  },
+
+  async handleValidate(payload) {
+    const profile = (payload && payload.profile && typeof payload.profile === "object") ? payload.profile : {};
+    const hinted = this.normalizeDatasetType(payload && payload.dataset_type);
+    const out = this.normalizeProfile(profile, hinted);
+    return { ok: true, profile: out.profile, validation: out.validation, capabilities: out.capabilities };
+  },
+
+  async handleGetProfile(profileId) {
+    const pid = String(profileId || "").trim();
+    if (!pid) throw new Error("profile_id is required");
+    const profiles = this.getProfiles();
+    const raw = profiles.find((p) => String(p.profile_id || "") === pid);
+    if (!raw) throw new Error(`profile not found: ${pid}`);
+    const out = this.normalizeProfile(raw, raw.dataset_type);
+    return {
+      profile: out.profile,
+      summary: this.profileSummary(out.profile),
+      validation: out.validation,
+      capabilities: out.capabilities,
+    };
+  },
+
+  async handleDeleteProfile(payload) {
+    const pid = String((payload && (payload.profile_id || payload.id)) || "").trim();
+    if (!pid) throw new Error("profile_id is required");
+    const profiles = this.getProfiles();
+    const idx = profiles.findIndex((p) => String(p.profile_id || "") === pid);
+    if (idx < 0) throw new Error(`profile not found: ${pid}`);
+    const removed = profiles[idx];
+    profiles.splice(idx, 1);
+    this.saveProfiles(profiles);
+
+    const removedDatasetId = String((removed && removed.dataset_id) || "").trim();
+    if (removedDatasetId) {
+      const datasets = this.getDatasets().filter((d) => String(d && d.id || "") !== removedDatasetId);
+      this.saveDatasets(datasets);
+    }
+    if (this.getDefaultProfileId() === pid) {
+      const nextDefault = String(((profiles[0] || {}).profile_id) || "").trim();
+      this.setDefaultProfileId(nextDefault);
+    }
+    return { ok: true, profile_id: pid, default_profile_id: this.getDefaultProfileId(), datasets: this.getDatasets() };
+  },
+
+  async handleSetDefaultProfile(payload) {
+    const pid = String((payload && (payload.profile_id || payload.id)) || "").trim();
+    if (!pid) throw new Error("profile_id is required");
+    const profiles = this.getProfiles();
+    const raw = profiles.find((p) => String(p.profile_id || "") === pid);
+    if (!raw) throw new Error(`profile not found: ${pid}`);
+    this.setDefaultProfileId(pid);
+    return {
+      ok: true,
+      profile_id: pid,
+      name: String(raw.name || pid),
+      dataset_id: String(raw.dataset_id || ""),
+    };
   },
 
   async handleSaveProfile(payload) {
-    const { profile } = payload;
+    const profileIn = payload && payload.profile && typeof payload.profile === "object" ? payload.profile : {};
+    const out = this.normalizeProfile(profileIn, profileIn.dataset_type);
+    const profile = out.profile;
     const profiles = this.getProfiles();
 
     const existingIdx = profiles.findIndex(p => p.profile_id === profile.profile_id);
     if (existingIdx >= 0) profiles[existingIdx] = profile;
     else profiles.push(profile);
+    this.saveProfiles(profiles);
+    if (!this.getDefaultProfileId()) {
+      this.setDefaultProfileId(profile.profile_id);
+    }
 
-    // Save logic generally only touches local datasets. 
-    // We constructs a new entry for the *new* dataset ID.
+    const family = this.datasetFamilyFromType(profile.dataset_type) || "v2x-traj";
+    const rootPath = String((profile.roots && profile.roots[0]) || (WebFS.rootHandle && WebFS.rootHandle.name) || "").trim();
     const dsEntry = {
       id: profile.dataset_id,
-      title: profile.name,
-      family: profile.type || 'v2x-traj',
-      root: profile.source_path
+      title: profile.name || profile.dataset_id,
+      family: family,
+      root: rootPath,
+      app: { supported: true, family: family },
     };
 
-    // We need to be careful not to modify the STATIC_CATALOG in place within getDatasets() return
-    // But since handleSaveProfile saves to LS via saveDatasets, checking existingDsIdx in the *combined* list is tricky.
-    // Actually, create a list of *only* dynamic ones to update.
+    const datasets = this.getDatasets();
+    const idx = datasets.findIndex((d) => String((d && d.id) || "") === dsEntry.id);
+    if (idx >= 0) datasets[idx] = { ...datasets[idx], ...dsEntry };
+    else datasets.push(dsEntry);
+    this.saveDatasets(datasets);
 
-    // Simpler: Just save the new entry. saveDatasets will filter out static IDs.
-    // If the user somehow updated a static ID... well, we generate new IDs 'ds-...' so no conflict.
-
-    // Re-read local only for manipulation
-    const local = [];
-    try {
-      const stored = JSON.parse(localStorage.getItem(this.LS_DATASETS));
-      if (Array.isArray(stored)) local.push(...stored);
-    } catch (e) { }
-
-    const idx = local.findIndex(d => d.id === dsEntry.id);
-    if (idx >= 0) local[idx] = dsEntry;
-    else local.push(dsEntry);
-
-    this.saveProfiles(profiles);
-    localStorage.setItem(this.LS_DATASETS, JSON.stringify(local));
-
-    return { ok: true, profile: profile };
+    return { ok: true, profile: profile, validation: out.validation, capabilities: out.capabilities, datasets: this.getDatasets() };
   },
 
   async handleListIntersections(url) {
@@ -577,7 +793,9 @@ const WebBackend = {
   },
 
   async handleLoadBundle(url) {
+    if (!WebFS.rootHandle) throw new Error("No folder selected");
     const parts = url.split('/');
+    const datasetId = parts[parts.indexOf('datasets') + 1] || 'web-dataset';
     const split = parts[parts.indexOf('scene') + 1];
     const sceneId = parts[parts.indexOf('scene') + 2];
     const urlObj = new URL(url, 'http://localhost');
@@ -589,6 +807,17 @@ const WebBackend = {
       'infra': 'infrastructure-trajectories',
       'vehicle': 'vehicle-trajectories',
       'traffic_light': 'traffic-light'
+    };
+
+    const extent = { min_x: Infinity, min_y: Infinity, max_x: -Infinity, max_y: -Infinity };
+    const allTs = new Set();
+
+    const updateExtent = (x, y) => {
+      if (!Number.isFinite(x) || !Number.isFinite(y)) return;
+      extent.min_x = Math.min(extent.min_x, x);
+      extent.min_y = Math.min(extent.min_y, y);
+      extent.max_x = Math.max(extent.max_x, x);
+      extent.max_y = Math.max(extent.max_y, y);
     };
 
     const trajectories = {};
@@ -639,6 +868,8 @@ const WebBackend = {
             obj.lane_id = r.lane_id;
           }
 
+          allTs.add(ts);
+          updateExtent(obj.x, obj.y);
           byTs[ts].push(obj);
         });
         trajectories[mod] = byTs;
@@ -659,12 +890,48 @@ const WebBackend = {
       }
     }
 
+    const tsSorted = Array.from(allTs).filter((x) => Number.isFinite(x)).sort((a, b) => a - b);
+    const timestamps = tsSorted.map((x) => x / 10);
+    const t0 = timestamps.length ? timestamps[0] : 0;
+    const frames = tsSorted.map((ts) => ({
+      ego: trajectories.ego && trajectories.ego[ts] ? trajectories.ego[ts] : [],
+      infra: trajectories.infra && trajectories.infra[ts] ? trajectories.infra[ts] : [],
+      vehicle: trajectories.vehicle && trajectories.vehicle[ts] ? trajectories.vehicle[ts] : [],
+      traffic_light: trajectories.traffic_light && trajectories.traffic_light[ts] ? trajectories.traffic_light[ts] : [],
+    }));
+
+    const modality_stats = {};
+    for (const mod of modalities) {
+      const byTs = trajectories[mod] || {};
+      const keys = Object.keys(byTs).map((x) => Number(x)).filter((x) => Number.isFinite(x)).sort((a, b) => a - b);
+      const rows = keys.reduce((acc, k) => acc + ((byTs[k] || []).length), 0);
+      modality_stats[mod] = {
+        rows: rows,
+        unique_ts: keys.length,
+        min_ts: keys.length ? (keys[0] / 10) : null,
+        max_ts: keys.length ? (keys[keys.length - 1] / 10) : null,
+      };
+    }
+
+    const normalizedExtent = Number.isFinite(extent.min_x) ? extent : { min_x: 0, min_y: 0, max_x: 1, max_y: 1 };
+
     return {
+      dataset_id: datasetId,
       scene_id: sceneId,
       split: split,
+      city: "Web City",
+      intersect_id: "web",
+      intersect_label: "Web",
+      map_id: mapData ? (mapData.map_id || "web_map") : null,
+      t0: t0,
+      timestamps: timestamps,
+      extent: normalizedExtent,
+      modality_stats: modality_stats,
+      frames: frames,
+      warnings: [],
       trajectories: trajectories,
       map: mapData,
-      meta: { city: "Web City", intersect_id: "001" }
+      meta: { city: "Web City", intersect_id: "web" }
     };
   }
 };
