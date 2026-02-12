@@ -136,13 +136,14 @@ def _fetch_update_payload_uncached() -> dict[str, object]:
         "release_url": None,
         "download_url": None,
         "published_at": None,
+        "release_prerelease": None,
+        "release_source": "latest",
         "error": None,
     }
     if not repo:
         return base
 
-    url = f"https://api.github.com/repos/{repo}/releases/latest"
-    try:
+    def _request_json(url: str) -> object:
         req = Request(
             url,
             headers={
@@ -151,16 +152,58 @@ def _fetch_update_payload_uncached() -> dict[str, object]:
             },
         )
         with urlopen(req, timeout=8) as resp:
-            raw = json.loads(resp.read().decode("utf-8", errors="replace"))
+            return json.loads(resp.read().decode("utf-8", errors="replace"))
+
+    latest_url = f"https://api.github.com/repos/{repo}/releases/latest"
+    raw: dict[str, object] | None = None
+    try:
+        latest_payload = _request_json(latest_url)
+        if isinstance(latest_payload, dict):
+            raw = latest_payload
+        else:
+            base["ok"] = False
+            base["error"] = "invalid response from release API"
+            base["comparison_mode"] = "error"
+            return base
+    except HTTPError as e:
+        # GitHub returns 404 on /releases/latest when there is no non-prerelease release.
+        if int(getattr(e, "code", 0) or 0) != 404:
+            base["ok"] = False
+            base["error"] = str(e)
+            base["comparison_mode"] = "error"
+            return base
+
+        fallback_url = f"https://api.github.com/repos/{repo}/releases?per_page=20"
+        try:
+            releases_payload = _request_json(fallback_url)
+        except Exception as ee:
+            base["ok"] = False
+            base["error"] = str(ee)
+            base["comparison_mode"] = "error"
+            return base
+
+        releases = releases_payload if isinstance(releases_payload, list) else []
+        for rel in releases:
+            if not isinstance(rel, dict):
+                continue
+            # Ignore drafts, but allow prereleases for tester channels.
+            if bool(rel.get("draft")):
+                continue
+            tag = str(rel.get("tag_name") or "").strip()
+            if not tag:
+                continue
+            raw = rel
+            base["release_source"] = "fallback_releases_list"
+            break
+
+        if raw is None:
+            base["comparison_mode"] = "no_releases"
+            base["release_url"] = f"https://github.com/{repo}/releases"
+            base["error"] = None
+            return base
     except Exception as e:
         base["ok"] = False
         base["error"] = str(e)
-        base["comparison_mode"] = "error"
-        return base
-
-    if not isinstance(raw, dict):
-        base["ok"] = False
-        base["error"] = "invalid response from release API"
         base["comparison_mode"] = "error"
         return base
 
@@ -177,6 +220,7 @@ def _fetch_update_payload_uncached() -> dict[str, object]:
     base["release_url"] = str(raw.get("html_url") or "").strip() or None
     base["download_url"] = _pick_release_download_url(raw)
     base["published_at"] = str(raw.get("published_at") or "").strip() or None
+    base["release_prerelease"] = bool(raw.get("prerelease"))
     return base
 
 
