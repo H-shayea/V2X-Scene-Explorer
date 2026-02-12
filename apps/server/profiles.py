@@ -10,6 +10,11 @@ import time
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 import uuid
 
+try:
+    from apps.server.domain import dataset_family_from_type, normalize_dataset_type
+except ModuleNotFoundError:
+    from domain import dataset_family_from_type, normalize_dataset_type  # type: ignore
+
 
 PROFILE_SCHEMA_VERSION = 1
 PROFILE_ADAPTER_VERSION = "1.0"
@@ -1379,18 +1384,8 @@ def _detect_cpm(paths: List[Path], profile_name: str) -> Dict[str, Any]:
 
 
 def _normalize_dataset_type(raw: Any) -> str:
-    s = str(raw or "").strip().lower()
-    if s in ("v2x-traj", "v2x_traj", "v2xtraj"):
-        return "v2x_traj"
-    if s in ("v2x-seq", "v2x_seq", "v2xseq"):
-        return "v2x_seq"
-    if s in ("consider-it-cpm", "consider_it_cpm", "cpm", "cpm-objects", "considerit"):
-        return "consider_it_cpm"
-    if s in ("ind", "in-d", "ind_dataset"):
-        return "ind"
-    if s in ("sind", "sin-d", "sin_d", "sind_dataset"):
-        return "sind"
-    return ""
+    # Backward-compatible wrapper kept for existing call sites in this module.
+    return normalize_dataset_type(raw)
 
 
 def detect_profile(repo_root: Path, payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -2104,6 +2099,7 @@ class ProfileStore:
         )
         for p in ready_profiles:
             dataset_type = _normalize_dataset_type(p.get("dataset_type"))
+            family = dataset_family_from_type(dataset_type)
             did = str(p.get("dataset_id") or "").strip()
             if not did:
                 continue
@@ -2119,24 +2115,17 @@ class ProfileStore:
                 "scene_strategy": p.get("scene_strategy") if isinstance(p.get("scene_strategy"), dict) else {},
                 "profile_id": str(p.get("profile_id") or ""),
             }
+            if not family:
+                continue
+            entry["family"] = family
             if dataset_type == "v2x_traj":
-                entry["family"] = "v2x-traj"
                 scenes_path = (((entry.get("bindings") or {}).get("scenes_index") or {}).get("path")) if isinstance(entry.get("bindings"), dict) else None
                 if scenes_path:
                     entry["scenes"] = str(scenes_path)
-            elif dataset_type == "v2x_seq":
-                entry["family"] = "v2x-seq"
-            elif dataset_type == "ind":
-                entry["family"] = "ind"
-            elif dataset_type == "sind":
-                entry["family"] = "sind"
             elif dataset_type == "consider_it_cpm":
-                entry["family"] = "cpm-objects"
                 basemap = p.get("basemap") if isinstance(p.get("basemap"), dict) else None
                 if basemap:
                     entry["basemap"] = basemap
-            else:
-                continue
             out.append(entry)
         return out
 

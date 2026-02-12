@@ -7,6 +7,8 @@
 const WebFS = {
   rootHandle: null,
   cachedHandles: new Map(), // path string -> handle
+  textCache: new Map(), // path string -> text
+  maxTextCacheItems: 64,
 
   isSupported() {
     return 'showDirectoryPicker' in window;
@@ -19,6 +21,10 @@ const WebFS = {
       });
       this.rootHandle = handle;
       this.cachedHandles.clear();
+      this.textCache.clear();
+      if (window.WebBackend && window.WebBackend._csvRowsCache && typeof window.WebBackend._csvRowsCache.clear === "function") {
+        window.WebBackend._csvRowsCache.clear();
+      }
       this.cachedHandles.set('', handle);
       this.cachedHandles.set(handle.name, handle);
       return handle;
@@ -51,10 +57,23 @@ const WebFS = {
   },
 
   async readFileText(pathStr) {
+    const key = String(pathStr || "");
+    if (this.textCache.has(key)) {
+      const hit = this.textCache.get(key);
+      this.textCache.delete(key);
+      this.textCache.set(key, hit);
+      return hit;
+    }
     const handle = await this.getFileHandle(pathStr);
     if (!handle) return null;
     const file = await handle.getFile();
-    return await file.text();
+    const text = await file.text();
+    this.textCache.set(key, text);
+    while (this.textCache.size > this.maxTextCacheItems) {
+      const oldest = this.textCache.keys().next().value;
+      this.textCache.delete(oldest);
+    }
+    return text;
   },
 
   async readFileJson(pathStr) {
@@ -161,6 +180,42 @@ function processMapData(raw) {
   };
 }
 
+function trajDomain() {
+  return (window.TrajDomain && typeof window.TrajDomain === "object") ? window.TrajDomain : null;
+}
+
+function domainNormalizeDatasetType(raw) {
+  const d = trajDomain();
+  if (d && typeof d.normalizeDatasetType === "function") {
+    return d.normalizeDatasetType(raw);
+  }
+  return '';
+}
+
+function domainDatasetFamilyFromType(raw) {
+  const d = trajDomain();
+  if (d && typeof d.datasetFamilyFromType === "function") {
+    return d.datasetFamilyFromType(raw);
+  }
+  return '';
+}
+
+function domainCapabilitiesFromType(raw) {
+  const d = trajDomain();
+  if (d && typeof d.capabilitiesFromDatasetType === "function") {
+    return d.capabilitiesFromDatasetType(raw);
+  }
+  return {};
+}
+
+function domainDefaultSceneStrategy(raw) {
+  const d = trajDomain();
+  if (d && typeof d.defaultSceneStrategy === "function") {
+    return d.defaultSceneStrategy(raw);
+  }
+  return { mode: "intersection_scene" };
+}
+
 
 // === Web Backend Emulation ===
 
@@ -168,6 +223,8 @@ const WebBackend = {
   LS_DATASETS: "traj.web.datasets",
   LS_PROFILES: "traj.web.profiles",
   LS_DEFAULT_PROFILE: "traj.web.default_profile",
+  CSV_ROWS_CACHE_MAX: 96,
+  _csvRowsCache: new Map(), // path -> parsed rows
 
   STATIC_CATALOG: [
     {
@@ -396,44 +453,19 @@ const WebBackend = {
   },
 
   normalizeDatasetType(raw) {
-    const s = String(raw || '').trim().toLowerCase();
-    if (s === 'v2x-traj' || s === 'v2x_traj' || s === 'v2xtraj') return 'v2x_traj';
-    if (s === 'v2x-seq' || s === 'v2x_seq' || s === 'v2xseq') return 'v2x_seq';
-    if (s === 'ind' || s === 'in-d' || s === 'ind_dataset') return 'ind';
-    if (s === 'sind' || s === 'sin-d' || s === 'sin_d' || s === 'sind_dataset') return 'sind';
-    if (s === 'consider-it-cpm' || s === 'consider_it_cpm' || s === 'cpm' || s === 'cpm-objects' || s === 'considerit') return 'consider_it_cpm';
-    return '';
+    return domainNormalizeDatasetType(raw);
   },
 
   datasetFamilyFromType(raw) {
-    const t = this.normalizeDatasetType(raw);
-    if (t === 'v2x_traj') return 'v2x-traj';
-    if (t === 'v2x_seq') return 'v2x-seq';
-    if (t === 'ind') return 'ind';
-    if (t === 'sind') return 'sind';
-    if (t === 'consider_it_cpm') return 'cpm-objects';
-    return '';
+    return domainDatasetFamilyFromType(raw);
   },
 
   capabilitiesFromType(raw) {
-    const t = this.normalizeDatasetType(raw);
-    if (t === "v2x_traj" || t === "v2x_seq") {
-      return { has_map: true, has_traffic_lights: true, splits: ["train", "val"], group_label: "Intersection" };
-    }
-    if (t === "ind") return { has_map: true, has_traffic_lights: false, splits: ["all"], group_label: "Location" };
-    if (t === "sind") return { has_map: true, has_traffic_lights: true, splits: ["all"], group_label: "City" };
-    if (t === "consider_it_cpm") return { has_map: false, has_traffic_lights: false, splits: ["all"], group_label: "Sensor" };
-    return {};
+    return domainCapabilitiesFromType(raw);
   },
 
   defaultSceneStrategy(raw) {
-    const t = this.normalizeDatasetType(raw);
-    if (t === "v2x_traj") return { mode: "intersection_scene" };
-    if (t === "v2x_seq") return { mode: "sequence_scene" };
-    if (t === "ind") return { mode: "recording_window", window_s: 60 };
-    if (t === "sind") return { mode: "scenario_scene" };
-    if (t === "consider_it_cpm") return { mode: "time_window", window_s: 300, gap_s: 120 };
-    return { mode: "intersection_scene" };
+    return domainDefaultSceneStrategy(raw);
   },
 
   profileSummary(profile, defaultProfileId = this.getDefaultProfileId()) {
@@ -541,6 +573,33 @@ const WebBackend = {
       return "sind";
     }
     return "v2x_traj";
+  },
+
+  _cacheCsvRows(pathKey, rows) {
+    this._csvRowsCache.set(pathKey, rows);
+    while (this._csvRowsCache.size > this.CSV_ROWS_CACHE_MAX) {
+      const oldest = this._csvRowsCache.keys().next().value;
+      this._csvRowsCache.delete(oldest);
+    }
+  },
+
+  async readCsvRowsFromPaths(paths) {
+    for (const p of (paths || [])) {
+      const pathKey = String(p || "").trim();
+      if (!pathKey) continue;
+      const cached = this._csvRowsCache.get(pathKey);
+      if (cached) {
+        this._csvRowsCache.delete(pathKey);
+        this._csvRowsCache.set(pathKey, cached);
+        return { rows: cached, path: pathKey };
+      }
+      const text = await WebFS.readFileText(pathKey);
+      if (!text) continue;
+      const rows = parseCsv(text);
+      this._cacheCsvRows(pathKey, rows);
+      return { rows, path: pathKey };
+    }
+    return { rows: [], path: null };
   },
 
   async fetchJson(url) {
@@ -709,16 +768,16 @@ const WebBackend = {
       return { split, items: [] };
     }
 
-    let csvText = await WebFS.readFileText('scenes.csv');
-    // If not at root, try split folder
-    if (!csvText) csvText = await WebFS.readFileText(WebFS.joinPath(WebFS.rootHandle.name, split, 'scenes.csv'));
-    if (!csvText) csvText = await WebFS.readFileText(WebFS.joinPath(WebFS.rootHandle.name, 'scenes.csv'));
-
-    if (!csvText) {
+    const candidatePaths = [
+      'scenes.csv',
+      WebFS.joinPath(WebFS.rootHandle.name, split, 'scenes.csv'),
+      WebFS.joinPath(WebFS.rootHandle.name, 'scenes.csv'),
+    ];
+    const found = await this.readCsvRowsFromPaths(candidatePaths);
+    const rows = Array.isArray(found.rows) ? found.rows : [];
+    if (!rows.length) {
       return { split, items: [] };
     }
-
-    const rows = parseCsv(csvText);
     const counts = {};
     rows.forEach(r => {
       // Filter by split logic
@@ -754,18 +813,18 @@ const WebBackend = {
       return { items: [], total: 0, limit, offset, availability: { scene_count: 0 } };
     }
 
-    let csvText = await WebFS.readFileText('scenes.csv');
-    // If not at root, try split folder
-    if (!csvText) csvText = await WebFS.readFileText(WebFS.joinPath(WebFS.rootHandle.name, split, 'scenes.csv'));
-    if (!csvText) csvText = await WebFS.readFileText(WebFS.joinPath(WebFS.rootHandle.name, 'scenes.csv'));
-
-    if (!csvText) {
+    const candidatePaths = [
+      'scenes.csv',
+      WebFS.joinPath(WebFS.rootHandle.name, split, 'scenes.csv'),
+      WebFS.joinPath(WebFS.rootHandle.name, 'scenes.csv'),
+    ];
+    const found = await this.readCsvRowsFromPaths(candidatePaths);
+    const rows = Array.isArray(found.rows) ? found.rows : [];
+    if (!rows.length) {
       // Fallback: list files in trajectories dir?
       // For now, return empty.
       return { items: [], total: 0, limit, offset, availability: { scene_count: 0 } };
     }
-
-    const rows = parseCsv(csvText);
     const scenes = rows.filter(r => {
       // Filter by split logic:
       if (r.split) return r.split === split;
@@ -823,18 +882,13 @@ const WebBackend = {
     const trajectories = {};
     for (const mod of modalities) {
       const folder = pathMap[mod];
-      // Try standard path: {root}/{folder}/{split}/data/{sceneId}.csv
-      let path = WebFS.joinPath(WebFS.rootHandle.name, folder, split, 'data', `${sceneId}.csv`);
-      let text = await WebFS.readFileText(path);
-
-      // Fallback: {root}/{folder}/{sceneId}.csv
-      if (!text) {
-        path = WebFS.joinPath(WebFS.rootHandle.name, folder, `${sceneId}.csv`);
-        text = await WebFS.readFileText(path);
-      }
-
-      if (text) {
-        const rows = parseCsv(text);
+      const candidatePaths = [
+        WebFS.joinPath(WebFS.rootHandle.name, folder, split, 'data', `${sceneId}.csv`),
+        WebFS.joinPath(WebFS.rootHandle.name, folder, `${sceneId}.csv`),
+      ];
+      const found = await this.readCsvRowsFromPaths(candidatePaths);
+      const rows = Array.isArray(found.rows) ? found.rows : [];
+      if (rows.length) {
         const byTs = {};
         rows.forEach(r => {
           const ts = parseTs100ms(r.timestamp);

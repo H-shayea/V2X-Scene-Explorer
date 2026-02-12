@@ -17,6 +17,10 @@ scene browsing, playback, full trajectories, per-class filters, and HD map rende
 - Filters: modality/stream, object type, and fine-grained classes (subtypes)
 - HD map layers (lanes/stoplines/crosswalks/junction areas) for datasets that provide maps
 
+## Architecture
+
+- High-level architecture and module layering are documented in `docs/ARCHITECTURE.md`.
+
 ## Quick start
 
 ### Requirements

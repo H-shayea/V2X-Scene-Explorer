@@ -15,8 +15,10 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 try:
+    from apps.server.domain import SUPPORTED_DATASET_FAMILIES
     from apps.server.profiles import load_profile_dataset_entries
 except ModuleNotFoundError:
+    from domain import SUPPORTED_DATASET_FAMILIES  # type: ignore
     from profiles import load_profile_dataset_entries  # type: ignore
 
 
@@ -4523,7 +4525,7 @@ def load_registry(repo_root: Path) -> List[DatasetSpec]:
 
 
 class DatasetStore:
-    _SUPPORTED_FAMILIES = {"v2x-traj", "v2x-seq", "ind", "sind", "cpm-objects"}
+    _SUPPORTED_FAMILIES = set(SUPPORTED_DATASET_FAMILIES)
 
     def __init__(self, repo_root: Path) -> None:
         self.repo_root = repo_root

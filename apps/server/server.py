@@ -47,6 +47,7 @@ _update_cache_key = ""
 _update_cache_ts = 0.0
 _update_cache_payload: dict[str, object] | None = None
 _SEMVER_RE = re.compile(r"^v?(\d+)\.(\d+)\.(\d+)(?:[-+].*)?$")
+_SAFE_COMPONENT_RE = re.compile(r"^[A-Za-z0-9_.:#-]{1,160}$")
 _PRETTY_JSON = str(os.environ.get("TRAJ_PRETTY_JSON") or "").strip().lower() in ("1", "true", "yes", "on")
 _COMPACT_BUNDLE = str(os.environ.get("TRAJ_COMPACT_BUNDLE", "1") or "").strip().lower() in ("1", "true", "yes", "on")
 
@@ -173,6 +174,15 @@ def clamp_int(s: str, default: int, min_v: int, max_v: int) -> int:
     except Exception:
         return default
     return max(min_v, min(max_v, v))
+
+
+def _is_safe_component(value: str) -> bool:
+    s = str(value or "").strip()
+    if not s:
+        return False
+    if "/" in s or "\\" in s or "\x00" in s or ".." in s:
+        return False
+    return _SAFE_COMPONENT_RE.fullmatch(s) is not None
 
 
 def _now_utc_iso() -> str:
@@ -763,6 +773,9 @@ class AppHandler(BaseHTTPRequestHandler):
                 if scene_id == "":
                     self._send_error_json(400, "bad_request", "scene_id is required")
                     return
+                if not _is_safe_component(split) or not _is_safe_component(scene_id):
+                    self._send_error_json(400, "bad_request", "invalid split or scene_id")
+                    return
                 payload = adapter.locate_scene(split, scene_id)
                 self._send_json(200, payload)
                 return
@@ -771,6 +784,9 @@ class AppHandler(BaseHTTPRequestHandler):
             if len(parts) == 7 and parts[3] == "scene" and parts[6] == "bundle":
                 split = parts[4]
                 scene_id = parts[5]
+                if not _is_safe_component(split) or not _is_safe_component(scene_id):
+                    self._send_error_json(400, "bad_request", "invalid split or scene_id")
+                    return
                 include_map = (qs.get("include_map", ["1"])[0] or "1") != "0"
                 map_clip = (qs.get("map_clip", ["intersection"])[0] or "intersection").strip()
                 map_padding = float(qs.get("map_padding", ["60"])[0] or 60)
@@ -794,6 +810,9 @@ class AppHandler(BaseHTTPRequestHandler):
             if len(parts) == 7 and parts[3] == "scene" and parts[6] == "background":
                 split = parts[4]
                 scene_id = parts[5]
+                if not _is_safe_component(split) or not _is_safe_component(scene_id):
+                    self._send_error_json(400, "bad_request", "invalid split or scene_id")
+                    return
                 getter = getattr(adapter, "get_scene_background", None)
                 if getter is None or not callable(getter):
                     self._send_error_json(404, "not_found", "scene background not available for this dataset")
