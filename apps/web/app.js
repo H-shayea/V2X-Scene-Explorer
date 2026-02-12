@@ -14,6 +14,27 @@ function isWebMode() {
   return !hasDesktopBridge();
 }
 
+function webBackendQueryOverride() {
+  try {
+    const qp = new URLSearchParams(String(window.location.search || ""));
+    const raw = String(qp.get("web_backend") || "").trim().toLowerCase();
+    if (raw === "1" || raw === "true" || raw === "on" || raw === "yes") return true;
+    if (raw === "0" || raw === "false" || raw === "off" || raw === "no") return false;
+  } catch (_) { }
+  return null;
+}
+
+function shouldUseEmbeddedWebBackend() {
+  const wb = window.WebBackend;
+  if (!isWebMode() || !wb || typeof wb.fetchJson !== "function" || typeof wb.postJson !== "function") return false;
+  const forced = webBackendQueryOverride();
+  if (forced !== null) return forced;
+  // On localhost/loopback we usually have the real Python backend; prefer it over the lightweight JS shim.
+  const host = String(window.location.hostname || "").trim().toLowerCase();
+  if (host === "localhost" || host === "127.0.0.1" || host === "[::1]" || host === "::1") return false;
+  return true;
+}
+
 function syncRuntimeModeCss() {
   const web = isWebMode();
   if (document.body) {
@@ -25,7 +46,7 @@ syncRuntimeModeCss();
 window.addEventListener("pywebviewready", syncRuntimeModeCss);
 
 async function fetchJson(url) {
-  if (isWebMode() && window.WebBackend && window.WebBackend.fetchJson) {
+  if (shouldUseEmbeddedWebBackend()) {
     return window.WebBackend.fetchJson(url);
   }
   const res = await fetch(url);
@@ -37,7 +58,7 @@ async function fetchJson(url) {
 }
 
 async function postJson(url, payload) {
-  if (isWebMode() && window.WebBackend && window.WebBackend.postJson) {
+  if (shouldUseEmbeddedWebBackend()) {
     return window.WebBackend.postJson(url, payload);
   }
   const res = await fetch(url, {
@@ -396,10 +417,6 @@ function drawSceneBackground(ctx, view, cssW, cssH, dpr, bundle) {
   ctx.globalAlpha = placement.alpha;
   ctx.imageSmoothingEnabled = true;
   ctx.translate(cx, cy);
-  if (placement.rotationDeg) {
-    // Screen Y axis points down, so world rotation sign is inverted on canvas.
-    ctx.rotate(-(Number(placement.rotationDeg) * Math.PI) / 180.0);
-  }
   if (placement.flipY) {
     ctx.scale(1, -1);
   }
@@ -1204,7 +1221,7 @@ function currentSceneBackground(bundle = state.bundle) {
   return bg;
 }
 
-function currentSceneBackgroundPlacement(bundle = state.bundle) {
+function currentSceneBackgroundBasePlacement(bundle = state.bundle) {
   const bg = currentSceneBackground(bundle);
   if (!bg) return null;
   const ext = bg.extent;
@@ -1214,11 +1231,99 @@ function currentSceneBackgroundPlacement(bundle = state.bundle) {
   const maxY = Number(ext.max_y);
   if (![minX, maxX, minY, maxY].every((v) => Number.isFinite(v))) return null;
 
-  let cx = 0.5 * (minX + maxX);
-  let cy = 0.5 * (minY + maxY);
-  let widthM = Math.max(1e-6, maxX - minX);
-  let heightM = Math.max(1e-6, maxY - minY);
-  let rotationDeg = 0;
+  return {
+    background: bg,
+    cx: 0.5 * (minX + maxX),
+    cy: 0.5 * (minY + maxY),
+    widthM: Math.max(1e-6, maxX - minX),
+    heightM: Math.max(1e-6, maxY - minY),
+  };
+}
+
+function currentSindTrajectoryTransform(bundle = state.bundle) {
+  if (!isSindDataset() || !sindBgAlignCityKey(bundle)) return null;
+  const base = currentSceneBackgroundBasePlacement(bundle);
+  if (!base) return null;
+  const cal = getSindBgAlign(bundle);
+  if (!cal.enabled) return null;
+
+  const tx = Number.isFinite(Number(cal.tx)) ? Number(cal.tx) : 0;
+  const ty = Number.isFinite(Number(cal.ty)) ? Number(cal.ty) : 0;
+  const sx = clamp(Number.isFinite(Number(cal.sx)) ? Number(cal.sx) : 1, 0.05, 10);
+  const sy = clamp(Number.isFinite(Number(cal.sy)) ? Number(cal.sy) : 1, 0.05, 10);
+  const rotDeg = clamp(Number.isFinite(Number(cal.rotationDeg)) ? Number(cal.rotationDeg) : 0, -180, 180);
+  const rotRad = (rotDeg * Math.PI) / 180.0;
+
+  if (Math.abs(tx) < 1e-9 && Math.abs(ty) < 1e-9 && Math.abs(sx - 1) < 1e-9 && Math.abs(sy - 1) < 1e-9 && Math.abs(rotRad) < 1e-12) {
+    return null;
+  }
+
+  return {
+    c0x: base.cx,
+    c0y: base.cy,
+    c1x: base.cx + tx,
+    c1y: base.cy + ty,
+    sx,
+    sy,
+    rotRad,
+    cos: Math.cos(rotRad),
+    sin: Math.sin(rotRad),
+  };
+}
+
+function applySindTrajectoryToPoint(x, y, bundle = state.bundle) {
+  const tx = currentSindTrajectoryTransform(bundle);
+  const xIn = Number(x);
+  const yIn = Number(y);
+  if (!tx || !Number.isFinite(xIn) || !Number.isFinite(yIn)) return [xIn, yIn];
+
+  const dx = xIn - tx.c1x;
+  const dy = yIn - tx.c1y;
+  const xr = dx * tx.cos + dy * tx.sin;
+  const yr = -dx * tx.sin + dy * tx.cos;
+  return [tx.c0x + xr / tx.sx, tx.c0y + yr / tx.sy];
+}
+
+function applySindTrajectoryWorldTransform(ctx, bundle = state.bundle) {
+  const tx = currentSindTrajectoryTransform(bundle);
+  if (!tx) return false;
+  ctx.translate(tx.c0x, tx.c0y);
+  ctx.scale(1 / tx.sx, 1 / tx.sy);
+  ctx.rotate(-tx.rotRad);
+  ctx.translate(-tx.c1x, -tx.c1y);
+  return true;
+}
+
+function transformExtentForSindTrajectory(extent, bundle = state.bundle) {
+  if (!extent || typeof extent !== "object") return extent;
+  const corners = [
+    [Number(extent.min_x), Number(extent.min_y)],
+    [Number(extent.min_x), Number(extent.max_y)],
+    [Number(extent.max_x), Number(extent.min_y)],
+    [Number(extent.max_x), Number(extent.max_y)],
+  ];
+  if (!corners.every((c) => Number.isFinite(c[0]) && Number.isFinite(c[1]))) return extent;
+
+  let minX = Infinity;
+  let minY = Infinity;
+  let maxX = -Infinity;
+  let maxY = -Infinity;
+  for (const [x, y] of corners) {
+    const [tx, ty] = applySindTrajectoryToPoint(x, y, bundle);
+    if (!Number.isFinite(tx) || !Number.isFinite(ty)) continue;
+    minX = Math.min(minX, tx);
+    minY = Math.min(minY, ty);
+    maxX = Math.max(maxX, tx);
+    maxY = Math.max(maxY, ty);
+  }
+  if (![minX, minY, maxX, maxY].every((v) => Number.isFinite(v))) return extent;
+  return { min_x: minX, min_y: minY, max_x: maxX, max_y: maxY };
+}
+
+function currentSceneBackgroundPlacement(bundle = state.bundle) {
+  const base = currentSceneBackgroundBasePlacement(bundle);
+  if (!base) return null;
+
   let alpha = 0.92;
   let flipY = false;
 
@@ -1226,23 +1331,14 @@ function currentSceneBackgroundPlacement(bundle = state.bundle) {
   if (useSindCalib) {
     const cal = getSindBgAlign(bundle);
     if (cal.enabled) {
-      cx += Number(cal.tx || 0);
-      cy += Number(cal.ty || 0);
-      widthM *= Math.max(0.05, Number(cal.sx || 1));
-      heightM *= Math.max(0.05, Number(cal.sy || 1));
-      rotationDeg = Number(cal.rotationDeg || 0);
       alpha = clamp(Number(cal.alpha || 0.92), 0.2, 1.0);
       flipY = !!cal.flipY;
     }
   }
 
   return {
-    background: bg,
-    cx,
-    cy,
-    widthM,
-    heightM,
-    rotationDeg,
+    ...base,
+    rotationDeg: 0,
     alpha,
     flipY,
   };
@@ -1666,8 +1762,8 @@ function modalityShortLabel(modality) {
 }
 
 function computeSceneViewExtent(bundle) {
-  if (bundle.map && bundle.map.clip_extent) return bundle.map.clip_extent;
-  return bundle.extent;
+  if (state.showMap && bundle.map && bundle.map.clip_extent) return bundle.map.clip_extent;
+  return transformExtentForSindTrajectory(bundle.extent, bundle);
 }
 
 function buildMapPaths(map) {
@@ -2187,7 +2283,7 @@ function render() {
   // Ensure a view exists (default: fit to scene/trajectories).
   if (!state.view) {
     // Default to the scene extent (trajectories). Users can hit "Fit Map" for full intersection context.
-    state.view = fitViewToExtent(bundle.extent, cssW, cssH, 28);
+    state.view = fitViewToExtent(transformExtentForSindTrajectory(bundle.extent, bundle), cssW, cssH, 28);
   }
   const view = state.view;
 
@@ -2316,11 +2412,12 @@ function render() {
   if (state.focusMask && bundle.map && bundle.map.clip_mode === "intersection" && bundle.map.clip_extent) {
     const outer = bundle.map.clip_extent;
     const pad = clamp(Number(state.mapPadding || 120), 40, 250);
+    const sceneExtent = transformExtentForSindTrajectory(bundle.extent, bundle);
     const inner = {
-      min_x: bundle.extent.min_x - pad,
-      min_y: bundle.extent.min_y - pad,
-      max_x: bundle.extent.max_x + pad,
-      max_y: bundle.extent.max_y + pad,
+      min_x: sceneExtent.min_x - pad,
+      min_y: sceneExtent.min_y - pad,
+      max_x: sceneExtent.max_x + pad,
+      max_y: sceneExtent.max_y + pad,
     };
     const mask = new Path2D();
     mask.rect(outer.min_x, outer.min_y, outer.max_x - outer.min_x, outer.max_y - outer.min_y);
@@ -2333,39 +2430,41 @@ function render() {
   }
 
   if (state.sceneBox) {
+    const sceneExtent = transformExtentForSindTrajectory(bundle.extent, bundle);
     ctx.save();
     ctx.globalAlpha = 0.06;
     ctx.fillStyle = "#2563eb";
     ctx.fillRect(
-      bundle.extent.min_x,
-      bundle.extent.min_y,
-      bundle.extent.max_x - bundle.extent.min_x,
-      bundle.extent.max_y - bundle.extent.min_y
+      sceneExtent.min_x,
+      sceneExtent.min_y,
+      sceneExtent.max_x - sceneExtent.min_x,
+      sceneExtent.max_y - sceneExtent.min_y
     );
     ctx.globalAlpha = 0.75;
     ctx.strokeStyle = "#2563eb";
     ctx.lineWidth = 1.6 / view.scale;
     ctx.strokeRect(
-      bundle.extent.min_x,
-      bundle.extent.min_y,
-      bundle.extent.max_x - bundle.extent.min_x,
-      bundle.extent.max_y - bundle.extent.min_y
+      sceneExtent.min_x,
+      sceneExtent.min_y,
+      sceneExtent.max_x - sceneExtent.min_x,
+      sceneExtent.max_y - sceneExtent.min_y
     );
     ctx.restore();
   }
 
   if (state.debugOverlay) {
     const px = (n) => n / view.scale;
+    const sceneExtent = transformExtentForSindTrajectory(bundle.extent, bundle);
     // Scene extent
     ctx.save();
     ctx.globalAlpha = 0.8;
     ctx.strokeStyle = "#7c3aed";
     ctx.lineWidth = px(1.5);
     ctx.strokeRect(
-      bundle.extent.min_x,
-      bundle.extent.min_y,
-      bundle.extent.max_x - bundle.extent.min_x,
-      bundle.extent.max_y - bundle.extent.min_y
+      sceneExtent.min_x,
+      sceneExtent.min_y,
+      sceneExtent.max_x - sceneExtent.min_x,
+      sceneExtent.max_y - sceneExtent.min_y
     );
     ctx.restore();
 
@@ -2442,6 +2541,9 @@ function render() {
     drawSegment(0, k, 0.92, 3.0, null, true);
   };
 
+  ctx.save();
+  applySindTrajectoryWorldTransform(ctx, bundle);
+
   // Trajectories for all objects in scene.
   if (state.trajectoryRange !== "none") {
     for (const modality of agentModalitiesOrdered()) {
@@ -2482,6 +2584,8 @@ function render() {
 
   ctx.restore();
 
+  ctx.restore();
+
   // Timeline labels
   $("frameLabel").textContent = `Frame ${frame} / ${Math.max(0, bundle.frames.length - 1)}`;
   const ts = bundle.timestamps && bundle.timestamps[frame] != null ? bundle.timestamps[frame] : null;
@@ -2505,7 +2609,8 @@ function pickNearestAgentAt(canvasX, canvasY) {
     for (const rec of fr[modality] || []) {
       if (!shouldDrawRec(modality, rec)) continue;
       if (rec.x == null || rec.y == null) continue;
-      const [cx, cy] = viewWorldToCanvas(view, cssW, cssH, rec.x, rec.y);
+      const [wx, wy] = applySindTrajectoryToPoint(rec.x, rec.y, bundle);
+      const [cx, cy] = viewWorldToCanvas(view, cssW, cssH, wx, wy);
       const dx = cx - canvasX;
       const dy = cy - canvasY;
       const d2 = dx * dx + dy * dy;
@@ -3436,7 +3541,7 @@ function isDesktopPickerAvailable(methodName) {
 }
 
 async function pickPathsDesktop(methodName, fallbackPrompt, defaultPath = "") {
-  if (isWebMode() && window.WebFS && methodName === 'pick_folder') {
+  if (shouldUseEmbeddedWebBackend() && window.WebFS && methodName === 'pick_folder') {
     if (window.WebFS.isSupported && !window.WebFS.isSupported()) {
       alert("Your browser does not support the File System Access API (needed for local file access). Please use Chrome, Edge, or Opera.");
       return [];
