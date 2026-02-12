@@ -568,6 +568,7 @@ const req = { intersections: 0, scenes: 0, bundle: 0 };
 const LS_LAST_DATASET = "trajExplorer.lastDatasetId";
 const LS_DATASET_SETTINGS = "trajExplorer.datasetSettingsById.v1";
 const LS_SIND_BG_ALIGN = "trajExplorer.sindBgAlignByCity.v1";
+const COOKIE_SIND_BG_ALIGN = "trajExplorerSindBgAlignV1";
 const SS_SOURCE_BY_TYPE = "trajExplorer.sourceByType.v1";
 
 function safeJsonParse(s) {
@@ -576,6 +577,34 @@ function safeJsonParse(s) {
   } catch (_) {
     return null;
   }
+}
+
+function readCookie(name) {
+  const key = String(name || "").trim();
+  if (!key) return "";
+  const parts = String(document.cookie || "").split(";");
+  for (const part of parts) {
+    const p = String(part || "").trim();
+    if (!p) continue;
+    const i = p.indexOf("=");
+    if (i <= 0) continue;
+    const k = p.slice(0, i).trim();
+    if (k !== key) continue;
+    try {
+      return decodeURIComponent(p.slice(i + 1));
+    } catch (_) {
+      return p.slice(i + 1);
+    }
+  }
+  return "";
+}
+
+function writeCookie(name, value, maxAgeDays = 3650) {
+  const key = String(name || "").trim();
+  if (!key) return;
+  const encoded = encodeURIComponent(String(value || ""));
+  const maxAge = Math.max(1, Math.round(Number(maxAgeDays || 3650) * 86400));
+  document.cookie = `${key}=${encoded}; Max-Age=${maxAge}; Path=/; SameSite=Lax`;
 }
 
 function defaultDatasetSettings() {
@@ -686,31 +715,57 @@ function isSindDataset(meta = currentDatasetMeta()) {
   return String((meta && meta.family) || "").trim().toLowerCase() === "sind";
 }
 
-function sindBgAlignCityKey(bundle = state.bundle) {
-  if (!isSindDataset()) return null;
-  if (!bundle || typeof bundle !== "object") return null;
+function sindBgAlignCityKeys(bundle = state.bundle) {
+  if (!isSindDataset()) return [];
+  if (!bundle || typeof bundle !== "object") return [];
   const city = String(bundle.city || bundle.intersect_id || "").trim();
-  if (!city) return null;
-  return `${state.datasetId || "sind"}::${city}`;
+  if (!city) return [];
+  const ds = String(state.datasetId || "").trim();
+  const keys = [];
+  if (ds) keys.push(`${ds}::${city}`);
+  keys.push(`sind::${city}`);
+  return Array.from(new Set(keys));
+}
+
+function sindBgAlignCityKey(bundle = state.bundle) {
+  const keys = sindBgAlignCityKeys(bundle);
+  return keys.length ? keys[0] : null;
 }
 
 function persistSindBgAlignStore() {
+  const payload = JSON.stringify(state.sindBgAlignByCity || {});
   try {
-    localStorage.setItem(LS_SIND_BG_ALIGN, JSON.stringify(state.sindBgAlignByCity || {}));
+    localStorage.setItem(LS_SIND_BG_ALIGN, payload);
+  } catch (_) { }
+  try {
+    writeCookie(COOKIE_SIND_BG_ALIGN, payload);
   } catch (_) { }
 }
 
 function loadPersistedSindBgAlignStore() {
-  const raw = safeJsonParse(localStorage.getItem(LS_SIND_BG_ALIGN));
+  let raw = safeJsonParse(localStorage.getItem(LS_SIND_BG_ALIGN));
+  if (!raw || typeof raw !== "object") {
+    raw = safeJsonParse(readCookie(COOKIE_SIND_BG_ALIGN));
+  }
   if (!raw || typeof raw !== "object") return;
   state.sindBgAlignByCity = raw;
+  try {
+    localStorage.setItem(LS_SIND_BG_ALIGN, JSON.stringify(raw));
+  } catch (_) { }
 }
 
 function getSindBgAlign(bundle = state.bundle) {
-  const key = sindBgAlignCityKey(bundle);
   const base = defaultSindBgAlign();
-  if (!key) return base;
-  const got = state.sindBgAlignByCity && state.sindBgAlignByCity[key];
+  const keys = sindBgAlignCityKeys(bundle);
+  if (!keys.length) return base;
+  let got = null;
+  for (const key of keys) {
+    const val = state.sindBgAlignByCity && state.sindBgAlignByCity[key];
+    if (val && typeof val === "object") {
+      got = val;
+      break;
+    }
+  }
   if (!got || typeof got !== "object") return base;
   const sx = Number(got.sx);
   const sy = Number(got.sy);
@@ -728,8 +783,8 @@ function getSindBgAlign(bundle = state.bundle) {
 }
 
 function setSindBgAlign(partial, bundle = state.bundle) {
-  const key = sindBgAlignCityKey(bundle);
-  if (!key) return;
+  const keys = sindBgAlignCityKeys(bundle);
+  if (!keys.length) return;
   const prev = getSindBgAlign(bundle);
   const next = { ...prev, ...(partial || {}) };
   // Keep values numerically stable.
@@ -741,7 +796,9 @@ function setSindBgAlign(partial, bundle = state.bundle) {
   next.alpha = Number.isFinite(Number(next.alpha)) ? clamp(Number(next.alpha), 0.2, 1.0) : 0.92;
   next.flipY = !!next.flipY;
   next.enabled = !!next.enabled;
-  state.sindBgAlignByCity[key] = next;
+  for (const key of keys) {
+    state.sindBgAlignByCity[key] = next;
+  }
   persistSindBgAlignStore();
 }
 
@@ -5389,6 +5446,7 @@ function wireUi() {
       if (max != null) v = Math.min(max, v);
       commitBgAlign({ [key]: v });
     };
+    el.addEventListener("input", onChange);
     el.addEventListener("change", onChange);
     el.addEventListener("blur", onChange);
   };
@@ -5420,10 +5478,7 @@ function wireUi() {
   if (resetAlignBtn) {
     resetAlignBtn.addEventListener("click", () => {
       if (!isSindDataset() || !state.bundle) return;
-      const key = sindBgAlignCityKey(state.bundle);
-      if (!key) return;
-      state.sindBgAlignByCity[key] = defaultSindBgAlign();
-      persistSindBgAlignStore();
+      setSindBgAlign(defaultSindBgAlign(), state.bundle);
       syncSindBgAlignUi(state.bundle);
       render();
     });

@@ -439,11 +439,13 @@ class V2XTrajAdapter:
             if not files:
                 files = list(root.rglob("*.csv"))
             for p in files:
-                k = str(p.resolve())
+                if not p.is_file():
+                    continue
+                k = str(p)
                 if k in seen:
                     continue
                 seen.add(k)
-                out.append(p.resolve())
+                out.append(p)
         out.sort(key=lambda p: p.name)
         return out
 
@@ -1098,6 +1100,7 @@ class V2XSeqAdapter(V2XTrajAdapter):
         self._scene_files: Dict[str, Dict[str, Dict[str, Path]]] = {"train": {}, "val": {}}
         self._roots_by_modality: Dict[str, List[Path]] = {"ego": [], "infra": [], "vehicle": [], "traffic_light": []}
         self._csv_kind_cache: Dict[str, str] = {}
+        self._tl_scene_path_cache: Dict[Tuple[str, str], Optional[Path]] = {}
         super().__init__(spec)
 
     @staticmethod
@@ -1108,7 +1111,7 @@ class V2XSeqAdapter(V2XTrajAdapter):
         """
         Return one of: trajectory, traffic_light, unknown.
         """
-        key = str(path.resolve())
+        key = str(path)
         cached = self._csv_kind_cache.get(key)
         if cached is not None:
             return cached
@@ -1129,14 +1132,61 @@ class V2XSeqAdapter(V2XTrajAdapter):
         self._csv_kind_cache[key] = kind
         return kind
 
+    def _sample_scene_csv_files(self, root: Path, split: str, limit: int = 4) -> List[Path]:
+        out: List[Path] = []
+        if limit <= 0:
+            return out
+        seen: set[str] = set()
+        roots = [root / split / "data", root / split]
+        for base in roots:
+            if not base.exists() or not base.is_dir():
+                continue
+
+            found_direct = False
+            for p in base.glob("*.csv"):
+                if not p.is_file():
+                    continue
+                found_direct = True
+                k = str(p)
+                if k in seen:
+                    continue
+                seen.add(k)
+                out.append(p)
+                if len(out) >= limit:
+                    return out
+
+            # Fall back to nested search only when this split folder has no direct files.
+            if found_direct:
+                continue
+            for p in base.rglob("*.csv"):
+                if not p.is_file():
+                    continue
+                k = str(p)
+                if k in seen:
+                    continue
+                seen.add(k)
+                out.append(p)
+                if len(out) >= limit:
+                    return out
+        return out
+
+    @staticmethod
+    def _scene_file_in_roots(roots: List[Path], split: str, scene_id: str) -> Optional[Path]:
+        filename = f"{scene_id}.csv"
+        for root in roots:
+            candidates = [root / split / "data" / filename, root / split / filename, root / filename]
+            for p in candidates:
+                if p.exists() and p.is_file():
+                    return p
+        return None
+
     def _infer_dir_kind(self, root: Path) -> str:
         if not root.exists() or not root.is_dir():
             return "unknown"
         counts: Counter = Counter()
         # Sample a small set per split (fast and sufficient for schema detection).
         for split in self._SPLITS:
-            files = self._iter_scene_csv_files(root, split)
-            for p in files[:4]:
+            for p in self._sample_scene_csv_files(root, split, limit=4):
                 counts[self._detect_csv_kind(p)] += 1
         if not counts:
             return "unknown"
@@ -1194,23 +1244,24 @@ class V2XSeqAdapter(V2XTrajAdapter):
 
     def _load_scenes_from_dirs(self) -> None:
         self._roots_by_modality = self._resolve_modality_roots()
+        tl_roots = list(self._roots_by_modality.get("traffic_light", []))
+
         for split in self._SPLITS:
             scenes = self._scene_index[split]
             self._scene_files[split] = {}
+            scene_files = self._scene_files[split]
 
-            for modality in ("ego", "infra", "vehicle", "traffic_light"):
+            # Index trajectory scene clips first; this is the primary scene universe.
+            for modality in ("ego", "infra", "vehicle"):
                 for mod_root in self._roots_by_modality.get(modality, []):
                     for p in self._iter_scene_csv_files(mod_root, split):
                         scene_id = str(p.stem or "").strip()
                         if not scene_id:
                             continue
-                        kind = self._detect_csv_kind(p)
-                        if modality == "traffic_light" and kind != "traffic_light":
-                            continue
-                        if modality in ("ego", "infra", "vehicle") and kind != "trajectory":
+                        if self._detect_csv_kind(p) != "trajectory":
                             continue
 
-                        files_for_scene = self._scene_files[split].setdefault(scene_id, {})
+                        files_for_scene = scene_files.setdefault(scene_id, {})
                         if modality not in files_for_scene:
                             files_for_scene[modality] = p
 
@@ -1226,14 +1277,6 @@ class V2XSeqAdapter(V2XTrajAdapter):
                             )
                             scenes[scene_id] = s
 
-                        if s.city is None or s.intersect_id is None:
-                            city, intersect_id = self._read_scene_meta_from_file(p)
-                            if s.city is None and city:
-                                s.city = city
-                            if s.intersect_id is None and intersect_id:
-                                s.intersect_id = intersect_id
-                                s.intersect_label = intersection_label(intersect_id)
-
                         if modality not in s.by_modality:
                             s.by_modality[modality] = {
                                 "rows": 0,
@@ -1244,21 +1287,67 @@ class V2XSeqAdapter(V2XTrajAdapter):
                                 "unique_agents": None,
                             }
 
+            # Attach traffic-light modality only for already indexed scenes.
+            for scene_id, s in scenes.items():
+                tl_path = self._scene_file_in_roots(tl_roots, split, scene_id)
+                self._tl_scene_path_cache[(split, scene_id)] = tl_path
+                if tl_path is None:
+                    continue
+                scene_files.setdefault(scene_id, {})["traffic_light"] = tl_path
+                if "traffic_light" not in s.by_modality:
+                    s.by_modality["traffic_light"] = {
+                        "rows": 0,
+                        "min_ts": None,
+                        "max_ts": None,
+                        "unique_ts": 0,
+                        "duration_s": None,
+                        "unique_agents": None,
+                    }
+
+            # Read metadata at most once per scene from one available clip.
+            for scene_id, s in scenes.items():
+                if s.city is not None and s.intersect_id is not None:
+                    continue
+                files_for_scene = scene_files.get(scene_id, {})
+                sample = (
+                    files_for_scene.get("infra")
+                    or files_for_scene.get("ego")
+                    or files_for_scene.get("vehicle")
+                    or files_for_scene.get("traffic_light")
+                )
+                if sample is None:
+                    continue
+                city, intersect_id = self._read_scene_meta_from_file(sample)
+                if s.city is None and city:
+                    s.city = city
+                if s.intersect_id is None and intersect_id:
+                    s.intersect_id = intersect_id
+                    s.intersect_label = intersection_label(intersect_id)
+
         for split, scenes in self._scene_index.items():
             for s in scenes.values():
                 if s.intersect_id:
                     self._intersections[split][s.intersect_id] += 1
 
     def _scene_included_in_list(self, s: SceneSummary, include_tl_only: bool) -> bool:
-        if include_tl_only:
-            return True
         mods = set((s.by_modality or {}).keys())
+        if include_tl_only:
+            return "traffic_light" in mods
         return bool({"ego", "infra", "vehicle"} & mods)
 
     def _scene_file(self, modality: str, split: str, scene_id: str) -> Path:
         p = self._scene_files.get(split, {}).get(scene_id, {}).get(modality)
         if p is not None:
             return p
+        if modality == "traffic_light":
+            key = (split, scene_id)
+            if key not in self._tl_scene_path_cache:
+                tl_roots = list(self._roots_by_modality.get("traffic_light", []))
+                self._tl_scene_path_cache[key] = self._scene_file_in_roots(tl_roots, split, scene_id)
+            cached = self._tl_scene_path_cache.get(key)
+            if cached is not None:
+                self._scene_files.setdefault(split, {}).setdefault(scene_id, {})["traffic_light"] = cached
+                return cached
         return self.spec.root / "__missing__" / split / f"{scene_id}_{modality}.csv"
 
     def load_scene_bundle(
@@ -4442,6 +4531,7 @@ class DatasetStore:
         self.adapters: Dict[str, Any] = {}
         self._adapter_errors: Dict[str, str] = {}
         self._adapter_lock = threading.Lock()
+        self._dataset_list_cache: Optional[List[Dict[str, Any]]] = None
 
     @classmethod
     def _is_supported_family(cls, family: str) -> bool:
@@ -4470,6 +4560,29 @@ class DatasetStore:
                 gap_s=self._strategy_int(spec, "gap_s"),
             )
         raise KeyError(f"unsupported dataset family: {spec.family}")
+
+    @staticmethod
+    def _probe_sind_assets(data_root: Path) -> Tuple[bool, bool, bool]:
+        has_map = False
+        has_bg = False
+        has_tl = False
+        if not data_root.exists() or not data_root.is_dir():
+            return has_map, has_bg, has_tl
+        try:
+            for dirpath, _dirs, files in os.walk(data_root):
+                for name in files:
+                    low = str(name or "").lower()
+                    if not has_map and low.endswith(".osm"):
+                        has_map = True
+                    if not has_bg and low.endswith(".png"):
+                        has_bg = True
+                    if not has_tl and low.endswith(".csv") and "traffic" in low and "meta" not in low and not low.startswith(".~lock"):
+                        has_tl = True
+                    if has_map and has_bg and has_tl:
+                        return has_map, has_bg, has_tl
+        except Exception:
+            return has_map, has_bg, has_tl
+        return has_map, has_bg, has_tl
 
     @staticmethod
     def _dataset_meta(spec: DatasetSpec) -> Dict[str, Any]:
@@ -4568,26 +4681,7 @@ class DatasetStore:
             bindings = spec.bindings if isinstance(spec.bindings, dict) else {}
             data_dir_raw = ((bindings.get("data_dir") or {}).get("path")) if isinstance(bindings.get("data_dir"), dict) else None
             data_root = Path(str(data_dir_raw)).expanduser() if data_dir_raw else spec.root
-            has_map = False
-            has_bg = False
-            has_tl = False
-            try:
-                if data_root.exists() and data_root.is_dir():
-                    for p in data_root.rglob("*.osm"):
-                        if p.is_file():
-                            has_map = True
-                            break
-                    for p in data_root.rglob("*.png"):
-                        if p.is_file():
-                            has_bg = True
-                            break
-                    for p in data_root.rglob("*.csv"):
-                        n = p.name.lower()
-                        if "traffic" in n and "meta" not in n and not n.startswith(".~lock"):
-                            has_tl = True
-                            break
-            except Exception:
-                pass
+            has_map, has_bg, has_tl = DatasetStore._probe_sind_assets(data_root)
             return {
                 "splits": ["all"],
                 "default_split": "all",
@@ -4610,6 +4704,8 @@ class DatasetStore:
         }
 
     def list_datasets(self) -> List[Dict[str, Any]]:
+        if self._dataset_list_cache is not None:
+            return [dict(x) for x in self._dataset_list_cache]
         out = []
         for spec in self.specs.values():
             meta = self._dataset_meta(spec)
@@ -4624,6 +4720,7 @@ class DatasetStore:
             if not supported:
                 item["unsupported_reason"] = f"Unsupported dataset family: {spec.family}"
             out.append(item)
+        self._dataset_list_cache = [dict(x) for x in out]
         return out
 
     def get_adapter(self, dataset_id: str) -> Any:
