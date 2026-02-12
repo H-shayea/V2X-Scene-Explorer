@@ -26,11 +26,23 @@ jobs:
       
       - name: Setup Pages
         uses: actions/configure-pages@v4
+
+      - name: Prepare web artifact (cache-busted)
+        run: |
+          rm -rf .pages-dist
+          mkdir -p .pages-dist
+          cp -R apps/web/. .pages-dist/
+          SHA8="${GITHUB_SHA::8}"
+          sed -i \
+            -e "s|src=\"\\./domain\\.js\"|src=\"./domain.js?v=${SHA8}\"|g" \
+            -e "s|src=\"\\./web_backend\\.js\"|src=\"./web_backend.js?v=${SHA8}\"|g" \
+            -e "s|src=\"\\./app\\.js\"|src=\"./app.js?v=${SHA8}\"|g" \
+            .pages-dist/index.html
       
       - name: Upload artifact
         uses: actions/upload-pages-artifact@v3
         with:
-          path: './apps/web'
+          path: './.pages-dist'
       
       - name: Deploy to GitHub Pages
         id: deployment
