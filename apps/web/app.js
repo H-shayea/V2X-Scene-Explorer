@@ -1942,6 +1942,7 @@ function drawAgent(ctx, view, modality, rec, showVelocity, showHeading) {
 
   const fill = colorForRec(rec);
   const stroke = COLORS.modality[modality] || "#111827";
+  const contrastStroke = "#f8fafc";
 
   const theta = rec.theta != null ? Number(rec.theta) : null;
   const length = rec.length != null ? Number(rec.length) : null;
@@ -2074,23 +2075,25 @@ function drawAgent(ctx, view, modality, rec, showVelocity, showHeading) {
   const isDot = (theta == null || length == null || width == null || !(length > 0) || !(width > 0));
 
   if (isDot) {
-    // Class color is the primary cue; modality is a subtle halo.
+    // Dark viewport: use a high-contrast halo so points remain readable.
     ctx.beginPath();
-    ctx.strokeStyle = stroke;
-    ctx.globalAlpha = 0.22;
-    ctx.lineWidth = px(2.6);
-    ctx.arc(rec.x, rec.y, px(4.6), 0, Math.PI * 2);
+    ctx.strokeStyle = contrastStroke;
+    ctx.globalAlpha = 0.9;
+    ctx.lineWidth = px(3.2);
+    ctx.arc(rec.x, rec.y, px(4.9), 0, Math.PI * 2);
     ctx.stroke();
 
     ctx.beginPath();
     ctx.fillStyle = fill;
-    ctx.globalAlpha = 0.96;
-    ctx.arc(rec.x, rec.y, px(3.6), 0, Math.PI * 2);
+    ctx.globalAlpha = 0.95;
+    ctx.arc(rec.x, rec.y, px(3.8), 0, Math.PI * 2);
     ctx.fill();
 
-    ctx.strokeStyle = fill;
-    ctx.globalAlpha = 0.78;
-    ctx.lineWidth = px(1.2);
+    ctx.beginPath();
+    ctx.strokeStyle = stroke;
+    ctx.globalAlpha = 0.92;
+    ctx.lineWidth = px(1.3);
+    ctx.arc(rec.x, rec.y, px(3.8), 0, Math.PI * 2);
     ctx.stroke();
   } else {
     // Oriented box in world coords; transform corners.
@@ -2115,18 +2118,23 @@ function drawAgent(ctx, view, modality, rec, showVelocity, showHeading) {
     ctx.closePath();
 
     ctx.fillStyle = fill;
-    ctx.globalAlpha = 0.28;
+    ctx.globalAlpha = 0.34;
     ctx.fill();
 
-    // Two-pass stroke: outer modality accent + inner class outline.
+    // High-contrast three-pass stroke for black canvas.
+    ctx.strokeStyle = contrastStroke;
+    ctx.globalAlpha = 0.88;
+    ctx.lineWidth = px(2.9);
+    ctx.stroke();
+
     ctx.strokeStyle = stroke;
-    ctx.globalAlpha = 0.55;
+    ctx.globalAlpha = 0.92;
     ctx.lineWidth = px(1.9);
     ctx.stroke();
 
     ctx.strokeStyle = fill;
-    ctx.globalAlpha = 0.78;
-    ctx.lineWidth = px(1.1);
+    ctx.globalAlpha = 0.9;
+    ctx.lineWidth = px(1.2);
     ctx.stroke();
   }
 
@@ -2147,8 +2155,8 @@ function drawTrafficLight(ctx, view, rec) {
   ctx.arc(rec.x, rec.y, px(4.0), 0, Math.PI * 2);
   ctx.fill();
 
-  ctx.strokeStyle = "#111827";
-  ctx.globalAlpha = 0.3;
+  ctx.strokeStyle = "#f8fafc";
+  ctx.globalAlpha = 0.62;
   ctx.lineWidth = px(1.2);
   ctx.stroke();
 }
@@ -2737,11 +2745,19 @@ function render() {
   }
 
   if (state.selected && state.selected.x != null && state.selected.y != null) {
+    const selColor = COLORS.modality[state.selected.modality] || "#2563eb";
     ctx.beginPath();
     ctx.arc(state.selected.x, state.selected.y, 8.5 / view.scale, 0, Math.PI * 2);
-    ctx.strokeStyle = "#111827";
-    ctx.globalAlpha = 0.5;
-    ctx.lineWidth = 2.2 / view.scale;
+    ctx.strokeStyle = "#f8fafc";
+    ctx.globalAlpha = 0.9;
+    ctx.lineWidth = 3.0 / view.scale;
+    ctx.stroke();
+
+    ctx.beginPath();
+    ctx.arc(state.selected.x, state.selected.y, 8.5 / view.scale, 0, Math.PI * 2);
+    ctx.strokeStyle = selColor;
+    ctx.globalAlpha = 0.95;
+    ctx.lineWidth = 1.8 / view.scale;
     ctx.stroke();
   }
 
