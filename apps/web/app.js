@@ -3971,16 +3971,8 @@ function isLikelyDirectoryPath(pathStr) {
 
 async function loadDatasetFromFolder(folderPathIn) {
   const meta = currentDatasetMeta() || {};
-  const datasetType = datasetTypeFromMeta(meta);
+  let datasetType = datasetTypeFromMeta(meta);
   const src = sourceState(datasetType);
-  if (!datasetType) {
-    src.hint = "This dataset family does not support local loading yet.";
-    src.tone = "bad";
-    persistSourceByType();
-    setConnectResult(src.hint, src.tone);
-    updateSourcePanel();
-    return;
-  }
   const folderPath = String(folderPathIn || "").trim();
   if (!folderPath) {
     src.hint = "No dataset directory selected.";
@@ -3999,21 +3991,30 @@ async function loadDatasetFromFolder(folderPathIn) {
     return;
   }
 
-  const preset = runtimeProfilePreset(datasetType, meta);
   state.sourceBusy = true;
   src.hint = "Detecting dataset schema...";
   src.tone = "";
   updateSourcePanel();
 
   try {
+    // Do NOT force dataset_type — let the backend auto-detect from folder contents
     const detected = await postJson("/api/profiles/detect", {
-      dataset_type: datasetType,
-      name: preset.name,
+      name: folderNameFromPath(folderPath),
       paths: [folderPath],
     });
     if (!detected || !detected.profile) {
       throw new Error(`Could not detect dataset profile from selected folder. ${expectedDatasetLayoutHint(datasetType)}`);
     }
+
+    // Use the detected dataset type (may differ from the active dataset card)
+    const detectedType = String(detected.profile.dataset_type || "").trim();
+    if (detectedType) {
+      datasetType = detectedType;
+    }
+
+    // Re-resolve source state for the (possibly new) dataset type
+    const detectedSrc = sourceState(datasetType);
+    const preset = runtimeProfilePreset(datasetType, meta);
     const profile = cloneObj(detected.profile);
     profile.profile_id = preset.profile_id;
     profile.dataset_id = preset.dataset_id;
@@ -4033,27 +4034,27 @@ async function loadDatasetFromFolder(folderPathIn) {
     renderHomeDatasetCards();
 
     const runtimeDatasetId = String(((saved && saved.profile) ? saved.profile.dataset_id : "") || preset.dataset_id);
-    src.folderPath = folderPath;
-    src.folderName = folderNameFromPath(folderPath);
+    detectedSrc.folderPath = folderPath;
+    detectedSrc.folderName = folderNameFromPath(folderPath);
     const savedProto = ((((saved || {}).profile || {}).bindings || {}).proto_schema || {}).path;
-    src.protoPath = savedProto ? String(savedProto || "").trim() : "";
-    src.hint = status === "ready_with_warnings"
+    detectedSrc.protoPath = savedProto ? String(savedProto || "").trim() : "";
+    detectedSrc.hint = status === "ready_with_warnings"
       ? `Loaded with warnings: ${sourceIssueMessage(validated.validation, datasetType) || "check mapping."}`
       : "Dataset source loaded.";
-    src.tone = status === "ready_with_warnings" ? "warn" : "ok";
+    detectedSrc.tone = status === "ready_with_warnings" ? "warn" : "ok";
     persistSourceByType();
 
     await openExplorerForDataset(runtimeDatasetId, { savePrev: false });
     const loadedScenes = Array.isArray(state.sceneIds) ? state.sceneIds.length : 0;
     if (loadedScenes <= 0) {
       const hint = expectedDatasetLayoutHint(datasetType);
-      src.hint = hint
+      detectedSrc.hint = hint
         ? `Dataset loaded, but no scenes were found. ${hint}`
         : "Dataset loaded, but no scenes were found in the selected directory.";
-      src.tone = "warn";
+      detectedSrc.tone = "warn";
       persistSourceByType();
     }
-    setConnectResult(src.hint, src.tone);
+    setConnectResult(detectedSrc.hint, detectedSrc.tone);
   } catch (e) {
     const msg = friendlyLoadFailureMessage(e, datasetType);
     src.hint = msg;
