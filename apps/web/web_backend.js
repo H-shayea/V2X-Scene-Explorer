@@ -223,6 +223,296 @@ function safeFloat(v) {
 
 // === Map Helper ===
 
+/**
+ * Extract map number from V2X intersect_id (e.g. "yizhuang#4-1_po" → 4).
+ */
+function parseIntersectMapId(intersectId) {
+  if (!intersectId) return null;
+  const m = String(intersectId).match(/#(\d+)/);
+  return m ? parseInt(m[1], 10) : null;
+}
+
+/**
+ * WGS84 → UTM forward projection (no external dependency).
+ * Returns { easting, northing }.
+ */
+function latLonToUtm(lat, lon, zone) {
+  const a = 6378137.0;
+  const f = 1.0 / 298.257223563;
+  const e2 = f * (2.0 - f);
+  const ep2 = e2 / (1.0 - e2);
+  const k0 = 0.9996;
+
+  const phi = lat * Math.PI / 180;
+  const lam = lon * Math.PI / 180;
+  const lam0 = (zone - 1) * 6 - 180 + 3;
+  const lam0r = lam0 * Math.PI / 180;
+
+  const sinPhi = Math.sin(phi);
+  const cosPhi = Math.cos(phi);
+  const tanPhi = Math.tan(phi);
+  const n = a / Math.sqrt(1.0 - e2 * sinPhi * sinPhi);
+  const t = tanPhi * tanPhi;
+  const c = ep2 * cosPhi * cosPhi;
+  const A = cosPhi * (lam - lam0r);
+
+  const M = a * (
+    (1.0 - e2 / 4.0 - 3.0 * e2 * e2 / 64.0 - 5.0 * e2 * e2 * e2 / 256.0) * phi
+    - (3.0 * e2 / 8.0 + 3.0 * e2 * e2 / 32.0 + 45.0 * e2 * e2 * e2 / 1024.0) * Math.sin(2.0 * phi)
+    + (15.0 * e2 * e2 / 256.0 + 45.0 * e2 * e2 * e2 / 1024.0) * Math.sin(4.0 * phi)
+    - (35.0 * e2 * e2 * e2 / 3072.0) * Math.sin(6.0 * phi)
+  );
+
+  const easting = k0 * n * (
+    A
+    + (1.0 - t + c) * (A * A * A) / 6.0
+    + (5.0 - 18.0 * t + t * t + 72.0 * c - 58.0 * ep2) * (A * A * A * A * A) / 120.0
+  ) + 500000.0;
+
+  let northing = k0 * (
+    M
+    + n * tanPhi * (
+      (A * A) / 2.0
+      + (5.0 - t + 9.0 * c + 4.0 * c * c) * (A * A * A * A) / 24.0
+      + (61.0 - 58.0 * t + t * t + 600.0 * c - 330.0 * ep2) * (A * A * A * A * A * A) / 720.0
+    )
+  );
+  if (lat < 0.0) northing += 10000000.0;
+  return { easting, northing };
+}
+
+function utmZoneFromLon(lon) {
+  return Math.floor((lon + 180) / 6) + 1;
+}
+
+/**
+ * Resample a polyline to n_out points via linear interpolation.
+ */
+function resamplePolyline(points, nOut) {
+  if (nOut <= 1) return points.slice(0, 1);
+  if (points.length <= 1) return points.slice();
+  if (points.length === nOut) return points.slice();
+  const out = [];
+  const span = points.length - 1;
+  for (let i = 0; i < nOut; i++) {
+    const t = span * (i / (nOut - 1));
+    const j0 = Math.floor(t);
+    const j1 = Math.min(points.length - 1, j0 + 1);
+    const a = t - j0;
+    out.push([
+      (1 - a) * points[j0][0] + a * points[j1][0],
+      (1 - a) * points[j0][1] + a * points[j1][1],
+    ]);
+  }
+  return out;
+}
+
+/**
+ * Downsample polyline keeping every step-th point plus first/last.
+ */
+function downsamplePolyline(points, step) {
+  const s = Math.max(1, step);
+  if (s <= 1 || points.length <= Math.max(12, s * 2)) return points;
+  const idxs = [];
+  for (let i = 0; i < points.length; i += s) idxs.push(i);
+  const last = points.length - 1;
+  if (idxs[idxs.length - 1] !== last) idxs.push(last);
+  const out = idxs.map(i => points[i]);
+  if (out.length < 2 && points.length >= 2) return [points[0], points[points.length - 1]];
+  return out;
+}
+
+function polylineBbox(pts) {
+  if (!pts || !pts.length) return null;
+  let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+  for (const p of pts) {
+    if (p[0] < minX) minX = p[0];
+    if (p[1] < minY) minY = p[1];
+    if (p[0] > maxX) maxX = p[0];
+    if (p[1] > maxY) maxY = p[1];
+  }
+  if (!isFinite(minX)) return null;
+  return { min_x: minX, min_y: minY, max_x: maxX, max_y: maxY };
+}
+
+function bboxMerge(a, b) {
+  if (!a) return b;
+  if (!b) return a;
+  return {
+    min_x: Math.min(a.min_x, b.min_x),
+    min_y: Math.min(a.min_y, b.min_y),
+    max_x: Math.max(a.max_x, b.max_x),
+    max_y: Math.max(a.max_y, b.max_y),
+  };
+}
+
+/**
+ * Parse a Lanelet2 OSM XML string into the standard map format.
+ * @param {string} xmlText  - raw OSM XML
+ * @param {function(lat,lon):([number,number]|null)} toXY - coordinate transform
+ * @param {number} [pointsStep=5] - downsample step
+ * @param {object} [opts] - { parseStopLines, parseCrosswalks }
+ * @returns {object|null} map data with lanes, stoplines, crosswalks, junctions
+ */
+function parseLaneletOsm(xmlText, toXY, pointsStep, opts) {
+  const step = Math.max(1, pointsStep || 5);
+  const parseStops = !!(opts && opts.parseStopLines);
+  const parseCross = !!(opts && opts.parseCrosswalks);
+
+  const parser = new DOMParser();
+  const doc = parser.parseFromString(xmlText, "application/xml");
+  if (!doc || doc.querySelector("parsererror")) return null;
+  const root = doc.documentElement;
+
+  // Phase 1: nodes
+  const nodes = {};
+  for (const n of root.querySelectorAll("node")) {
+    const nid = (n.getAttribute("id") || "").trim();
+    const lat = parseFloat(n.getAttribute("lat"));
+    const lon = parseFloat(n.getAttribute("lon"));
+    if (!nid || !isFinite(lat) || !isFinite(lon)) continue;
+    nodes[nid] = [lat, lon];
+  }
+
+  // Phase 2: ways + way-level tags
+  const ways = {};
+  const wayTags = {};
+  for (const w of root.querySelectorAll("way")) {
+    const wid = (w.getAttribute("id") || "").trim();
+    if (!wid) continue;
+    const refs = [];
+    for (const nd of w.querySelectorAll("nd")) {
+      const r = (nd.getAttribute("ref") || "").trim();
+      if (r) refs.push(r);
+    }
+    ways[wid] = refs;
+    const tags = {};
+    for (const t of w.querySelectorAll("tag")) {
+      tags[(t.getAttribute("k") || "")] = (t.getAttribute("v") || "");
+    }
+    if (Object.keys(tags).length) wayTags[wid] = tags;
+  }
+
+  function wayPoints(wid) {
+    if (!wid) return [];
+    const refs = ways[wid] || [];
+    const out = [];
+    for (const rid of refs) {
+      const ll = nodes[rid];
+      if (!ll) continue;
+      const xy = toXY(ll[0], ll[1]);
+      if (!xy) continue;
+      if (out.length && Math.abs(xy[0] - out[out.length - 1][0]) < 1e-9 && Math.abs(xy[1] - out[out.length - 1][1]) < 1e-9) continue;
+      out.push(xy);
+    }
+    return out;
+  }
+
+  // Phase 3: relations → lanes
+  const lanes = [];
+  let mapBbox = null;
+  for (const rel of root.querySelectorAll("relation")) {
+    const tags = {};
+    for (const t of rel.querySelectorAll("tag")) {
+      tags[(t.getAttribute("k") || "")] = (t.getAttribute("v") || "");
+    }
+    if (tags.type !== "lanelet") continue;
+
+    let leftId = null, rightId = null;
+    for (const m of rel.querySelectorAll("member")) {
+      if ((m.getAttribute("type") || "") !== "way") continue;
+      const role = m.getAttribute("role") || "";
+      const ref = (m.getAttribute("ref") || "").trim();
+      if (!ref) continue;
+      if (role === "left") leftId = ref;
+      else if (role === "right") rightId = ref;
+    }
+
+    let left = wayPoints(leftId);
+    let right = wayPoints(rightId);
+
+    // Compute centerline
+    let center = [];
+    if (left.length >= 2 && right.length >= 2) {
+      const dSame = (left[0][0] - right[0][0]) ** 2 + (left[0][1] - right[0][1]) ** 2
+        + (left[left.length - 1][0] - right[right.length - 1][0]) ** 2 + (left[left.length - 1][1] - right[right.length - 1][1]) ** 2;
+      const dRev = (left[0][0] - right[right.length - 1][0]) ** 2 + (left[0][1] - right[right.length - 1][1]) ** 2
+        + (left[left.length - 1][0] - right[0][0]) ** 2 + (left[left.length - 1][1] - right[0][1]) ** 2;
+      if (dRev < dSame) right = right.slice().reverse();
+      const nPts = Math.max(left.length, right.length);
+      const l2 = resamplePolyline(left, nPts);
+      const r2 = resamplePolyline(right, nPts);
+      center = l2.map((lp, i) => [(lp[0] + r2[i][0]) * 0.5, (lp[1] + r2[i][1]) * 0.5]);
+    } else if (left.length >= 2) {
+      center = left;
+    } else if (right.length >= 2) {
+      center = right;
+    }
+
+    left = downsamplePolyline(left, step);
+    right = downsamplePolyline(right, step);
+    center = downsamplePolyline(center, step);
+    if (center.length < 2) continue;
+
+    let polygon = [];
+    if (left.length >= 2 && right.length >= 2) {
+      polygon = left.concat(right.slice().reverse());
+      if (polygon.length >= 3 && (polygon[0][0] !== polygon[polygon.length - 1][0] || polygon[0][1] !== polygon[polygon.length - 1][1])) {
+        polygon.push([polygon[0][0], polygon[0][1]]);
+      }
+    }
+
+    const b = polylineBbox(polygon.length >= 3 ? polygon : center);
+    if (!b) continue;
+    mapBbox = bboxMerge(mapBbox, b);
+
+    lanes.push({
+      id: rel.getAttribute("id") || ("lane_" + (lanes.length + 1)),
+      lane_type: tags.subtype || "road",
+      turn_direction: null,
+      is_intersection: (tags.subtype || "").toLowerCase() === "intersection",
+      has_traffic_control: false,
+      centerline: center,
+      left_boundary: left,
+      right_boundary: right,
+      polygon,
+    });
+  }
+
+  // Phase 4 (optional): stop lines & crosswalks from way-level tags
+  const stoplines = [];
+  const crosswalks = [];
+  if (parseStops || parseCross) {
+    for (const [wid, tags] of Object.entries(wayTags)) {
+      const wtype = (tags.type || "").toLowerCase();
+      if (parseStops && wtype === "stop_line") {
+        const pts = downsamplePolyline(wayPoints(wid), step);
+        if (pts.length >= 2) {
+          const b = polylineBbox(pts);
+          if (b) { mapBbox = bboxMerge(mapBbox, b); stoplines.push({ id: wid, centerline: pts }); }
+        }
+      }
+      if (parseCross && (wtype === "zebra" || wtype === "crosswalk")) {
+        const pts = downsamplePolyline(wayPoints(wid), step);
+        if (pts.length >= 2) {
+          const b = polylineBbox(pts);
+          if (b) { mapBbox = bboxMerge(mapBbox, b); crosswalks.push({ id: wid, polygon: pts }); }
+        }
+      }
+    }
+  }
+
+  return {
+    map_id: "lanelet_map",
+    lanes,
+    stoplines,
+    crosswalks,
+    junctions: [],
+    counts: { LANE: lanes.length, STOPLINE: stoplines.length, CROSSWALK: crosswalks.length, JUNCTION: 0 },
+    bbox: mapBbox,
+  };
+}
+
 function processMapData(raw) {
   // Converts JSON map (Dict[ID, Obj]) to List[Obj] expected by app.js
 
@@ -1751,7 +2041,13 @@ const WebBackend = {
     if (includeMap) {
       const mapDir = WebFS.joinPath(rootName, "maps");
       const mapFiles = await WebFS.listDir(mapDir);
-      const jsonMap = mapFiles.find(f => f.endsWith(".json"));
+      // Match map by intersection ID (e.g. intersect_id "yizhuang#4-1_po" → hdmap4.json)
+      const mapNum = parseIntersectMapId(ref.intersect_id);
+      let jsonMap = null;
+      if (mapNum != null) {
+        jsonMap = mapFiles.find(f => f.toLowerCase().endsWith(`hdmap${mapNum}.json`));
+      }
+      if (!jsonMap) jsonMap = mapFiles.find(f => f.endsWith(".json"));
       if (jsonMap) {
         const text = await WebFS.readFileText(WebFS.joinPath(mapDir, jsonMap));
         if (text) {
@@ -1885,6 +2181,9 @@ const WebBackend = {
         has_background: hasBackground,
         data_dir: dataDir,
         ortho_px_to_meter: safeFloat(meta.orthoPxToMeter),
+        x_utm_origin: safeFloat(meta.xUtmOrigin),
+        y_utm_origin: safeFloat(meta.yUtmOrigin),
+        lon_location: safeFloat(meta.lonLocation),
       };
     }
 
@@ -1975,6 +2274,48 @@ const WebBackend = {
       for (let i = 0; i < ids.length; i++) sceneIndexByLocation[lid][ids[i]] = i;
     }
 
+    // Discover Lanelet2 map files: maps/lanelets/{location}/locationN.osm
+    const laneletMaps = {}; // locationId -> { default: path, construction: path }
+    const rootName2 = String(WebFS.rootHandle.name || "");
+    const mapsDirs = [
+      WebFS.joinPath(rootName2, "maps", "lanelets"),
+      WebFS.joinPath(rootName2, "maps"),
+    ];
+    for (const mapsDir of mapsDirs) {
+      const mapEntries = await WebFS.listDir(mapsDir);
+      if (!mapEntries.length) continue;
+      // Check if .osm files are directly here or inside subdirectories
+      for (const entry of mapEntries) {
+        if (entry.toLowerCase().endsWith(".osm")) {
+          // Direct .osm file
+          const stem = entry.toLowerCase();
+          const lm = stem.match(/location\s*(\d+)/);
+          if (lm) {
+            const lid = String(parseInt(lm[1], 10));
+            if (!laneletMaps[lid]) laneletMaps[lid] = {};
+            const key2 = stem.includes("construction") ? "construction" : "default";
+            laneletMaps[lid][key2] = WebFS.joinPath(mapsDir, entry);
+          }
+        } else {
+          // Subdirectory — look for .osm inside
+          const subPath = WebFS.joinPath(mapsDir, entry);
+          const subEntries = await WebFS.listDir(subPath);
+          for (const sf of subEntries) {
+            if (!sf.toLowerCase().endsWith(".osm")) continue;
+            const stem2 = sf.toLowerCase();
+            const lm2 = stem2.match(/location\s*(\d+)/);
+            if (lm2) {
+              const lid = String(parseInt(lm2[1], 10));
+              if (!laneletMaps[lid]) laneletMaps[lid] = {};
+              const key2 = stem2.includes("construction") ? "construction" : "default";
+              laneletMaps[lid][key2] = WebFS.joinPath(subPath, sf);
+            }
+          }
+        }
+      }
+      if (Object.keys(laneletMaps).length > 0) break;
+    }
+
     return {
       split: "all",
       window_s: windowS,
@@ -1985,6 +2326,7 @@ const WebBackend = {
       scene_index: sceneIndex,
       scene_index_by_location: sceneIndexByLocation,
       locations,
+      lanelet_maps: laneletMaps,
     };
   },
 
@@ -2173,6 +2515,38 @@ const WebBackend = {
       }
     }
 
+    // --- Lanelet2 vector map ---
+    let mapData = null;
+    let mapId = null;
+    if (includeMap && rec.x_utm_origin != null && rec.y_utm_origin != null) {
+      const locId = rec.location_id || "";
+      const bucket = (index.lanelet_maps && index.lanelet_maps[locId]) || {};
+      // Special case: location 1, recordings 11-17 use construction map
+      const recNum = parseInt(num, 10);
+      let mapPath = null;
+      if (locId === "1" && recNum >= 11 && recNum <= 17 && bucket.construction) {
+        mapPath = bucket.construction;
+      }
+      if (!mapPath) mapPath = bucket.default || bucket.construction || null;
+      if (mapPath) {
+        const osmText = await WebFS.readFileText(mapPath);
+        if (osmText) {
+          const xOrigin = rec.x_utm_origin;
+          const yOrigin = rec.y_utm_origin;
+          const lonLoc = rec.lon_location;
+          const toXY = (lat, lon) => {
+            const zone = utmZoneFromLon(lonLoc != null ? lonLoc : lon);
+            const utm = latLonToUtm(lat, lon, zone);
+            return [utm.easting - xOrigin, utm.northing - yOrigin];
+          };
+          mapData = parseLaneletOsm(osmText, toXY, 5);
+          if (mapData) {
+            mapId = mapData.map_id || null;
+          }
+        }
+      }
+    }
+
     return {
       dataset_id: datasetId,
       split: "all",
@@ -2186,10 +2560,10 @@ const WebBackend = {
       window_index: wi,
       window_count: windowCount,
       intersect_by_modality: { infra: ref.location_id },
-      map_id: null,
+      map_id: mapId,
       t0, timestamps, extent: normalizedExtent,
       modality_stats, frames, warnings,
-      map: null,
+      map: mapData,
       background,
       meta: { city: null, intersect_id: ref.location_id },
     };
@@ -3382,6 +3756,28 @@ const WebBackend = {
       },
     };
 
+    // --- Lanelet2 vector map ---
+    let sindMapData = null;
+    let sindMapId = null;
+    if (includeMap) {
+      // Look for .osm file in the city directory
+      const cityPath = ref.dir_path.split("/").slice(0, -1).join("/"); // parent of scenario dir
+      const cityEntries = await WebFS.listDir(cityPath);
+      const osmFile = cityEntries.find(f => f.toLowerCase().endsWith(".osm"));
+      if (osmFile) {
+        const osmPath = WebFS.joinPath(cityPath, osmFile);
+        const osmText = await WebFS.readFileText(osmPath);
+        if (osmText) {
+          const sindToXY = (lat, lon) => {
+            // SinD equirectangular projection
+            return [lon * 111319.49079327357, lat * 110574.0];
+          };
+          sindMapData = parseLaneletOsm(osmText, sindToXY, 5, { parseStopLines: true, parseCrosswalks: true });
+          if (sindMapData) sindMapId = sindMapData.map_id || null;
+        }
+      }
+    }
+
     return {
       dataset_id: datasetId,
       split: "all",
@@ -3394,14 +3790,14 @@ const WebBackend = {
       recording_label: ref.scenario_label,
       window_index: 0,
       window_count: 1,
-      map_id: null,
+      map_id: sindMapId,
       t0,
       timestamps,
       extent: normalizedExtent,
       modality_stats,
       frames,
       warnings,
-      map: null,
+      map: sindMapData,
       meta: { city: ref.city_id, intersect_id: ref.city_id },
     };
   },
@@ -3504,9 +3900,13 @@ const WebBackend = {
 
     let mapData = null;
     if (includeMap) {
-      // Find map JSON
       const mapFiles = await WebFS.listDir(WebFS.joinPath(WebFS.rootHandle.name, 'maps'));
-      const jsonMap = mapFiles.find(f => f.endsWith('.json'));
+      const mapNum = parseIntersectMapId(ref.intersect_id);
+      let jsonMap = null;
+      if (mapNum != null) {
+        jsonMap = mapFiles.find(f => f.toLowerCase().endsWith(`hdmap${mapNum}.json`));
+      }
+      if (!jsonMap) jsonMap = mapFiles.find(f => f.endsWith('.json'));
       if (jsonMap) {
         const text = await WebFS.readFileText(WebFS.joinPath(WebFS.rootHandle.name, 'maps', jsonMap));
         if (text) {
