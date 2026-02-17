@@ -113,6 +113,27 @@ const WebFS = {
   }
 };
 
+/**
+ * Read width and height from a PNG file via its IHDR chunk (bytes 16–23).
+ * @param {FileSystemFileHandle} fileHandle
+ * @returns {Promise<{width:number, height:number}|null>}
+ */
+async function readPngSize(fileHandle) {
+  try {
+    const file = await fileHandle.getFile();
+    const header = await file.slice(0, 24).arrayBuffer();
+    const view = new DataView(header);
+    // PNG signature check (first 4 bytes: 0x89504E47)
+    if (view.getUint32(0) !== 0x89504E47) return null;
+    const width = view.getUint32(16);
+    const height = view.getUint32(20);
+    if (width <= 0 || height <= 0) return null;
+    return { width, height };
+  } catch {
+    return null;
+  }
+}
+
 // === Helper Functions ===
 
 function countChar(s, ch) {
@@ -332,8 +353,8 @@ function domainCapabilitiesFromType(raw) {
   if (t === "v2x_traj" || t === "v2x_seq") {
     return { has_map: true, has_traffic_lights: true, splits: ["train", "val"], group_label: "Intersection" };
   }
-  if (t === "ind") return { has_map: true, has_traffic_lights: false, splits: ["all"], group_label: "Location" };
-  if (t === "sind") return { has_map: true, has_traffic_lights: true, splits: ["all"], group_label: "City" };
+  if (t === "ind") return { has_map: true, has_traffic_lights: false, has_scene_background: true, splits: ["all"], group_label: "Location" };
+  if (t === "sind") return { has_map: true, has_traffic_lights: true, has_scene_background: true, splits: ["all"], group_label: "City" };
   if (t === "consider_it_cpm") return { has_map: false, has_traffic_lights: false, splits: ["all"], group_label: "Sensor" };
   return {};
 }
@@ -2123,6 +2144,35 @@ const WebBackend = {
       },
     };
 
+    // --- Background / orthophoto image ---
+    let background = null;
+    if (rec.has_background) {
+      const _BG_SCALE_DOWN = 12.0; // matches Python _DEFAULT_BACKGROUND_SCALE_DOWN
+      const bgPath = WebFS.joinPath(rec.data_dir, `${num}_background.png`);
+      const bgHandle = await WebFS.getFileHandle(bgPath);
+      if (bgHandle) {
+        const bgSize = await readPngSize(bgHandle);
+        if (bgSize) {
+          const mpp = (rec.ortho_px_to_meter || 1.0) * _BG_SCALE_DOWN;
+          const bgFile = await bgHandle.getFile();
+          const bgUrl = URL.createObjectURL(bgFile);
+          background = {
+            kind: "scene_image",
+            url: bgUrl,
+            recording_id: num,
+            size_px: { width: bgSize.width, height: bgSize.height },
+            meters_per_px: mpp,
+            extent: {
+              min_x: 0,
+              max_x: bgSize.width * mpp,
+              min_y: -bgSize.height * mpp,
+              max_y: 0,
+            },
+          };
+        }
+      }
+    }
+
     return {
       dataset_id: datasetId,
       split: "all",
@@ -2140,6 +2190,7 @@ const WebBackend = {
       t0, timestamps, extent: normalizedExtent,
       modality_stats, frames, warnings,
       map: null,
+      background,
       meta: { city: null, intersect_id: ref.location_id },
     };
   },
