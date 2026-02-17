@@ -28,6 +28,15 @@ const WebFS = {
       if (window.WebBackend && window.WebBackend._cpmIndexCache && typeof window.WebBackend._cpmIndexCache.clear === "function") {
         window.WebBackend._cpmIndexCache.clear();
       }
+      if (window.WebBackend && window.WebBackend._sindIndexCache && typeof window.WebBackend._sindIndexCache.clear === "function") {
+        window.WebBackend._sindIndexCache.clear();
+      }
+      if (window.WebBackend && window.WebBackend._v2xIndexCache && typeof window.WebBackend._v2xIndexCache.clear === "function") {
+        window.WebBackend._v2xIndexCache.clear();
+      }
+      if (window.WebBackend && window.WebBackend._indIndexCache && typeof window.WebBackend._indIndexCache.clear === "function") {
+        window.WebBackend._indIndexCache.clear();
+      }
       this.cachedHandles.set('', handle);
       this.cachedHandles.set(handle.name, handle);
       return handle;
@@ -448,6 +457,12 @@ const WebBackend = {
   _csvRowsCache: new Map(), // path -> parsed rows
   CPM_INDEX_CACHE_MAX: 8,
   _cpmIndexCache: new Map(), // key -> index payload
+  SIND_INDEX_CACHE_MAX: 4,
+  _sindIndexCache: new Map(), // key -> index payload
+  V2X_INDEX_CACHE_MAX: 4,
+  _v2xIndexCache: new Map(), // key -> index payload (v2x_traj and v2x_seq)
+  IND_INDEX_CACHE_MAX: 4,
+  _indIndexCache: new Map(), // key -> index payload
 
   STATIC_CATALOG: [
     {
@@ -805,6 +820,10 @@ const WebBackend = {
       return "v2x_traj";
     }
     if (names.some((x) => x.includes("recordingmeta") || x.endsWith("_tracks.csv"))) {
+      return "ind";
+    }
+    // inD has data/ dir at root with NN_tracks.csv files inside; detect "data" + "maps" combo
+    if (names.includes("data") && names.includes("maps")) {
       return "ind";
     }
     if (names.some((x) => x.includes("veh_smoothed_tracks") || x.includes("ped_smoothed_tracks"))) {
@@ -1260,6 +1279,871 @@ const WebBackend = {
     };
   },
 
+  // ── SinD index builder ──────────────────────────────────────────
+
+  async _buildSindIndex() {
+    if (!WebFS.rootHandle) {
+      return { split: "all", cities: {}, scenes: {}, scene_ids_sorted: [], scene_ids_by_city: {}, scene_index: {}, scene_index_by_city: {} };
+    }
+    const rootName = String(WebFS.rootHandle.name || "");
+    const topEntries = await WebFS.listDir(rootName);
+    // Filter to directories only (not files like .DS_Store, Images, etc.)
+    const dirNames = [];
+    for (const entry of topEntries) {
+      if (entry.startsWith(".")) continue;
+      // Check if it's a directory by trying to list its contents
+      const children = await WebFS.listDir(WebFS.joinPath(rootName, entry));
+      if (children.length === 0) {
+        // Could be empty dir or a file — try reading as file
+        const fh = await WebFS.getFileHandle(WebFS.joinPath(rootName, entry));
+        if (fh) continue; // it's a file, skip
+      }
+      dirNames.push({ name: entry, children });
+    }
+
+    // Check if top-level dirs are scenario dirs (flat layout: scenarios directly under root)
+    const directScenarios = [];
+    for (const d of dirNames) {
+      const lower = d.children.map(f => f.toLowerCase());
+      if (lower.includes("veh_smoothed_tracks.csv") || lower.includes("ped_smoothed_tracks.csv")) {
+        directScenarios.push({ name: d.name, files: d.children });
+      }
+    }
+
+    const cities = {};
+    const scenes = {};
+    const sceneIdsSorted = [];
+    const sceneIdsByCity = {};
+    let sid = 1;
+
+    if (directScenarios.length > 0) {
+      // Flat layout: all scenarios directly under root, grouped as a single city
+      const cityName = rootName || "city";
+      const cityLabel = cityName.replace(/_/g, " ");
+      cities[cityName] = { city_id: cityName, city_label: cityLabel, count: directScenarios.length };
+      sceneIdsByCity[cityName] = [];
+
+      directScenarios.sort((a, b) => {
+        const na = parseInt((a.name.match(/\d+/) || ["999999"])[0], 10);
+        const nb = parseInt((b.name.match(/\d+/) || ["999999"])[0], 10);
+        if (na !== nb) return na - nb;
+        return a.name.localeCompare(b.name);
+      });
+
+      for (const scen of directScenarios) {
+        const sceneId = String(sid);
+        sid += 1;
+        const scenPath = WebFS.joinPath(rootName, scen.name);
+        const lower = scen.files.map(f => f.toLowerCase());
+        const hasVeh = lower.includes("veh_smoothed_tracks.csv");
+        const hasPed = lower.includes("ped_smoothed_tracks.csv");
+        let tlFile = null;
+        for (const f of scen.files) {
+          const fl = f.toLowerCase();
+          if (fl.endsWith(".csv") && fl.includes("traffic") && !fl.includes("meta") && !fl.startsWith(".~lock")) {
+            tlFile = f;
+            break;
+          }
+        }
+        scenes[sceneId] = {
+          scene_id: sceneId, city_id: cityName, city_label: cityLabel,
+          scenario_id: scen.name, scenario_label: scen.name.replace(/_/g, " "),
+          dir_path: scenPath, has_veh: hasVeh, has_ped: hasPed, tl_file: tlFile,
+        };
+        sceneIdsSorted.push(sceneId);
+        sceneIdsByCity[cityName].push(sceneId);
+      }
+    } else {
+      // Standard layout: root → city folders → scenario folders
+      for (const cityDir of dirNames.sort((a, b) => a.name.localeCompare(b.name))) {
+        const cityName = cityDir.name;
+        const cityPath = WebFS.joinPath(rootName, cityName);
+        const scenarioEntries = cityDir.children;
+        const scenarioNames = [];
+        for (const s of scenarioEntries) {
+          if (s.startsWith(".")) continue;
+          const scenPath = WebFS.joinPath(cityPath, s);
+          const scenFiles = await WebFS.listDir(scenPath);
+          const lower = scenFiles.map(f => f.toLowerCase());
+          if (lower.includes("veh_smoothed_tracks.csv") || lower.includes("ped_smoothed_tracks.csv")) {
+            scenarioNames.push({ name: s, files: scenFiles });
+          }
+        }
+        if (scenarioNames.length === 0) continue;
+
+        const cityLabel = cityName.replace(/_/g, " ");
+        cities[cityName] = { city_id: cityName, city_label: cityLabel, count: scenarioNames.length };
+        sceneIdsByCity[cityName] = [];
+
+        scenarioNames.sort((a, b) => {
+          const na = parseInt((a.name.match(/\d+/) || ["999999"])[0], 10);
+          const nb = parseInt((b.name.match(/\d+/) || ["999999"])[0], 10);
+          if (na !== nb) return na - nb;
+          return a.name.localeCompare(b.name);
+        });
+
+        for (const scen of scenarioNames) {
+          const sceneId = String(sid);
+          sid += 1;
+          const scenPath = WebFS.joinPath(cityPath, scen.name);
+          const lower = scen.files.map(f => f.toLowerCase());
+          const hasVeh = lower.includes("veh_smoothed_tracks.csv");
+          const hasPed = lower.includes("ped_smoothed_tracks.csv");
+          let tlFile = null;
+          for (const f of scen.files) {
+            const fl = f.toLowerCase();
+            if (fl.endsWith(".csv") && fl.includes("traffic") && !fl.includes("meta") && !fl.startsWith(".~lock")) {
+              tlFile = f;
+              break;
+            }
+          }
+          scenes[sceneId] = {
+            scene_id: sceneId, city_id: cityName, city_label: cityLabel,
+            scenario_id: scen.name, scenario_label: scen.name.replace(/_/g, " "),
+            dir_path: scenPath, has_veh: hasVeh, has_ped: hasPed, tl_file: tlFile,
+          };
+          sceneIdsSorted.push(sceneId);
+          sceneIdsByCity[cityName].push(sceneId);
+        }
+      }
+    }
+
+    // Build index lookups
+    const sceneIndex = {};
+    for (let i = 0; i < sceneIdsSorted.length; i++) {
+      sceneIndex[sceneIdsSorted[i]] = i;
+    }
+    const sceneIndexByCity = {};
+    for (const [cid, ids] of Object.entries(sceneIdsByCity)) {
+      sceneIndexByCity[cid] = {};
+      for (let i = 0; i < ids.length; i++) {
+        sceneIndexByCity[cid][ids[i]] = i;
+      }
+    }
+
+    return {
+      split: "all",
+      cities,
+      scenes,
+      scene_ids_sorted: sceneIdsSorted,
+      scene_ids_by_city: sceneIdsByCity,
+      scene_index: sceneIndex,
+      scene_index_by_city: sceneIndexByCity,
+    };
+  },
+
+  async _getSindIndex(ctx) {
+    if (!WebFS.rootHandle) {
+      return {
+        split: "all", cities: {}, scenes: {},
+        scene_ids_sorted: [], scene_ids_by_city: {},
+        scene_index: {}, scene_index_by_city: {},
+      };
+    }
+    const rootName = String(WebFS.rootHandle.name || "");
+    const key = JSON.stringify({ root: rootName, dataset_id: String((ctx && ctx.datasetId) || "") });
+    const cached = this._sindIndexCache.get(key);
+    if (cached) {
+      this._sindIndexCache.delete(key);
+      this._sindIndexCache.set(key, cached);
+      return cached;
+    }
+    const built = await this._buildSindIndex();
+    this._sindIndexCache.set(key, built);
+    while (this._sindIndexCache.size > this.SIND_INDEX_CACHE_MAX) {
+      const oldest = this._sindIndexCache.keys().next().value;
+      this._sindIndexCache.delete(oldest);
+    }
+    return built;
+  },
+
+  // ── V2X-Traj / V2X-Seq index builder ──────────────────────────────────
+
+  _v2xModalityRoots(datasetType) {
+    const rootName = String(WebFS.rootHandle.name || "");
+    if (datasetType === "v2x_seq") {
+      return [
+        { modality: "ego",           dir: WebFS.joinPath(rootName, "cooperative-vehicle-infrastructure", "cooperative-trajectories") },
+        { modality: "ego",           dir: WebFS.joinPath(rootName, "cooperative-vehicle-infrastructure", "infrastructure-trajectories") },
+        { modality: "ego",           dir: WebFS.joinPath(rootName, "cooperative-vehicle-infrastructure", "vehicle-trajectories") },
+        { modality: "infra",         dir: WebFS.joinPath(rootName, "single-infrastructure", "trajectories") },
+        { modality: "vehicle",       dir: WebFS.joinPath(rootName, "single-vehicle", "trajectories") },
+        { modality: "traffic_light", dir: WebFS.joinPath(rootName, "single-infrastructure", "traffic-light") },
+        { modality: "traffic_light", dir: WebFS.joinPath(rootName, "cooperative-vehicle-infrastructure", "traffic-light") },
+      ];
+    }
+    // v2x_traj
+    return [
+      { modality: "ego",           dir: WebFS.joinPath(rootName, "ego-trajectories") },
+      { modality: "infra",         dir: WebFS.joinPath(rootName, "infrastructure-trajectories") },
+      { modality: "vehicle",       dir: WebFS.joinPath(rootName, "vehicle-trajectories") },
+      { modality: "traffic_light", dir: WebFS.joinPath(rootName, "traffic-light") },
+    ];
+  },
+
+  _v2xIntersectionLabel(intersectId) {
+    if (!intersectId) return intersectId || "";
+    const m = String(intersectId).match(/#(\d+)/);
+    if (m) return "Intersection " + String(m[1]).padStart(2, "0");
+    return String(intersectId);
+  },
+
+  async _buildV2xIndex(datasetType) {
+    if (!WebFS.rootHandle) {
+      return { splits: [], scenes: {}, scene_ids_sorted: [], scene_ids_by_intersect: {}, scene_index: {}, scene_index_by_intersect: {}, intersections: {} };
+    }
+    const modalityRoots = this._v2xModalityRoots(datasetType);
+    const splits = (datasetType === "v2x_seq" || datasetType === "v2x_traj") ? ["train", "val"] : ["train", "val"];
+
+    // Discover scenes across all modality roots and splits
+    // scenesMap: { sceneId -> { scene_id, split, modalities: Set, city, intersect_id, files: { modality -> path } } }
+    const scenesMap = {};
+
+    for (const mr of modalityRoots) {
+      for (const split of splits) {
+        const dataDir = WebFS.joinPath(mr.dir, split, "data");
+        let files = await WebFS.listDir(dataDir);
+        if (!files.length) {
+          // Try fallback: {root}/{split}/*.csv
+          const altDir = WebFS.joinPath(mr.dir, split);
+          files = await WebFS.listDir(altDir);
+          if (!files.length) continue;
+          // Filter to CSV files
+          files = files.filter(f => f.toLowerCase().endsWith(".csv"));
+          for (const f of files) {
+            const sceneId = f.replace(/\.csv$/i, "");
+            if (!sceneId) continue;
+            if (!scenesMap[sceneId]) {
+              scenesMap[sceneId] = {
+                scene_id: sceneId, split, modalities: new Set(), city: null, intersect_id: null,
+                files: {},
+              };
+            }
+            scenesMap[sceneId].modalities.add(mr.modality);
+            if (!scenesMap[sceneId].files[mr.modality]) {
+              scenesMap[sceneId].files[mr.modality] = WebFS.joinPath(altDir, f);
+            }
+          }
+        } else {
+          // Filter to CSV files
+          files = files.filter(f => f.toLowerCase().endsWith(".csv"));
+          for (const f of files) {
+            const sceneId = f.replace(/\.csv$/i, "");
+            if (!sceneId) continue;
+            if (!scenesMap[sceneId]) {
+              scenesMap[sceneId] = {
+                scene_id: sceneId, split, modalities: new Set(), city: null, intersect_id: null,
+                files: {},
+              };
+            }
+            scenesMap[sceneId].modalities.add(mr.modality);
+            if (!scenesMap[sceneId].files[mr.modality]) {
+              scenesMap[sceneId].files[mr.modality] = WebFS.joinPath(dataDir, f);
+            }
+          }
+        }
+      }
+    }
+
+    // For v2x_seq: filter out scenes that are traffic-light only (no trajectory modalities)
+    // unless `include_tl_only` is set (handled later in handlers)
+
+    // Read city/intersect_id from one sample CSV per scene
+    const sceneIdsList = Object.keys(scenesMap);
+    // Sort numerically
+    sceneIdsList.sort((a, b) => {
+      const na = parseInt(a, 10);
+      const nb = parseInt(b, 10);
+      if (Number.isFinite(na) && Number.isFinite(nb) && na !== nb) return na - nb;
+      return a.localeCompare(b);
+    });
+
+    // Read intersect_id from first row of a sample file for each scene
+    // Only sample a subset to avoid reading thousands of files
+    const SAMPLE_MAX = 500;
+    let sampled = 0;
+    for (const sceneId of sceneIdsList) {
+      const s = scenesMap[sceneId];
+      if (sampled >= SAMPLE_MAX && s.intersect_id) continue;
+      // Pick first available file path
+      const filePath = s.files.ego || s.files.infra || s.files.vehicle || s.files.traffic_light;
+      if (!filePath) continue;
+      const text = await WebFS.readFileText(filePath);
+      if (!text) continue;
+      // Read only the header and first data line
+      const lines = text.split(/\r?\n/, 3);
+      if (lines.length < 2) continue;
+      const rawHeader = String(lines[0] || "").replace(/^\uFEFF/, "");
+      const delimiter = detectCsvDelimiter(rawHeader, ",");
+      const headers = splitCsvLine(rawHeader, delimiter).map(h => h.trim());
+      const firstLine = String(lines[1] || "").trim();
+      if (!firstLine) continue;
+      const values = splitCsvLine(firstLine, delimiter);
+      const row = {};
+      for (let j = 0; j < headers.length; j++) {
+        row[headers[j]] = String(values[j] == null ? "" : values[j]).trim();
+      }
+      s.city = row.city || null;
+      s.intersect_id = row.intersect_id || null;
+      sampled++;
+    }
+
+    // Build intersection info
+    const intersections = {};
+    const sceneIdsByIntersect = {};
+    const sceneIdsSorted = [];
+
+    for (const sceneId of sceneIdsList) {
+      const s = scenesMap[sceneId];
+      const hasTraj = s.modalities.has("ego") || s.modalities.has("infra") || s.modalities.has("vehicle");
+      // Store for later filtering in handlers
+      s._has_traj = hasTraj;
+      s._has_tl = s.modalities.has("traffic_light");
+
+      sceneIdsSorted.push(sceneId);
+      const iid = s.intersect_id || "unknown";
+      if (!intersections[iid]) {
+        intersections[iid] = {
+          intersect_id: iid,
+          intersect_label: this._v2xIntersectionLabel(iid),
+          count: 0,
+        };
+      }
+      intersections[iid].count += 1;
+      if (!sceneIdsByIntersect[iid]) sceneIdsByIntersect[iid] = [];
+      sceneIdsByIntersect[iid].push(sceneId);
+    }
+
+    // Build index lookups
+    const sceneIndex = {};
+    for (let i = 0; i < sceneIdsSorted.length; i++) {
+      sceneIndex[sceneIdsSorted[i]] = i;
+    }
+    const sceneIndexByIntersect = {};
+    for (const [iid, ids] of Object.entries(sceneIdsByIntersect)) {
+      sceneIndexByIntersect[iid] = {};
+      for (let i = 0; i < ids.length; i++) {
+        sceneIndexByIntersect[iid][ids[i]] = i;
+      }
+    }
+
+    return {
+      dataset_type: datasetType,
+      splits,
+      scenes: scenesMap,
+      scene_ids_sorted: sceneIdsSorted,
+      scene_ids_by_intersect: sceneIdsByIntersect,
+      scene_index: sceneIndex,
+      scene_index_by_intersect: sceneIndexByIntersect,
+      intersections,
+    };
+  },
+
+  async _getV2xIndex(ctx) {
+    if (!WebFS.rootHandle) {
+      return { splits: [], scenes: {}, scene_ids_sorted: [], scene_ids_by_intersect: {}, scene_index: {}, scene_index_by_intersect: {}, intersections: {} };
+    }
+    const rootName = String(WebFS.rootHandle.name || "");
+    const dt = ctx.datasetType || "v2x_traj";
+    const key = JSON.stringify({ root: rootName, dataset_type: dt, dataset_id: String((ctx && ctx.datasetId) || "") });
+    const cached = this._v2xIndexCache.get(key);
+    if (cached) {
+      this._v2xIndexCache.delete(key);
+      this._v2xIndexCache.set(key, cached);
+      return cached;
+    }
+    const built = await this._buildV2xIndex(dt);
+    this._v2xIndexCache.set(key, built);
+    while (this._v2xIndexCache.size > this.V2X_INDEX_CACHE_MAX) {
+      const oldest = this._v2xIndexCache.keys().next().value;
+      this._v2xIndexCache.delete(oldest);
+    }
+    return built;
+  },
+
+  // ── V2X-Seq bundle loader ──────────────────────────────────────────
+
+  async _loadV2xSeqBundle(ctx, datasetId, sceneId, split, includeMap) {
+    const index = await this._getV2xIndex(ctx);
+    const ref = index.scenes && index.scenes[sceneId] ? index.scenes[sceneId] : null;
+    if (!ref) throw new Error(`V2X-Seq scene not found: ${sceneId}`);
+
+    const rootName = String(WebFS.rootHandle.name || "");
+    const modalities = ["ego", "infra", "vehicle", "traffic_light"];
+    const modalityRoots = this._v2xModalityRoots("v2x_seq");
+
+    const extent = { min_x: Infinity, min_y: Infinity, max_x: -Infinity, max_y: -Infinity };
+    const allTs = new Set();
+    const trajectories = {};
+
+    const updateExtent = (x, y) => {
+      if (!Number.isFinite(x) || !Number.isFinite(y)) return;
+      extent.min_x = Math.min(extent.min_x, x);
+      extent.min_y = Math.min(extent.min_y, y);
+      extent.max_x = Math.max(extent.max_x, x);
+      extent.max_y = Math.max(extent.max_y, y);
+    };
+
+    // For each modality root, try to find the scene CSV
+    for (const mr of modalityRoots) {
+      const candidatePaths = [
+        WebFS.joinPath(mr.dir, ref.split || split, "data", `${sceneId}.csv`),
+        WebFS.joinPath(mr.dir, ref.split || split, `${sceneId}.csv`),
+        WebFS.joinPath(mr.dir, `${sceneId}.csv`),
+      ];
+      const found = await this.readCsvRowsFromPaths(candidatePaths);
+      const rows = Array.isArray(found.rows) ? found.rows : [];
+      if (!rows.length) continue;
+
+      const mod = mr.modality;
+      const byTs = trajectories[mod] || {};
+      rows.forEach(r => {
+        const ts = parseTs100ms(r.timestamp);
+        if (ts === null) return;
+        if (!byTs[ts]) byTs[ts] = [];
+        allTs.add(ts);
+        if (mod === "traffic_light") {
+          const obj = {
+            x: safeFloat(r.x), y: safeFloat(r.y),
+            direction: r.direction, lane_id: r.lane_id,
+            color_1: r.color_1, remain_1: safeFloat(r.remain_1),
+            color_2: r.color_2, remain_2: safeFloat(r.remain_2),
+            color_3: r.color_3, remain_3: safeFloat(r.remain_3),
+          };
+          updateExtent(obj.x, obj.y);
+          byTs[ts].push(obj);
+        } else {
+          const obj = {
+            id: r.id, type: r.type, sub_type: r.sub_type, tag: r.tag,
+            x: safeFloat(r.x), y: safeFloat(r.y), z: safeFloat(r.z),
+            length: safeFloat(r.length), width: safeFloat(r.width), height: safeFloat(r.height),
+            theta: safeFloat(r.theta), v_x: safeFloat(r.v_x), v_y: safeFloat(r.v_y),
+          };
+          updateExtent(obj.x, obj.y);
+          byTs[ts].push(obj);
+        }
+      });
+      trajectories[mod] = byTs;
+    }
+
+    let mapData = null;
+    if (includeMap) {
+      const mapDir = WebFS.joinPath(rootName, "maps");
+      const mapFiles = await WebFS.listDir(mapDir);
+      const jsonMap = mapFiles.find(f => f.endsWith(".json"));
+      if (jsonMap) {
+        const text = await WebFS.readFileText(WebFS.joinPath(mapDir, jsonMap));
+        if (text) {
+          mapData = processMapData(JSON.parse(text));
+          mapData.map_file = jsonMap;
+        }
+      }
+    }
+
+    const tsSorted = Array.from(allTs).filter(x => Number.isFinite(x)).sort((a, b) => a - b);
+    const timestamps = tsSorted.map(x => x / 10);
+    const t0 = timestamps.length ? timestamps[0] : 0;
+    const frames = tsSorted.map(ts => ({
+      ego: trajectories.ego && trajectories.ego[ts] ? trajectories.ego[ts] : [],
+      infra: trajectories.infra && trajectories.infra[ts] ? trajectories.infra[ts] : [],
+      vehicle: trajectories.vehicle && trajectories.vehicle[ts] ? trajectories.vehicle[ts] : [],
+      traffic_light: trajectories.traffic_light && trajectories.traffic_light[ts] ? trajectories.traffic_light[ts] : [],
+    }));
+
+    const modality_stats = {};
+    for (const mod of modalities) {
+      const byTs = trajectories[mod] || {};
+      const keys = Object.keys(byTs).map(Number).filter(Number.isFinite).sort((a, b) => a - b);
+      const rows = keys.reduce((acc, k) => acc + ((byTs[k] || []).length), 0);
+      modality_stats[mod] = {
+        rows,
+        unique_ts: keys.length,
+        min_ts: keys.length ? (keys[0] / 10) : null,
+        max_ts: keys.length ? (keys[keys.length - 1] / 10) : null,
+      };
+    }
+
+    const normalizedExtent = Number.isFinite(extent.min_x) ? extent : { min_x: 0, min_y: 0, max_x: 1, max_y: 1 };
+
+    return {
+      dataset_id: datasetId,
+      scene_id: sceneId,
+      split: ref.split || split,
+      city: ref.city || null,
+      intersect_id: ref.intersect_id || null,
+      intersect_label: this._v2xIntersectionLabel(ref.intersect_id),
+      map_id: mapData ? (mapData.map_id || "web_map") : null,
+      t0, timestamps, extent: normalizedExtent,
+      scene_label: `Scene ${sceneId}`,
+      modality_stats, frames, warnings: [],
+      trajectories, map: mapData,
+      meta: { city: ref.city || null, intersect_id: ref.intersect_id || null },
+    };
+  },
+
+  // ── inD index builder ──────────────────────────────────────────────
+
+  _indClassToTypeSubtype(cls) {
+    const c = String(cls || "").trim().toLowerCase();
+    if (c === "car") return { type: "VEHICLE", sub_type: "CAR" };
+    if (c === "truck_bus" || c === "truck" || c === "bus") return { type: "VEHICLE", sub_type: c.toUpperCase() };
+    if (c === "van") return { type: "VEHICLE", sub_type: "VAN" };
+    if (c === "motorcycle") return { type: "VEHICLE", sub_type: "MOTORCYCLE" };
+    if (c === "pedestrian") return { type: "PEDESTRIAN", sub_type: null };
+    if (c === "bicycle") return { type: "BICYCLE", sub_type: null };
+    return { type: "OTHER", sub_type: c || null };
+  },
+
+  async _buildIndIndex(ctx) {
+    if (!WebFS.rootHandle) {
+      return { split: "all", recordings: {}, scenes: {}, scene_ids_sorted: [], scene_ids_by_location: {}, scene_index: {}, scene_index_by_location: {}, locations: {} };
+    }
+    const rootName = String(WebFS.rootHandle.name || "");
+
+    // Find data directory: first try root/data, then root itself
+    let dataDir = WebFS.joinPath(rootName, "data");
+    let dataEntries = await WebFS.listDir(dataDir);
+    if (!dataEntries.length) {
+      dataDir = rootName;
+      dataEntries = await WebFS.listDir(dataDir);
+    }
+
+    // Find all recording numbers by looking for NN_tracks.csv
+    const recNums = [];
+    for (const entry of dataEntries) {
+      const m = entry.match(/^(\d+)_tracks\.csv$/i);
+      if (m) recNums.push(m[1]);
+    }
+    recNums.sort((a, b) => parseInt(a, 10) - parseInt(b, 10));
+
+    // Read recording metadata for each recording
+    const recordings = {};
+    for (const num of recNums) {
+      const metaPath = WebFS.joinPath(dataDir, `${num}_recordingMeta.csv`);
+      const metaText = await WebFS.readFileText(metaPath);
+      if (!metaText) continue;
+      const metaRows = parseCsv(metaText);
+      if (!metaRows.length) continue;
+      const meta = metaRows[0]; // recordingMeta has just one data row
+
+      const tracksMetaPath = WebFS.joinPath(dataDir, `${num}_tracksMeta.csv`);
+      const tracksMetaText = await WebFS.readFileText(tracksMetaPath);
+      const tracksMeta = tracksMetaText ? parseCsv(tracksMetaText) : [];
+
+      const frameRate = safeFloat(meta.frameRate) || 25.0;
+      const duration = safeFloat(meta.duration) || 0;
+      const locationId = String(meta.locationId || "").trim();
+
+      // Compute max frame from tracksMeta
+      let maxFrame = 0;
+      const trackInfos = {};
+      for (const tm of tracksMeta) {
+        const tid = String(tm.trackId || "").trim();
+        const initF = parseInt(tm.initialFrame, 10) || 0;
+        const finalF = parseInt(tm.finalFrame, 10) || 0;
+        const cls = String(tm.class || "").trim();
+        const w = safeFloat(tm.width);
+        const l = safeFloat(tm.length);
+        trackInfos[tid] = { initialFrame: initF, finalFrame: finalF, cls, width: w, length: l };
+        if (finalF > maxFrame) maxFrame = finalF;
+      }
+      if (maxFrame <= 0 && duration > 0) maxFrame = Math.round(duration * frameRate);
+
+      // Check for background image
+      const bgPath = WebFS.joinPath(dataDir, `${num}_background.png`);
+      const bgHandle = await WebFS.getFileHandle(bgPath);
+      const hasBackground = !!bgHandle;
+
+      recordings[num] = {
+        recording_id: num,
+        location_id: locationId,
+        frame_rate: frameRate,
+        duration,
+        max_frame: maxFrame,
+        track_infos: trackInfos,
+        has_background: hasBackground,
+        data_dir: dataDir,
+        ortho_px_to_meter: safeFloat(meta.orthoPxToMeter),
+      };
+    }
+
+    // Window recordings into scenes
+    const profile = (ctx && ctx.profile && typeof ctx.profile === "object") ? ctx.profile : {};
+    const strategy = (profile.scene_strategy && typeof profile.scene_strategy === "object") ? profile.scene_strategy : {};
+    const windowS = Math.min(600, Math.max(10, parseInt(strategy.window_s, 10) || 60));
+
+    const scenes = {};
+    const sceneIdsSorted = [];
+    const sceneIdsByLocation = {};
+    const locations = {};
+    let globalSceneN = 1;
+
+    for (const num of recNums) {
+      const rec = recordings[num];
+      if (!rec) continue;
+      const locId = rec.location_id || "unknown";
+      const locLabel = "Location " + String(locId).padStart(2, "0");
+
+      if (!locations[locId]) {
+        locations[locId] = { location_id: locId, location_label: locLabel, count: 0 };
+      }
+      if (!sceneIdsByLocation[locId]) sceneIdsByLocation[locId] = [];
+
+      const windowFrames = Math.round(windowS * rec.frame_rate);
+      let startFrame = 0;
+      let wi = 0;
+
+      while (startFrame <= rec.max_frame) {
+        const endFrame = Math.min(rec.max_frame, startFrame + windowFrames - 1);
+        const sceneId = String(globalSceneN);
+        globalSceneN += 1;
+
+        // Count tracks overlapping this window
+        let trackCount = 0;
+        let rowEstimate = 0;
+        for (const [tid, info] of Object.entries(rec.track_infos)) {
+          if (info.finalFrame >= startFrame && info.initialFrame <= endFrame) {
+            trackCount += 1;
+            const overlapStart = Math.max(startFrame, info.initialFrame);
+            const overlapEnd = Math.min(endFrame, info.finalFrame);
+            rowEstimate += (overlapEnd - overlapStart + 1);
+          }
+        }
+
+        const minTs = startFrame / rec.frame_rate;
+        const maxTs = endFrame / rec.frame_rate;
+        const durS = maxTs - minTs;
+        const uniqueTs = endFrame - startFrame + 1;
+
+        scenes[sceneId] = {
+          scene_id: sceneId,
+          recording_id: num,
+          window_index: wi,
+          split: "all",
+          location_id: locId,
+          location_label: locLabel,
+          start_frame: startFrame,
+          end_frame: endFrame,
+          frame_rate: rec.frame_rate,
+          min_ts: minTs,
+          max_ts: maxTs,
+          duration_s: durS,
+          unique_ts: uniqueTs,
+          unique_agents: trackCount,
+          rows: rowEstimate,
+          data_dir: rec.data_dir,
+          has_background: rec.has_background,
+          ortho_px_to_meter: rec.ortho_px_to_meter,
+        };
+
+        sceneIdsSorted.push(sceneId);
+        sceneIdsByLocation[locId].push(sceneId);
+        locations[locId].count += 1;
+
+        wi += 1;
+        startFrame = endFrame + 1;
+      }
+    }
+
+    // Build index lookups
+    const sceneIndex = {};
+    for (let i = 0; i < sceneIdsSorted.length; i++) sceneIndex[sceneIdsSorted[i]] = i;
+    const sceneIndexByLocation = {};
+    for (const [lid, ids] of Object.entries(sceneIdsByLocation)) {
+      sceneIndexByLocation[lid] = {};
+      for (let i = 0; i < ids.length; i++) sceneIndexByLocation[lid][ids[i]] = i;
+    }
+
+    return {
+      split: "all",
+      window_s: windowS,
+      recordings,
+      scenes,
+      scene_ids_sorted: sceneIdsSorted,
+      scene_ids_by_location: sceneIdsByLocation,
+      scene_index: sceneIndex,
+      scene_index_by_location: sceneIndexByLocation,
+      locations,
+    };
+  },
+
+  async _getIndIndex(ctx) {
+    if (!WebFS.rootHandle) {
+      return { split: "all", recordings: {}, scenes: {}, scene_ids_sorted: [], scene_ids_by_location: {}, scene_index: {}, scene_index_by_location: {}, locations: {} };
+    }
+    const rootName = String(WebFS.rootHandle.name || "");
+    const key = JSON.stringify({ root: rootName, dataset_id: String((ctx && ctx.datasetId) || "") });
+    const cached = this._indIndexCache.get(key);
+    if (cached) {
+      this._indIndexCache.delete(key);
+      this._indIndexCache.set(key, cached);
+      return cached;
+    }
+    const built = await this._buildIndIndex(ctx);
+    this._indIndexCache.set(key, built);
+    while (this._indIndexCache.size > this.IND_INDEX_CACHE_MAX) {
+      const oldest = this._indIndexCache.keys().next().value;
+      this._indIndexCache.delete(oldest);
+    }
+    return built;
+  },
+
+  // ── inD bundle loader ──────────────────────────────────────────────
+
+  async _loadIndBundle(ctx, datasetId, sceneId, includeMap) {
+    const index = await this._getIndIndex(ctx);
+    const ref = index.scenes && index.scenes[sceneId] ? index.scenes[sceneId] : null;
+    if (!ref) throw new Error(`inD scene not found: ${sceneId}`);
+
+    const rec = index.recordings && index.recordings[ref.recording_id];
+    if (!rec) throw new Error(`inD recording not found: ${ref.recording_id}`);
+
+    const dataDir = ref.data_dir;
+    const num = ref.recording_id;
+    const startFrame = ref.start_frame;
+    const endFrame = ref.end_frame;
+    const frameRate = ref.frame_rate;
+
+    // Read tracks CSV
+    const tracksPath = WebFS.joinPath(dataDir, `${num}_tracks.csv`);
+    const tracksText = await WebFS.readFileText(tracksPath);
+    if (!tracksText) throw new Error(`Failed to read tracks file: ${tracksPath}`);
+
+    // Parse tracks CSV
+    const lines = tracksText.split(/\r?\n/);
+    const firstNonEmpty = lines.findIndex(l => l.trim() !== "");
+    if (firstNonEmpty < 0) throw new Error("Empty tracks file");
+    const rawHeader = String(lines[firstNonEmpty] || "").replace(/^\uFEFF/, "");
+    const delimiter = detectCsvDelimiter(rawHeader, ",");
+    const headers = splitCsvLine(rawHeader, delimiter).map(h => h.trim());
+
+    // Build column index map
+    const colIdx = {};
+    for (let j = 0; j < headers.length; j++) colIdx[headers[j]] = j;
+    const iFrame = colIdx["frame"];
+    const iTrackId = colIdx["trackId"];
+    const iXCenter = colIdx["xCenter"];
+    const iYCenter = colIdx["yCenter"];
+    const iHeading = colIdx["heading"];
+    const iWidth = colIdx["width"];
+    const iLength = colIdx["length"];
+    const iXVel = colIdx["xVelocity"];
+    const iYVel = colIdx["yVelocity"];
+
+    // Frame-indexed data
+    const infraByFrame = {};
+    const extent = { min_x: Infinity, min_y: Infinity, max_x: -Infinity, max_y: -Infinity };
+    const uniqueAgents = new Set();
+    let rowCount = 0;
+
+    for (let i = firstNonEmpty + 1; i < lines.length; i++) {
+      const line = lines[i];
+      if (!line.trim()) continue;
+      const values = splitCsvLine(line, delimiter);
+      const frame = parseInt(values[iFrame], 10);
+      if (!Number.isFinite(frame)) continue;
+      if (frame < startFrame || frame > endFrame) continue;
+
+      const trackId = String(values[iTrackId] || "").trim();
+      const x = safeFloat(values[iXCenter]);
+      const y = safeFloat(values[iYCenter]);
+      const headingDeg = safeFloat(values[iHeading]);
+      const theta = headingDeg != null ? (headingDeg * Math.PI / 180) : null;
+      let w = safeFloat(values[iWidth]);
+      let l = safeFloat(values[iLength]);
+      const vx = safeFloat(values[iXVel]);
+      const vy = safeFloat(values[iYVel]);
+
+      // Fallback width/length from tracksMeta
+      const trackInfo = rec.track_infos[trackId];
+      if (w == null && trackInfo) w = trackInfo.width;
+      if (l == null && trackInfo) l = trackInfo.length;
+      const cls = trackInfo ? trackInfo.cls : "";
+      const typeInfo = this._indClassToTypeSubtype(cls);
+
+      const obj = {
+        id: trackId,
+        track_id: trackId,
+        object_id: trackId,
+        type: typeInfo.type,
+        sub_type: typeInfo.sub_type,
+        tag: `recording-${num}`,
+        x, y, z: null,
+        length: l, width: w, height: null,
+        theta, v_x: vx, v_y: vy,
+      };
+
+      if (x != null && y != null) {
+        extent.min_x = Math.min(extent.min_x, x);
+        extent.min_y = Math.min(extent.min_y, y);
+        extent.max_x = Math.max(extent.max_x, x);
+        extent.max_y = Math.max(extent.max_y, y);
+      }
+
+      if (!infraByFrame[frame]) infraByFrame[frame] = [];
+      infraByFrame[frame].push(obj);
+      uniqueAgents.add(trackId);
+      rowCount += 1;
+    }
+
+    const frameKeys = Object.keys(infraByFrame).map(Number).filter(Number.isFinite).sort((a, b) => a - b);
+    const timestamps = frameKeys.map(f => f / frameRate);
+    const t0 = timestamps.length ? timestamps[0] : 0;
+    const frames = frameKeys.map(f => ({
+      infra: infraByFrame[f] || [],
+      ego: [],
+      vehicle: [],
+      traffic_light: [],
+    }));
+
+    const normalizedExtent = Number.isFinite(extent.min_x) ? extent : { min_x: 0, min_y: 0, max_x: 1, max_y: 1 };
+
+    const warnings = [];
+    if (rowCount <= 0) warnings.push("scene_window_empty");
+
+    const wi = ref.window_index;
+    // Count total windows for this recording
+    const recSceneIds = Object.values(index.scenes)
+      .filter(s => s.recording_id === num)
+      .map(s => s.scene_id);
+    const windowCount = recSceneIds.length;
+    const durS = timestamps.length >= 2 ? (timestamps[timestamps.length - 1] - timestamps[0]) : 0;
+    const sceneLabel = `Recording ${num} \u00b7 Window ${wi + 1} \u00b7 ${Math.round(durS)}s`;
+
+    const modality_stats = {
+      ego: { rows: 0, unique_ts: 0, min_ts: null, max_ts: null },
+      vehicle: { rows: 0, unique_ts: 0, min_ts: null, max_ts: null },
+      traffic_light: { rows: 0, unique_ts: 0, min_ts: null, max_ts: null },
+      infra: {
+        rows: rowCount,
+        unique_ts: frameKeys.length,
+        min_ts: timestamps.length ? timestamps[0] : null,
+        max_ts: timestamps.length ? timestamps[timestamps.length - 1] : null,
+        unique_agents: uniqueAgents.size,
+      },
+    };
+
+    return {
+      dataset_id: datasetId,
+      split: "all",
+      scene_id: sceneId,
+      scene_label: sceneLabel,
+      city: null,
+      intersect_id: ref.location_id,
+      intersect_label: ref.location_label,
+      recording_id: num,
+      recording_label: `Recording ${num}`,
+      window_index: wi,
+      window_count: windowCount,
+      intersect_by_modality: { infra: ref.location_id },
+      map_id: null,
+      t0, timestamps, extent: normalizedExtent,
+      modality_stats, frames, warnings,
+      map: null,
+      meta: { city: null, intersect_id: ref.location_id },
+    };
+  },
+
   async _getCpmIndex(ctx) {
     if (!WebFS.rootHandle) {
       return {
@@ -1512,6 +2396,57 @@ const WebBackend = {
       return { split, items };
     }
 
+    if (ctx.datasetType === "sind") {
+      const index = await this._getSindIndex(ctx);
+      const split = index.split || "all";
+      const items = [];
+      for (const city of Object.values(index.cities || {})) {
+        if (!city || !city.city_id) continue;
+        items.push({
+          intersect_id: city.city_id,
+          intersect_label: city.city_label || city.city_id,
+          count: city.count || 0,
+        });
+      }
+      items.sort((a, b) => String(a.intersect_label || "").localeCompare(String(b.intersect_label || "")));
+      return { split, items };
+    }
+
+    if (ctx.datasetType === "v2x_traj" || ctx.datasetType === "v2x_seq") {
+      const index = await this._getV2xIndex(ctx);
+      const items = [];
+      for (const inter of Object.values(index.intersections || {})) {
+        if (!inter || !inter.intersect_id) continue;
+        items.push({
+          intersect_id: inter.intersect_id,
+          intersect_label: inter.intersect_label || inter.intersect_id,
+          count: inter.count || 0,
+        });
+      }
+      items.sort((a, b) => b.count - a.count);
+      return { split: requestedSplit, items };
+    }
+
+    if (ctx.datasetType === "ind") {
+      const index = await this._getIndIndex(ctx);
+      const items = [];
+      for (const loc of Object.values(index.locations || {})) {
+        if (!loc || !loc.location_id) continue;
+        items.push({
+          intersect_id: loc.location_id,
+          intersect_label: loc.location_label || loc.location_id,
+          count: loc.count || 0,
+        });
+      }
+      items.sort((a, b) => {
+        const na = parseInt(a.intersect_id, 10);
+        const nb = parseInt(b.intersect_id, 10);
+        if (Number.isFinite(na) && Number.isFinite(nb)) return na - nb;
+        return String(a.intersect_label || "").localeCompare(String(b.intersect_label || ""));
+      });
+      return { split: "all", items };
+    }
+
     const candidatePaths = [
       'scenes.csv',
       WebFS.joinPath(WebFS.rootHandle.name, requestedSplit, 'scenes.csv'),
@@ -1614,10 +2549,161 @@ const WebBackend = {
       };
     }
 
+    if (ctx.datasetType === "sind") {
+      const index = await this._getSindIndex(ctx);
+      const split = index.split || "all";
+      let ids = [];
+      if (intersectId) {
+        ids = Array.isArray(index.scene_ids_by_city && index.scene_ids_by_city[intersectId])
+          ? index.scene_ids_by_city[intersectId].slice()
+          : [];
+      } else {
+        ids = Array.isArray(index.scene_ids_sorted) ? index.scene_ids_sorted.slice() : [];
+      }
+      if (includeTlOnlyFlag) {
+        ids = ids.filter(sid => {
+          const ref = index.scenes && index.scenes[sid];
+          return ref && ref.tl_file;
+        });
+      }
+      const total = ids.length;
+      const slice = ids.slice(offset, offset + limit);
+      const items = [];
+      for (const sid of slice) {
+        const ref = index.scenes && index.scenes[sid] ? index.scenes[sid] : null;
+        if (!ref) continue;
+        items.push({
+          scene_id: ref.scene_id,
+          scene_label: `${ref.city_label} \u00b7 ${ref.scenario_label}`,
+          split,
+          city: ref.city_id,
+          intersect_id: ref.city_id,
+          intersect_label: ref.city_label,
+          by_modality: {
+            infra: { rows: 0, min_ts: null, max_ts: null, unique_ts: 0, duration_s: null, unique_agents: 0 },
+            traffic_light: { rows: 0, min_ts: null, max_ts: null, unique_ts: 0 },
+          },
+        });
+      }
+      return {
+        split,
+        intersect_id: intersectId || null,
+        total,
+        limit,
+        offset,
+        items,
+        availability: { scene_count: total, by_modality: { infra: total, traffic_light: ids.filter(sid => index.scenes[sid] && index.scenes[sid].tl_file).length } },
+        include_tl_only: includeTlOnlyFlag,
+      };
+    }
+
+    if (ctx.datasetType === "v2x_traj" || ctx.datasetType === "v2x_seq") {
+      const index = await this._getV2xIndex(ctx);
+      let ids = [];
+      if (intersectId) {
+        ids = Array.isArray(index.scene_ids_by_intersect && index.scene_ids_by_intersect[intersectId])
+          ? index.scene_ids_by_intersect[intersectId].slice()
+          : [];
+      } else {
+        ids = Array.isArray(index.scene_ids_sorted) ? index.scene_ids_sorted.slice() : [];
+      }
+      // For v2x_seq: filter based on include_tl_only
+      if (ctx.datasetType === "v2x_seq") {
+        if (includeTlOnlyFlag) {
+          ids = ids.filter(sid => {
+            const ref = index.scenes && index.scenes[sid];
+            return ref && ref._has_tl;
+          });
+        } else {
+          ids = ids.filter(sid => {
+            const ref = index.scenes && index.scenes[sid];
+            return ref && ref._has_traj;
+          });
+        }
+      }
+      const total = ids.length;
+      const slice = ids.slice(offset, offset + limit);
+      const items = [];
+      for (const sid of slice) {
+        const ref = index.scenes && index.scenes[sid] ? index.scenes[sid] : null;
+        if (!ref) continue;
+        const mods = {};
+        for (const m of ref.modalities || []) {
+          mods[m] = { rows: 0, min_ts: null, max_ts: null, unique_ts: 0, duration_s: null, unique_agents: null };
+        }
+        items.push({
+          scene_id: ref.scene_id,
+          scene_label: `Scene ${ref.scene_id}`,
+          split: ref.split || requestedSplit,
+          city: ref.city || null,
+          intersect_id: ref.intersect_id || null,
+          intersect_label: this._v2xIntersectionLabel(ref.intersect_id),
+          by_modality: mods,
+        });
+      }
+      const avail = { scene_count: total, by_modality: {} };
+      for (const mod of ["ego", "infra", "vehicle", "traffic_light"]) {
+        avail.by_modality[mod] = ids.filter(sid => {
+          const ref = index.scenes && index.scenes[sid];
+          return ref && ref.modalities && ref.modalities.has(mod);
+        }).length;
+      }
+      return {
+        split: requestedSplit,
+        intersect_id: intersectId || null,
+        total, limit, offset, items, availability: avail,
+        include_tl_only: includeTlOnlyFlag,
+      };
+    }
+
+    if (ctx.datasetType === "ind") {
+      const index = await this._getIndIndex(ctx);
+      let ids = [];
+      if (intersectId) {
+        ids = Array.isArray(index.scene_ids_by_location && index.scene_ids_by_location[intersectId])
+          ? index.scene_ids_by_location[intersectId].slice()
+          : [];
+      } else {
+        ids = Array.isArray(index.scene_ids_sorted) ? index.scene_ids_sorted.slice() : [];
+      }
+      const total = ids.length;
+      const slice = ids.slice(offset, offset + limit);
+      const items = [];
+      for (const sid of slice) {
+        const ref = index.scenes && index.scenes[sid] ? index.scenes[sid] : null;
+        if (!ref) continue;
+        const durS = ref.duration_s || 0;
+        items.push({
+          scene_id: ref.scene_id,
+          scene_label: `Recording ${ref.recording_id} \u00b7 Window ${ref.window_index + 1} \u00b7 ${Math.round(durS)}s`,
+          recording_id: ref.recording_id,
+          window_index: ref.window_index,
+          split: "all",
+          city: null,
+          intersect_id: ref.location_id,
+          intersect_label: ref.location_label,
+          by_modality: {
+            infra: {
+              rows: ref.rows || 0,
+              min_ts: ref.min_ts,
+              max_ts: ref.max_ts,
+              unique_ts: ref.unique_ts || 0,
+              duration_s: durS,
+              unique_agents: ref.unique_agents || 0,
+            },
+          },
+        });
+      }
+      return {
+        split: "all",
+        intersect_id: intersectId || null,
+        total, limit, offset, items,
+        availability: { scene_count: total, by_modality: { infra: total } },
+        include_tl_only: includeTlOnlyFlag,
+      };
+    }
+
     const candidatePaths = [
-      'scenes.csv',
-      WebFS.joinPath(WebFS.rootHandle.name, requestedSplit, 'scenes.csv'),
-      WebFS.joinPath(WebFS.rootHandle.name, 'scenes.csv'),
     ];
     const found = await this.readCsvRowsFromPaths(candidatePaths);
     const rows = Array.isArray(found.rows) ? found.rows : [];
@@ -1692,6 +2778,89 @@ const WebBackend = {
         city: null,
         intersect_id: String(ref.sensor_id || ""),
         intersect_label: String(ref.sensor_label || ref.sensor_id || ""),
+        index_all: idxAll,
+        total_all: Array.isArray(index.scene_ids_sorted) ? index.scene_ids_sorted.length : 0,
+        index_in_intersection: idxIn,
+        total_in_intersection: totalIn,
+      };
+    }
+
+    if (ctx.datasetType === "sind") {
+      const index = await this._getSindIndex(ctx);
+      const split = index.split || "all";
+      const ref = index.scenes && index.scenes[sceneId] ? index.scenes[sceneId] : null;
+      if (!ref) return { split, scene_id: sceneId, found: false };
+      const idxAll = index.scene_index && index.scene_index[sceneId] != null ? Number(index.scene_index[sceneId]) : null;
+      const idxIn = index.scene_index_by_city && index.scene_index_by_city[ref.city_id]
+        && index.scene_index_by_city[ref.city_id][sceneId] != null
+        ? Number(index.scene_index_by_city[ref.city_id][sceneId])
+        : null;
+      const totalIn = Array.isArray(index.scene_ids_by_city && index.scene_ids_by_city[ref.city_id])
+        ? index.scene_ids_by_city[ref.city_id].length
+        : 0;
+      return {
+        split,
+        scene_id: sceneId,
+        found: true,
+        city: ref.city_id,
+        intersect_id: ref.city_id,
+        intersect_label: ref.city_label || ref.city_id,
+        recording_id: ref.scenario_id,
+        index_all: idxAll,
+        total_all: Array.isArray(index.scene_ids_sorted) ? index.scene_ids_sorted.length : 0,
+        index_in_intersection: idxIn,
+        total_in_intersection: totalIn,
+      };
+    }
+
+    if (ctx.datasetType === "v2x_traj" || ctx.datasetType === "v2x_seq") {
+      const index = await this._getV2xIndex(ctx);
+      const ref = index.scenes && index.scenes[sceneId] ? index.scenes[sceneId] : null;
+      if (!ref) return { split: requestedSplit, scene_id: sceneId, found: false };
+      const idxAll = index.scene_index && index.scene_index[sceneId] != null ? Number(index.scene_index[sceneId]) : null;
+      const iid = ref.intersect_id || "unknown";
+      const idxIn = index.scene_index_by_intersect && index.scene_index_by_intersect[iid]
+        && index.scene_index_by_intersect[iid][sceneId] != null
+        ? Number(index.scene_index_by_intersect[iid][sceneId])
+        : null;
+      const totalIn = Array.isArray(index.scene_ids_by_intersect && index.scene_ids_by_intersect[iid])
+        ? index.scene_ids_by_intersect[iid].length
+        : 0;
+      return {
+        split: ref.split || requestedSplit,
+        scene_id: sceneId,
+        found: true,
+        city: ref.city || null,
+        intersect_id: ref.intersect_id || null,
+        intersect_label: this._v2xIntersectionLabel(ref.intersect_id),
+        index_all: idxAll,
+        total_all: Array.isArray(index.scene_ids_sorted) ? index.scene_ids_sorted.length : 0,
+        index_in_intersection: idxIn,
+        total_in_intersection: totalIn,
+      };
+    }
+
+    if (ctx.datasetType === "ind") {
+      const index = await this._getIndIndex(ctx);
+      const ref = index.scenes && index.scenes[sceneId] ? index.scenes[sceneId] : null;
+      if (!ref) return { split: "all", scene_id: sceneId, found: false };
+      const idxAll = index.scene_index && index.scene_index[sceneId] != null ? Number(index.scene_index[sceneId]) : null;
+      const lid = ref.location_id || "unknown";
+      const idxIn = index.scene_index_by_location && index.scene_index_by_location[lid]
+        && index.scene_index_by_location[lid][sceneId] != null
+        ? Number(index.scene_index_by_location[lid][sceneId])
+        : null;
+      const totalIn = Array.isArray(index.scene_ids_by_location && index.scene_ids_by_location[lid])
+        ? index.scene_ids_by_location[lid].length
+        : 0;
+      return {
+        split: "all",
+        scene_id: sceneId,
+        found: true,
+        city: null,
+        intersect_id: ref.location_id,
+        intersect_label: ref.location_label,
+        recording_id: ref.recording_id,
         index_all: idxAll,
         total_all: Array.isArray(index.scene_ids_sorted) ? index.scene_ids_sorted.length : 0,
         index_in_intersection: idxIn,
@@ -1891,6 +3060,301 @@ const WebBackend = {
     };
   },
 
+  // ── SinD bundle loader ──────────────────────────────────────────
+
+  _sindClassToTypeSubtype(raw) {
+    const c = String(raw || "").trim().toLowerCase();
+    if (["car", "truck", "bus", "van", "motorcycle", "tricycle"].includes(c)) return { type: "VEHICLE", sub_type: c.toUpperCase() };
+    if (c === "pedestrian" || c === "person") return { type: "PEDESTRIAN", sub_type: "PEDESTRIAN" };
+    if (c === "bicycle" || c === "cyclist") return { type: "BICYCLE", sub_type: "BICYCLE" };
+    if (c === "animal") return { type: "ANIMAL", sub_type: "ANIMAL" };
+    if (c) return { type: "OTHER", sub_type: c.toUpperCase() };
+    return { type: "UNKNOWN", sub_type: null };
+  },
+
+  _sindTsKeyFromMs(raw) {
+    const v = safeFloat(raw);
+    if (v === null) return null;
+    return Math.round(v / 100.0);
+  },
+
+  _sindTsFromKey(k) {
+    return k / 10.0;
+  },
+
+  _sindQ3(v) {
+    if (v === null || v === undefined) return null;
+    const f = parseFloat(v);
+    if (!isFinite(f)) return null;
+    return Math.round(f * 1000) / 1000;
+  },
+
+  _sindReadTracksRows(rows, sourceTag) {
+    const byTs = {};
+    const extent = { min_x: Infinity, min_y: Infinity, max_x: -Infinity, max_y: -Infinity };
+    let rowCount = 0;
+    const uniqueIds = new Set();
+    const subTypeCounts = {};
+
+    for (const row of rows) {
+      let tsKey = this._sindTsKeyFromMs(row.timestamp_ms);
+      if (tsKey === null) {
+        const fr = safeFloat(row.frame_id);
+        if (fr !== null) tsKey = Math.round(fr);
+      }
+      if (tsKey === null) continue;
+
+      const x = safeFloat(row.x);
+      const y = safeFloat(row.y);
+      if (x !== null && y !== null) {
+        extent.min_x = Math.min(extent.min_x, x);
+        extent.min_y = Math.min(extent.min_y, y);
+        extent.max_x = Math.max(extent.max_x, x);
+        extent.max_y = Math.max(extent.max_y, y);
+      }
+
+      const trackRaw = row.track_id || row.id || `row${rowCount + 1}`;
+      const objId = `${sourceTag}:${trackRaw}`;
+      let clsRaw = String(row.agent_type || "").trim();
+      if (!clsRaw) clsRaw = sourceTag === "ped" ? "pedestrian" : "vehicle";
+      const { type: objType, sub_type: subType } = this._sindClassToTypeSubtype(clsRaw);
+      let theta = safeFloat(row.heading_rad);
+      if (theta === null) theta = safeFloat(row.yaw_rad);
+
+      const rec = {
+        id: objId,
+        type: objType,
+        sub_type: subType,
+        x: this._sindQ3(x),
+        y: this._sindQ3(y),
+      };
+      const len = safeFloat(row.length);
+      const wid = safeFloat(row.width);
+      const vx = safeFloat(row.vx);
+      const vy = safeFloat(row.vy);
+      if (len !== null) rec.length = this._sindQ3(len);
+      if (wid !== null) rec.width = this._sindQ3(wid);
+      if (theta !== null) rec.theta = this._sindQ3(theta);
+      if (vx !== null) rec.v_x = this._sindQ3(vx);
+      if (vy !== null) rec.v_y = this._sindQ3(vy);
+
+      if (!byTs[tsKey]) byTs[tsKey] = [];
+      byTs[tsKey].push(rec);
+      uniqueIds.add(objId);
+      const stKey = String(subType || "UNKNOWN");
+      subTypeCounts[stKey] = (subTypeCounts[stKey] || 0) + 1;
+      rowCount++;
+    }
+
+    return { byTs, extent, rowCount, uniqueIds, subTypeCounts };
+  },
+
+  _sindTlColorFromValue(raw) {
+    const s = String(raw || "").trim();
+    if (!s) return null;
+    const low = s.toLowerCase();
+    if (low.includes("red")) return "RED";
+    if (low.includes("yellow")) return "YELLOW";
+    if (low.includes("green")) return "GREEN";
+    try {
+      const v = parseInt(low, 10);
+      if (v === 0) return "RED";
+      if (v === 1) return "YELLOW";
+      if (v === 2 || v === 3) return "GREEN";
+    } catch (_) {}
+    return null;
+  },
+
+  _sindReadTrafficLightRows(rows) {
+    const byTs = {};
+    const extent = { min_x: Infinity, min_y: Infinity, max_x: -Infinity, max_y: -Infinity };
+    let rowCount = 0;
+
+    if (!rows.length) return { byTs, extent, rowCount };
+
+    // Detect timestamp column
+    const firstRow = rows[0];
+    const allCols = Object.keys(firstRow);
+    let tsCol = null;
+    for (const c of allCols) {
+      const n = c.toLowerCase().replace(/[^a-z0-9]/g, "");
+      if (n.includes("timestamp") || n === "timems" || n === "time") { tsCol = c; break; }
+    }
+
+    // Detect traffic light state columns
+    const stateCols = allCols.filter(c => {
+      const n = c.toLowerCase().replace(/[^a-z0-9]/g, "");
+      return n.includes("trafficlight") || (n.includes("traffic") && n.includes("light"));
+    });
+
+    if (!stateCols.length) return { byTs, extent, rowCount };
+
+    for (const row of rows) {
+      let tsKey = null;
+      if (tsCol) tsKey = this._sindTsKeyFromMs(row[tsCol]);
+      if (tsKey === null) {
+        const fr = safeFloat(row.RawFrameID || row.rawframeid);
+        if (fr !== null) tsKey = Math.round(fr);
+      }
+      if (tsKey === null) continue;
+
+      for (let i = 0; i < stateCols.length; i++) {
+        const col = stateCols[i];
+        const color = this._sindTlColorFromValue(row[col]);
+        if (!color) continue;
+        const rec = {
+          id: `${i + 1}:${col}`,
+          x: 0,
+          y: 0,
+          color_1: color,
+        };
+        if (!byTs[tsKey]) byTs[tsKey] = [];
+        byTs[tsKey].push(rec);
+        rowCount++;
+      }
+    }
+
+    return { byTs, extent, rowCount };
+  },
+
+  async _loadSindBundle(ctx, datasetId, sceneId, includeMap) {
+    const index = await this._getSindIndex(ctx);
+    const ref = index.scenes && index.scenes[sceneId] ? index.scenes[sceneId] : null;
+    if (!ref) throw new Error(`SinD scene not found: ${sceneId}`);
+
+    const rootName = String(WebFS.rootHandle.name || "");
+    const scenPath = ref.dir_path;
+
+    const warnings = [];
+    const infraByTs = {};
+    const tlByTs = {};
+    const extent = { min_x: Infinity, min_y: Infinity, max_x: -Infinity, max_y: -Infinity };
+    let rowsInfra = 0;
+    const uniqueAgents = new Set();
+    const subTypeCounts = {};
+
+    // Read vehicle tracks
+    if (ref.has_veh) {
+      const vehPath = WebFS.joinPath(scenPath, "Veh_smoothed_tracks.csv");
+      const vehText = await WebFS.readFileText(vehPath);
+      if (vehText) {
+        const vehRows = parseCsv(vehText);
+        const veh = this._sindReadTracksRows(vehRows, "veh");
+        for (const [k, arr] of Object.entries(veh.byTs)) {
+          if (!infraByTs[k]) infraByTs[k] = [];
+          infraByTs[k].push(...arr);
+        }
+        if (isFinite(veh.extent.min_x)) {
+          extent.min_x = Math.min(extent.min_x, veh.extent.min_x);
+          extent.min_y = Math.min(extent.min_y, veh.extent.min_y);
+          extent.max_x = Math.max(extent.max_x, veh.extent.max_x);
+          extent.max_y = Math.max(extent.max_y, veh.extent.max_y);
+        }
+        rowsInfra += veh.rowCount;
+        for (const id of veh.uniqueIds) uniqueAgents.add(id);
+        for (const [k, v] of Object.entries(veh.subTypeCounts)) subTypeCounts[k] = (subTypeCounts[k] || 0) + v;
+      }
+    }
+
+    // Read pedestrian tracks
+    if (ref.has_ped) {
+      const pedPath = WebFS.joinPath(scenPath, "Ped_smoothed_tracks.csv");
+      const pedText = await WebFS.readFileText(pedPath);
+      if (pedText) {
+        const pedRows = parseCsv(pedText);
+        const ped = this._sindReadTracksRows(pedRows, "ped");
+        for (const [k, arr] of Object.entries(ped.byTs)) {
+          if (!infraByTs[k]) infraByTs[k] = [];
+          infraByTs[k].push(...arr);
+        }
+        if (isFinite(ped.extent.min_x)) {
+          extent.min_x = Math.min(extent.min_x, ped.extent.min_x);
+          extent.min_y = Math.min(extent.min_y, ped.extent.min_y);
+          extent.max_x = Math.max(extent.max_x, ped.extent.max_x);
+          extent.max_y = Math.max(extent.max_y, ped.extent.max_y);
+        }
+        rowsInfra += ped.rowCount;
+        for (const id of ped.uniqueIds) uniqueAgents.add(id);
+        for (const [k, v] of Object.entries(ped.subTypeCounts)) subTypeCounts[k] = (subTypeCounts[k] || 0) + v;
+      }
+    }
+
+    // Read traffic lights
+    let tlRows = 0;
+    if (ref.tl_file) {
+      const tlPath = WebFS.joinPath(scenPath, ref.tl_file);
+      const tlText = await WebFS.readFileText(tlPath);
+      if (tlText) {
+        const tlCsvRows = parseCsv(tlText);
+        const tl = this._sindReadTrafficLightRows(tlCsvRows);
+        for (const [k, arr] of Object.entries(tl.byTs)) {
+          if (!tlByTs[k]) tlByTs[k] = [];
+          tlByTs[k].push(...arr);
+        }
+        tlRows = tl.rowCount;
+      }
+    }
+
+    const normalizedExtent = isFinite(extent.min_x)
+      ? extent
+      : { min_x: -10, min_y: -10, max_x: 10, max_y: 10 };
+
+    const allKeys = [...new Set([...Object.keys(infraByTs), ...Object.keys(tlByTs)].map(Number))].filter(isFinite).sort((a, b) => a - b);
+    const timestamps = allKeys.map(k => this._sindTsFromKey(k));
+    const t0 = timestamps.length ? timestamps[0] : 0;
+    const frames = allKeys.map(k => ({
+      infra: infraByTs[k] || [],
+      traffic_light: tlByTs[k] || [],
+    }));
+
+    if (rowsInfra <= 0) warnings.push("scene_window_empty");
+
+    const infraKeys = Object.keys(infraByTs).map(Number).filter(isFinite).sort((a, b) => a - b);
+    const tlKeys = Object.keys(tlByTs).map(Number).filter(isFinite).sort((a, b) => a - b);
+
+    const modality_stats = {
+      ego: { rows: 0, unique_ts: 0, min_ts: null, max_ts: null },
+      vehicle: { rows: 0, unique_ts: 0, min_ts: null, max_ts: null },
+      infra: {
+        rows: rowsInfra,
+        unique_ts: infraKeys.length,
+        min_ts: infraKeys.length ? this._sindTsFromKey(infraKeys[0]) : null,
+        max_ts: infraKeys.length ? this._sindTsFromKey(infraKeys[infraKeys.length - 1]) : null,
+        unique_agents: uniqueAgents.size,
+        sub_type_counts: subTypeCounts,
+      },
+      traffic_light: {
+        rows: tlRows,
+        unique_ts: tlKeys.length,
+        min_ts: tlKeys.length ? this._sindTsFromKey(tlKeys[0]) : null,
+        max_ts: tlKeys.length ? this._sindTsFromKey(tlKeys[tlKeys.length - 1]) : null,
+      },
+    };
+
+    return {
+      dataset_id: datasetId,
+      split: "all",
+      scene_id: sceneId,
+      scene_label: `${ref.city_label} \u00b7 ${ref.scenario_label}`,
+      city: ref.city_id,
+      intersect_id: ref.city_id,
+      intersect_label: ref.city_label,
+      recording_id: ref.scenario_id,
+      recording_label: ref.scenario_label,
+      window_index: 0,
+      window_count: 1,
+      map_id: null,
+      t0,
+      timestamps,
+      extent: normalizedExtent,
+      modality_stats,
+      frames,
+      warnings,
+      map: null,
+      meta: { city: ref.city_id, intersect_id: ref.city_id },
+    };
+  },
+
   async handleLoadBundle(url) {
     if (!WebFS.rootHandle) throw new Error("No folder selected");
     const parts = url.split('/');
@@ -1903,6 +3367,18 @@ const WebBackend = {
 
     if (ctx.datasetType === "consider_it_cpm") {
       return await this._loadCpmBundle(ctx, datasetId, sceneId);
+    }
+
+    if (ctx.datasetType === "sind") {
+      return await this._loadSindBundle(ctx, datasetId, sceneId, includeMap);
+    }
+
+    if (ctx.datasetType === "v2x_seq") {
+      return await this._loadV2xSeqBundle(ctx, datasetId, sceneId, split, includeMap);
+    }
+
+    if (ctx.datasetType === "ind") {
+      return await this._loadIndBundle(ctx, datasetId, sceneId, includeMap);
     }
 
     const modalities = ['ego', 'infra', 'vehicle', 'traffic_light'];
