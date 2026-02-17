@@ -3927,6 +3927,9 @@ function friendlyLoadFailureMessage(err, datasetType) {
   const low = raw.toLowerCase();
   const name = datasetTypeDisplayName(datasetType);
 
+  // Pass through dataset-type mismatch messages as-is
+  if (low.includes("but you are on the")) return raw;
+
   if (
     !raw
     || low.includes("could not detect dataset profile")
@@ -4006,13 +4009,22 @@ async function loadDatasetFromFolder(folderPathIn) {
       throw new Error(`Could not detect dataset profile from selected folder. ${expectedDatasetLayoutHint(datasetType)}`);
     }
 
-    // Use the detected dataset type (may differ from the active dataset card)
+    // Check if the detected type matches the active dataset card
     const detectedType = String(detected.profile.dataset_type || "").trim();
+    const cardType = datasetType; // type from the active dataset card
+    if (detectedType && cardType && detectedType !== cardType) {
+      const detectedLabel = profileTypeLabel(detectedType);
+      const cardLabel = profileTypeLabel(cardType);
+      throw new Error(
+        `The selected folder is a ${detectedLabel} dataset, but you are on the ${cardLabel} card. ` +
+        `Please select a ${cardLabel} dataset folder, or switch to the ${detectedLabel} card first.`
+      );
+    }
     if (detectedType) {
       datasetType = detectedType;
     }
 
-    // Re-resolve source state for the (possibly new) dataset type
+    // Resolve source state for the dataset type
     const detectedSrc = sourceState(datasetType);
     const preset = runtimeProfilePreset(datasetType, meta);
     const profile = cloneObj(detected.profile);
